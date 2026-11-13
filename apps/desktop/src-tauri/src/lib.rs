@@ -87,6 +87,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn plain_http_is_refused_for_every_non_loopback_host() {
+        for url in [
+            "http://192.168.1.10:8080",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.nip.io",
+            "http://0.0.0.0:8080",
+        ] {
+            assert_eq!(
+                probe_instance(url.to_owned()).await.unwrap_err(),
+                CommandError::InsecureUrl,
+                "{url}"
+            );
+        }
+    }
+
     #[test]
     fn error_codes_serialise_as_snake_case() {
         let json = serde_json::to_string(&CommandError::NotAnInstance).unwrap();

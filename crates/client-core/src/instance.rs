@@ -178,6 +178,33 @@ mod tests {
     }
 
     #[test]
+    fn loopback_lookalikes_do_not_get_plain_http() {
+        for input in [
+            "http://localhost.evil.example",
+            "http://evil.example/localhost",
+            "http://127.0.0.1.nip.io",
+            "http://0.0.0.0:8080",
+            "http://10.0.0.1",
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://[fe80::1]:8080",
+            "http://localhost.",
+        ] {
+            assert_eq!(
+                InstanceUrl::parse(input),
+                Err(InstanceUrlError::InsecureScheme),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_host_matching_ignores_case() {
+        let url = InstanceUrl::parse("HTTP://LOCALHOST:8080").unwrap();
+        assert_eq!(url.as_str(), "http://localhost:8080/");
+        assert!(InstanceUrl::parse("http://127.8.9.10:1").is_ok());
+    }
+
+    #[test]
     fn credentials_query_and_fragment_are_rejected() {
         assert_eq!(
             InstanceUrl::parse("https://user:pw@example.org"),

@@ -10,7 +10,8 @@ const en = {
     "Tavern is self-hosted. Enter the address of the instance run by you or by someone you trust.",
   "instance.url.label": "Instance address",
   "instance.url.placeholder": "chat.example.org",
-  "instance.url.hint": "The connection always uses HTTPS.",
+  "instance.url.hint":
+    "HTTPS is required. Plain HTTP is accepted only for a server running on this computer (localhost).",
   "instance.submit": "Check instance",
   "instance.checking": "Checking…",
   "instance.result.title": "Instance status",
@@ -20,7 +21,8 @@ const en = {
   "status.ok": "OK",
   "status.unavailable": "Unavailable",
   "error.invalid_url": "This is not a valid address.",
-  "error.insecure_url": "The instance must be reached over HTTPS.",
+  "error.insecure_url":
+    "The instance must be reached over HTTPS. Plain HTTP only works for localhost.",
   "error.unreachable": "The instance cannot be reached. Check the address and your connection.",
   "error.not_an_instance": "A server answered, but it is not a Tavern instance.",
   "error.unknown": "Something went wrong.",
@@ -36,7 +38,8 @@ const fr: Catalogue = {
     "Tavern est auto-hébergé. Saisissez l'adresse de l'instance gérée par vous ou par une personne de confiance.",
   "instance.url.label": "Adresse de l'instance",
   "instance.url.placeholder": "chat.exemple.org",
-  "instance.url.hint": "La connexion utilise toujours HTTPS.",
+  "instance.url.hint":
+    "HTTPS est obligatoire. Le HTTP en clair n'est accepté que pour un serveur tournant sur cet ordinateur (localhost).",
   "instance.submit": "Vérifier l'instance",
   "instance.checking": "Vérification…",
   "instance.result.title": "État de l'instance",
@@ -46,7 +49,8 @@ const fr: Catalogue = {
   "status.ok": "OK",
   "status.unavailable": "Indisponible",
   "error.invalid_url": "Cette adresse n'est pas valide.",
-  "error.insecure_url": "L'instance doit être jointe en HTTPS.",
+  "error.insecure_url":
+    "L'instance doit être jointe en HTTPS. Le HTTP en clair ne fonctionne que pour localhost.",
   "error.unreachable": "L'instance est injoignable. Vérifiez l'adresse et votre connexion.",
   "error.not_an_instance": "Un serveur a répondu, mais ce n'est pas une instance Tavern.",
   "error.unknown": "Une erreur est survenue.",
