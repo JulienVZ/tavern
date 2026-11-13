@@ -23,7 +23,7 @@ flowchart LR
     Server["server: REST API and WebSocket gateway"]
     PG[("PostgreSQL")]
     Blobs[("Blob storage: filesystem or S3-compatible")]
-    LK["LiveKit server: SFU and TURN"]
+    LK["LiveKit server: SFU"]
   end
 
   UI <-->|"Tauri IPC: decrypted view models"| Glue
@@ -38,7 +38,7 @@ flowchart LR
   Server --> PG
   Server --> Blobs
   Server -.->|"signs access tokens, room admin API"| LK
-  Core <-->|"encrypted media: UDP, TCP or TURN/TLS"| LK
+  Core <-->|"encrypted media: UDP or TCP"| LK
 ```
 
 The server never receives plaintext content or keys. The UI never receives keys or ciphertext.
@@ -51,7 +51,7 @@ The server never receives plaintext content or keys. The UI never receives keys 
 | LiveKit signalling | 443/TCP (separate host name) | Caddy → LiveKit |
 | Media (ICE over UDP, multiplexed) | one UDP port | LiveKit |
 | Media fallback (ICE over TCP) | 7881/TCP | LiveKit |
-| TURN over TLS | 5349/TCP | LiveKit |
+| TURN over TLS (optional, disabled by default) | 5349/TCP | LiveKit |
 
 Using a single multiplexed UDP port keeps port forwarding simple on a home router and works with Docker's bridge network. Host networking with a UDP port range is an advanced option on Linux. Exact values and the port forwarding guide are in `docs/self-hosting.md` (written in M0).
 
@@ -150,7 +150,9 @@ sequenceDiagram
   S-->>C: Ready
 ```
 
-A device that already has a session skips to the last two steps. The new device then joins each of the user's conversations with an MLS external commit (section 3.5); it has no earlier history ([ADR 0006](adr/0006-no-prior-history-v1.md)).
+A device that already has a session skips to the last two steps. The new device then joins each of the user's conversations with an MLS external commit (section 3.5); it has no earlier history ([ADR 0006](adr/0006-no-prior-history-v1.md)), which the UI explains at enrolment and at the top of each conversation. History transfer is planned in [ADR 0009](adr/0009-history-on-new-devices.md).
+
+At registration and password change the client enforces a minimum password strength locally (length and a zxcvbn-style estimate), because the password also protects the account identity key.
 
 ### 3.3 Sending a message
 
@@ -241,7 +243,9 @@ sequenceDiagram
 
 A **new device of an existing member** does not wait for someone to add it. It fetches the group's latest `GroupInfo` from the server and joins with an MLS external commit. Other members accept that commit only if the new leaf carries a device certificate signed by the AIK of a user who is already in the group.
 
-Joining a server gives access to several channels at once. Whether the newcomer joins each channel group by external commit authorised by the server's roles, or is added by an online member, is designed in M4 (see the threat model for what is at stake).
+Joining a server gives access to several channels at once. The planned mechanism is an external commit authorised by the server's roles, so the newcomer does not wait for a member to be online; the arrival is always displayed in the channel. A "private channel" option requires an Add committed by an existing member instead. The final decision is taken at M4 (see the threat model for what is at stake).
+
+Each enrolment of a device is announced: the account's other devices receive `DeviceListChanged` and show a notification with a revoke action, and contacts see a notice in shared conversations.
 
 ### 3.6 Removing a member (kick, ban, role change, revoked device)
 
@@ -274,7 +278,7 @@ sequenceDiagram
 
 - Delivery stops as soon as the server records the removal. The cryptographic removal follows when the first member device commits; if the moderator's device is online that happens within one round trip.
 - Every member device that receives the proposal tries to commit it after a short random delay. The compare-and-swap of section 3.4 keeps one commit and the others drop theirs.
-- While removals are pending, the server refuses application messages for the conversation with `REMOVAL_PENDING`, so that nothing new is encrypted for the removed leaf. The client commits the proposals, then sends.
+- While removals are pending, the server refuses application messages for the conversation with `REMOVAL_PENDING`, so that nothing new is encrypted for the removed leaf. The client handles this by itself: it commits the pending proposals, re-encrypts the message for the new epoch and sends it again. The user sees a normal send, never an error.
 - Clients reject external proposals of any other type. The server can ask for a removal; it can never ask for an addition.
 - A removal from a server triggers the same sequence for every channel group the user was in. A ban also records the user id so that it cannot rejoin.
 - The external sender key is a dedicated instance secret. Its loss or rotation is handled as described in [ADR 0002](adr/0002-mls-via-openmls.md#external-sender-key-lifecycle): members repair the group's `external_senders` list with an ordinary commit, and until then removals are committed by a member with the right permission.

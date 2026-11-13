@@ -165,6 +165,10 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Sessions : token opaque aléatoire, stocké **haché** côté serveur, lié à un appareil, révocable depuis les paramètres.
 - TOTP optionnel dès la v1, passkeys plus tard.
 - Clé de récupération générée à la création du compte (affichée une seule fois) pour restaurer l'identité sur un nouvel appareil.
+- Robustesse du mot de passe imposée **côté client** à l'inscription et au changement (12 caractères minimum, estimation type zxcvbn ≥ 3/4) : il protège aussi la clé d'identité du compte.
+- Chaque enrôlement d'appareil est notifié à tous les appareils existants du compte (avec action de révocation) et affiché à ses contacts dans les conversations partagées.
+- Un nouvel appareil n'a pas d'historique en v1 : l'UI l'explique à l'enrôlement et en tête de chaque conversation (ADR 0006, ADR 0009).
+- Quand le serveur répond `REMOVAL_PENDING` ou `STALE_EPOCH`, le client committe/applique ce qui est en attente puis renvoie le message automatiquement, sans erreur visible.
 - Rate limiting sur toutes les routes d'auth.
 
 ### Règles de code liées à la sécurité
@@ -219,9 +223,9 @@ L'expérience d'un admin d'instance est une fonctionnalité à part entière.
 - `deploy/scripts/create-admin.sh` pour créer le premier compte admin / le premier code d'invitation.
 - Endpoint `/health` et `/version`.
 - Scripts de sauvegarde/restauration (dump Postgres + dossier des blobs + secrets d'instance, dont le setup OPAQUE et la clé external sender).
-- Ports LiveKit par défaut : signalisation derrière Caddy (443), un seul port UDP en mux pour le média, 7881/TCP en repli, TURN/TLS sur 5349. `network_mode: host` avec plage UDP documenté comme option avancée sous Linux.
+- Ports LiveKit par défaut : signalisation derrière Caddy (443), un seul port UDP en mux pour le média, 7881/TCP en repli. **TURN désactivé par défaut en v1** ; TURN/TLS sur 5349 avec le volume de certificats de Caddy partagé est une option documentée dans `docs/self-hosting.md`. `network_mode: host` avec plage UDP documenté comme option avancée sous Linux.
 - Le client demande l'URL de l'instance au premier lancement (comme Element ou Mattermost). Architecture prête pour plusieurs instances dans un même client (pas obligatoire en v1).
-- Documentation `docs/self-hosting.md` : prérequis matériels, ports à ouvrir (HTTPS 443 ; ports RTC TCP/UDP et TURN de LiveKit — vérifier la doc LiveKit à jour), DNS, configuration box internet (serveur maison) vs VPS, mise à jour, sauvegarde.
+- Documentation `docs/self-hosting.md` : prérequis matériels, ports à ouvrir (HTTPS 443 ; port UDP mux et 7881/TCP de LiveKit ; TURN/TLS 5349 en option — vérifier la doc LiveKit à jour), DNS, configuration box internet (serveur maison) vs VPS, mise à jour, sauvegarde.
 - Dimensionnement de référence (40 utilisateurs) : 4 vCPU, 8 Go RAM, SSD 100 Go + stockage fichiers, **upload ≥ 500 Mb/s (idéalement 1 Gb/s symétrique)**, IPv4 publique. La bande passante est le facteur limitant (un stream 1080p60 vu par 10 personnes ≈ 80 Mb/s sortants).
 - Images Docker multi-arch (amd64 + arm64) publiées sur GHCR par la CI.
 
@@ -295,6 +299,7 @@ cd deploy && docker compose up -d
 | **M3** | Groupes privés | Ajout/retrait de membres avec rotation de clés vérifiée |
 | **M4** | Serveurs, channels textuels, catégories, rôles, permissions, modération | Kick/ban retire l'accès cryptographique |
 | **M5** | Pièces jointes chiffrées, avatars, bannières, emojis personnalisés, réactions, recherche locale | |
+| **M5b** | Historique sur un nouvel appareil de l'utilisateur (ADR 0009) : transfert d'appareil à appareil | Un second appareil récupère l'historique du premier sans que le serveur détienne de clé |
 | **M6** | Vocal : LiveKit, E2EE via exporter MLS, channels vocaux, appels DM | Appel à 5 personnes, E2EE actif, rotation à l'arrivée/départ |
 | **M7** | Webcam + partage d'écran 1080p60 sur les 3 OS | 1080p60 stable à 8 Mb/s, avec encodage matériel quand il est disponible |
 | **M8** | Finitions : notifications desktop, paramètres, thèmes, i18n, updater, packaging | Installeurs signés publiés par la CI |
@@ -309,7 +314,8 @@ cd deploy && docker compose up -d
 3. **Signature de code** des installeurs (certificat Windows, compte Apple Developer pour la notarisation macOS) : reportée au M8.
 4. **Rendu vidéo** : dans le webview (simple) ou natif via wgpu (plus performant) — à décider au jalon M7 après mesure.
 5. **Encodeur Media Foundation** (QuickSync/AMF sous Windows) : à décider au M7 après mesure.
-6. **Mécanisme d'entrée dans les channels d'un serveur** (external commit autorisé par les rôles, ou ajout par un membre en ligne) : à concevoir au M4.
+6. **Mécanisme d'entrée dans les channels d'un serveur** : orientation retenue — external commit autorisé par les rôles (le nouveau membre n'attend pas), arrivée toujours affichée dans le channel, plus une option « channel privé » où l'entrée exige l'ajout par un membre. Décision finale au M4.
+7. **Historique sur un nouvel appareil** : ADR 0009 (proposé), transfert d'appareil à appareil au M5b ; sauvegarde chiffrée sous la clé de récupération à évaluer ensuite.
 
 ---
 

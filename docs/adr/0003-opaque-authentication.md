@@ -1,6 +1,6 @@
 # ADR 0003 — OPAQUE for password authentication
 
-- Status: accepted (the account key wrapping described below awaits maintainer validation)
+- Status: accepted
 - Date: 2026-11-13
 
 ## Context
@@ -28,6 +28,8 @@ Client side, the OPAQUE **export key** (derived from the password, never known t
 
 - At registration the client generates the Ed25519 account identity key (AIK) and a random 256-bit recovery key. It uploads the AIK public key and two wrapped copies of the AIK private key: one under a key derived from the export key, one under the recovery key (XChaCha20-Poly1305 in both cases).
 - At login on a new device, the client unwraps the AIK with the export key, signs the new device's certificate, then erases the AIK private key from memory. It is not stored on the device.
+- **Password strength is enforced on the client**, since the server never sees the password: at registration and at every password change the client requires at least 12 characters and a strength estimate of 3 out of 4 or better (zxcvbn-style estimator, run locally, fed with the handle and display name as penalised words). The UI explains why: the password also protects the account identity key.
+- **Every device enrolment is announced.** The server sends `DeviceListChanged` to all existing devices of the account, which show a notification naming the new device and offering to revoke it. Contacts see a visible notice ("Alice added a new device") in each shared conversation when the new leaf joins, and the server sends `UserDevicesChanged` to friends. An enrolment made by someone who cracked the password therefore cannot go unnoticed.
 - The recovery key is displayed once. It allows a password reset without losing the identity: the client unwraps the AIK with it, runs a new OPAQUE registration and uploads a new password-wrapped copy.
 
 ## Alternatives considered
@@ -40,6 +42,6 @@ Client side, the OPAQUE **export key** (derived from the password, never known t
 ## Consequences
 
 - The server never receives a password or a password-equivalent value.
-- Someone who steals the database **and** the `ServerSetup` can still run an offline dictionary attack, at Argon2id cost per guess. Success yields the password and therefore the AIK. This is the residual risk of any password-based scheme; it is stated in the threat model, and password strength guidance belongs in the UI.
+- Someone who steals the database **and** the `ServerSetup` can still run an offline dictionary attack, at Argon2id cost per guess. Success yields the password and therefore the AIK. This is the residual risk of any password-based scheme; it is stated in the threat model and mitigated by the client-side strength requirement and by enrolment notices.
 - Registration and login each take two round trips.
 - Argon2id cost is paid on the client at each login, which affects the perceived login time on slow machines.

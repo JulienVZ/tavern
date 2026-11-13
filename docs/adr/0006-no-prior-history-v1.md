@@ -15,8 +15,9 @@ In v1:
 
 - A new member of a DM, group or channel sees messages from the moment their device joins the MLS group, and nothing earlier.
 - A new device of an existing user starts with an empty history for every conversation.
-- History lives in each device's local encrypted store. The server keeps ciphertext only for delivery (until every recipient device has acknowledged it, with a configurable maximum, 30 days by default — this retention rule awaits maintainer validation).
-- The UI states this plainly where it matters: when joining a channel, when adding a device, and in the documentation.
+- History lives in each device's local encrypted store. The server keeps ciphertext only for delivery (until every recipient device has acknowledged it, with a maximum configurable per instance, 30 days by default).
+- The UI states this plainly where it matters: when joining a channel, when adding a device, at the top of each conversation where the device's history starts, and in the documentation.
+- Restoring history on a user's own new device is planned after M5: see [ADR 0009](0009-history-on-new-devices.md).
 
 ## Alternatives considered
 

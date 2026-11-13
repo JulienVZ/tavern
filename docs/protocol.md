@@ -87,6 +87,7 @@ message ServerFrame {
     PresenceChanged presence_changed = 46;
     TypingEvent typing_event = 47;
     KeyPackagesLow key_packages_low = 48;
+    UserDevicesChanged user_devices_changed = 49;
   }
 }
 ```
@@ -140,6 +141,7 @@ Notes:
 - Login for an unknown handle returns a well-formed OPAQUE response computed from a dummy record. Failures at `login/finish` return the same `INVALID_CREDENTIALS` error whatever the cause.
 - All `/v1/auth/*` routes are rate limited per IP and per handle.
 - The first admin account and the first invitation are created on the host by `deploy/scripts/create-admin.sh`.
+- Password strength is checked by the client only (at least 12 characters and a zxcvbn-style score of 3 or more), at registration and password change; the server cannot see the password.
 
 ### 4.2 Gateway
 
@@ -184,8 +186,13 @@ message Error {
 // The server closes the connection right after.
 message SessionRevoked { RevocationReason reason = 1; }
 
-// One of the user's own devices was added or revoked.
-message DeviceListChanged {}
+// One of the user's own devices was added or revoked. Sent to every other
+// device of the account; clients show a notification with a revoke action
+// when a device was added.
+message DeviceListChanged {
+  bytes device_id = 1;
+  bool added = 2;
+}
 ```
 
 ## 5. Messages for M2 (friends and encrypted DMs)
@@ -293,6 +300,14 @@ message ConversationCreated {
   repeated bytes member_user_ids = 3;
 }
 
+// A friend enrolled or revoked a device. Clients show a notice in shared
+// conversations when a device was added.
+message UserDevicesChanged {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  bool added = 3;
+}
+
 // The device should upload more KeyPackages.
 message KeyPackagesLow { uint32 remaining = 1; }
 ```
@@ -301,7 +316,7 @@ Delivery rules:
 
 - Each conversation has one sequence, shared by application messages, proposals and commits. A device processes it in order.
 - The server checks, for every message: the device is a current leaf of the group, the device is not blocked for delivery, the conversation-specific authorisation holds, and sizes are within limits.
-- Application messages must be encrypted for the current epoch (`STALE_EPOCH` otherwise) and are refused while removals are pending (`REMOVAL_PENDING`).
+- Application messages must be encrypted for the current epoch (`STALE_EPOCH` otherwise) and are refused while removals are pending (`REMOVAL_PENDING`). Both are recovered by the client without user-visible error: it applies or commits what is pending, re-encrypts for the new epoch and resends with the same `client_message_id`. Only repeated failure (three attempts) surfaces as "not sent, retry".
 - A commit is validated against the public group state: valid signature, proposals allowed for the sender, new leaves carry valid device certificates. The epoch update is atomic.
 - External proposals issued by the server are always `Remove`. Clients reject any other type from an external sender.
 - `SendMessage` is idempotent on (`device`, `client_message_id`): a retry returns the original acknowledgement.
@@ -451,6 +466,7 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | Typing updates | 1 per 3 s per conversation |
 | Auth routes | 10 per minute per IP, 5 per minute per handle |
 | Stored message retention | until acknowledged by all recipient devices, at most 30 days * |
+| Password (client-enforced) | at least 12 characters, strength score ≥ 3 of 4 |
 
 Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE_LIMITED` with `retry_after_ms`. A connection that keeps exceeding rates is closed with 4007.
 

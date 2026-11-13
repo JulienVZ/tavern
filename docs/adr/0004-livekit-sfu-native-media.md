@@ -17,7 +17,7 @@ Verified on 2026-11-13 against the sources of `livekit/rust-sdks`:
 
 ## Decision
 
-- **LiveKit server**, self-hosted in the reference Docker Compose, is the SFU and the TURN server. No transcoding.
+- **LiveKit server**, self-hosted in the reference Docker Compose, is the SFU (and the TURN server when that option is enabled). No transcoding.
 - **The LiveKit Rust SDK runs inside `client-core`.** The webview's WebRTC stack is never used.
 - **E2EE keys come from MLS.** For each participant and each MLS epoch of the group bound to the call:
   `key = MLS-Exporter(label = "tavern media v1", context = participant identity, length = 32)`.
@@ -28,7 +28,7 @@ Verified on 2026-11-13 against the sources of `livekit/rust-sdks`:
 - **Hardware encoding in v1 is whatever the SDK provides**: VideoToolbox on macOS, NVENC and VAAPI on Linux, NVENC on Windows, OpenH264 software fallback elsewhere. A Media Foundation encoder for QuickSync and AMF, fed through `NativeVideoSource::new_encoded`, is deferred to M7 and decided after measurement. The M7 criterion is "1080p60 with hardware encoding when it is available".
 - **System and application audio during screen sharing** is implemented per OS in the `media` crate at M7.
 - **The prebuilt libwebrtc is accepted.** The `livekit`, `libwebrtc` and `webrtc-sys` versions are pinned exactly, `deny.toml` restricts sources, and the risk is listed in the threat model.
-- **Default network layout**: LiveKit signalling behind Caddy on 443, one multiplexed UDP port for media, 7881/TCP as ICE fallback, TURN/TLS on 5349. `network_mode: host` with a UDP port range is documented as an advanced option for Linux.
+- **Default network layout**: LiveKit signalling behind Caddy on 443, one multiplexed UDP port for media, 7881/TCP as ICE fallback. **TURN is disabled by default in v1.** TURN/TLS on 5349, using Caddy's certificate volume shared with LiveKit, is a documented option for users behind networks that block everything but TLS. `network_mode: host` with a UDP port range is documented as an advanced option for Linux.
 - The server issues LiveKit access tokens (short lived, one room, identity fixed to the device id) only after checking permissions.
 
 ## Alternatives considered
@@ -46,5 +46,5 @@ Verified on 2026-11-13 against the sources of `livekit/rust-sdks`:
 - In a DM or group call, conversation members who are not in the call hold the group's exporter secret and could decrypt the media if they obtained the packets. They are members of that conversation anyway.
 - Windows machines without an NVIDIA GPU encode in software in v1; 1080p60 may not hold on weak CPUs. Measured at M7.
 - The client binary embeds libwebrtc. Its size and memory use are measured at M6 against the 200 MB call budget.
-- TURN/TLS on 5349 needs a certificate for the TURN host name. How Caddy-managed certificates reach LiveKit is settled in M0.
+- Without TURN, a client on a network that blocks both UDP and outbound TCP to port 7881 cannot join calls. The optional TURN/TLS setup covers that case and is described in `docs/self-hosting.md`.
 - Video rendering (webview or native through wgpu) is decided at M7 after measurement.
