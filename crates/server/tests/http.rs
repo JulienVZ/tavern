@@ -15,32 +15,15 @@
     reason = "test helpers panic on set-up failure"
 )]
 
-use std::net::SocketAddr;
+mod common;
 
+use common::{DATABASE_URL_VAR, TestApp};
 use tavern_protocol::rest::{ComponentStatus, HealthResponse, VersionResponse};
-use tavern_server::{AppState, app, db};
-use tokio::net::TcpListener;
-
-const DATABASE_URL_VAR: &str = "TAVERN_TEST_DATABASE_URL";
+use tavern_server::db;
 
 /// Starts the application on an ephemeral port and returns its address.
-async fn spawn_app() -> SocketAddr {
-    let database_url = std::env::var(DATABASE_URL_VAR)
-        .unwrap_or_else(|_| panic!("{DATABASE_URL_VAR} must be set to run this test"));
-
-    let pool = db::connect(&database_url, 2)
-        .await
-        .expect("database must be reachable");
-    db::migrate(&pool).await.expect("migrations must apply");
-
-    let state = AppState {
-        db: pool,
-        source_url: Some("https://example.org/source".to_owned()),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
-    addr
+async fn spawn_app() -> std::net::SocketAddr {
+    TestApp::spawn().await.addr
 }
 
 #[tokio::test]
@@ -111,4 +94,31 @@ async fn wrong_database_password_is_explained() {
         matches!(error, db::ConnectError::AuthenticationFailed),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn openapi_document_lists_the_routes() {
+    let addr = spawn_app().await;
+
+    let document: serde_json::Value = reqwest::get(format!("http://{addr}/v1/openapi.json"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let paths = document["paths"].as_object().unwrap();
+    for path in [
+        "/health",
+        "/v1/auth/login/start",
+        "/v1/devices",
+        "/v1/admin/invites",
+    ] {
+        assert!(
+            paths.contains_key(path),
+            "{path} is missing from the OpenAPI document"
+        );
+    }
+    assert!(document["components"]["schemas"]["LoginGrant"].is_object());
 }

@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! HTTP routes.
+//! Health and version endpoints.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Json, Router};
-use tavern_protocol::rest::{ComponentStatus, GatewayVersions, HealthResponse, VersionResponse};
+use tavern_protocol::rest::{
+    B64, ComponentStatus, GatewayVersions, HealthResponse, VersionResponse,
+};
 use tavern_protocol::{GATEWAY_MAJOR_VERSION, GATEWAY_MINOR_VERSION};
 
 use crate::{AppState, db};
 
-/// Routes of the server, without middleware.
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/health", get(health))
-        .route("/version", get(version))
-}
-
 /// `GET /health`: 200 when the server and its database work, 503 otherwise.
-async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "system",
+    responses(
+        (status = 200, body = HealthResponse),
+        (status = 503, body = HealthResponse)
+    )
+)]
+pub(crate) async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     if db::is_healthy(&state.db).await {
         let body = HealthResponse {
             status: ComponentStatus::Ok,
@@ -36,7 +39,8 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRespon
 }
 
 /// `GET /version`: software and protocol versions of this instance.
-async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
+#[utoipa::path(get, path = "/version", tag = "system", responses((status = 200, body = VersionResponse)))]
+pub(crate) async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
     Json(VersionResponse {
         name: "tavern".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -45,6 +49,7 @@ async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
             max_major: GATEWAY_MAJOR_VERSION,
             minor: GATEWAY_MINOR_VERSION,
         },
-        source_url: state.source_url,
+        mls_external_sender_key: B64::from(state.secrets.external_sender.public_bytes()),
+        source_url: state.settings.source_url.clone(),
     })
 }

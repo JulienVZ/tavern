@@ -114,33 +114,42 @@ One connection per device. A second connection with the same session closes the 
 
 ### 4.1 REST
 
+The authoritative description is the OpenAPI document served at `GET /v1/openapi.json`. Summary:
+
 | Method and path | Purpose | Auth |
 |---|---|---|
 | `GET /health` | Liveness and database check | none |
 | `GET /version` | Server version, protocol versions, MLS external sender public key, source link | none |
-| `POST /v1/auth/register/start` | Invite code, handle, OPAQUE `RegistrationRequest` → `RegistrationResponse`, registration id | none |
-| `POST /v1/auth/register/finish` | Registration id, OPAQUE `RegistrationUpload`, AIK public key, two wrapped AIK copies → user id | none |
-| `POST /v1/auth/login/start` | Handle, OPAQUE `CredentialRequest` → `CredentialResponse`, login id | none |
-| `POST /v1/auth/login/finish` | Login id, OPAQUE `CredentialFinalization` → enrolment token and wrapped AIK, or `TOTP_REQUIRED` | none |
-| `POST /v1/auth/login/totp` | Login id, TOTP code → enrolment token and wrapped AIK | none |
-| `POST /v1/auth/recover/start`, `/finish` | Password reset with the recovery key: fetch the recovery-wrapped AIK, prove possession by signing a challenge with the AIK, register a new OPAQUE record | none |
-| `POST /v1/devices` | Device certificate, encrypted device name → device id, session token | enrolment token |
-| `GET /v1/devices` | List own devices | session |
+| `GET /v1/openapi.json` | OpenAPI description | none |
+| `POST /v1/auth/register/start` | Invite code, handle, OPAQUE `RegistrationRequest` → `RegistrationResponse`, suite | none |
+| `POST /v1/auth/register/finish` | Invite code, handle, display name, OPAQUE `RegistrationUpload`, AIK public key, two wrapped AIK copies → user id | none |
+| `POST /v1/auth/login/start` | Handle, OPAQUE `CredentialRequest` → login id, `CredentialResponse`, suite | none |
+| `POST /v1/auth/login/finish` | Login id, OPAQUE `CredentialFinalization` → grant, or `totp_required` | none |
+| `POST /v1/auth/login/totp` | Login id, TOTP code or recovery code → grant | none |
+| `POST /v1/auth/logout` | End the current session | session |
+| `POST /v1/devices` | Device certificate, encrypted device name, platform → session | enrolment token |
+| `POST /v1/devices/{id}/session` | Signature of the session nonce by the device key → session | enrolment token |
+| `GET /v1/devices` | Active devices of the account | session |
 | `DELETE /v1/devices/{id}` | Revoke a device and its session | session |
-| `POST /v1/auth/logout` | Revoke the current session | session |
-| `POST /v1/account/password` | Change password: new OPAQUE registration and new password-wrapped AIK | session, plus a fresh OPAQUE login |
+| `GET /v1/users/me` | The signed-in account | session |
 | `POST /v1/account/totp/enable`, `/confirm`, `/disable` | TOTP enrolment | session |
-| `GET /v1/users/me`, `PATCH /v1/users/me` | Own account and profile | session |
-| `GET /v1/users/{id}`, `GET /v1/users/by-handle/{handle}` | Public profile and AIK public key | session |
 | `POST /v1/admin/invites`, `GET`, `DELETE /v1/admin/invites/{id}` | Instance invitations | admin session |
-| `GET /v1/admin/users`, `PATCH /v1/admin/users/{id}` | List, disable, set quotas | admin session |
+| `GET /v1/admin/users` | Accounts of the instance | admin session |
+| `POST /v1/admin/users/{id}/disable`, `/enable` | Disable or re-enable an account | admin session |
+| `POST /v1/admin/users/{id}/totp/disable` | Disable the TOTP of a user who lost their authenticator and codes | admin session |
+
+Credential changes (re-authentication, password change, recovery with the recovery key, recovery key rotation) are added at the end of M1 and described in [ADR 0003](adr/0003-opaque-authentication.md#credential-changes).
 
 Notes:
 
-- The enrolment token is valid for 5 minutes and for `POST /v1/devices` only. A session always belongs to a device.
-- Login for an unknown handle returns a well-formed OPAQUE response computed from a dummy record. Failures at `login/finish` return the same `INVALID_CREDENTIALS` error whatever the cause.
-- All `/v1/auth/*` routes are rate limited per IP and per handle.
-- The first admin account and the first invitation are created on the host by `deploy/scripts/create-admin.sh`.
+- A **grant** is what a completed login returns: an enrolment token and a session nonce (both single use, five minutes), the account's public identity key and the wrapped "password" copy of its private key. The wrapped copy is never returned before the TOTP step when TOTP is enabled.
+- The enrolment token is sent as `Authorization: Bearer`, like a session token. It is consumed by the request that uses it, successful or not.
+- A session always belongs to a device. A device whose session ended logs in again and reopens it with `POST /v1/devices/{id}/session`; it is not enrolled a second time.
+- Handles must be sent in canonical form (lower case ASCII `a–z 0–9 _ .`, 2 to 32 characters, no leading, trailing or double dot). The server refuses anything else with `INVALID_HANDLE`; it never lower-cases or trims. A handle cannot be changed in v1.
+- Login for an unknown handle returns a well-formed OPAQUE response computed from a decoy record. Failures at `login/finish` return the same `INVALID_CREDENTIALS` whatever the cause. `ACCOUNT_DISABLED` is returned only after the right password.
+- `HANDLE_TAKEN` is returned by `register/start` only to a caller holding a valid invitation code.
+- `/v1/auth/*` is limited to 30 requests per minute per client address, and login, registration and recovery starts to 5 per minute per handle.
+- The first administrator invitation is created on the host by `deploy/scripts/create-admin.sh`.
 - Password strength is checked by the client only (at least 12 characters and a zxcvbn-style score of 3 or more), at registration and password change; the server cannot see the password.
 
 ### 4.2 Gateway
@@ -422,7 +431,7 @@ enum ErrorCode {
 }
 ```
 
-REST errors use the same codes in a JSON body `{ "code": "EPOCH_CONFLICT", "message": "..." }` with the matching HTTP status (400, 401, 403, 404, 409, 413, 429, 500, 503).
+REST errors carry a JSON body `{ "code": "INVALID_CREDENTIALS", "message": "...", "retry_after_ms": 1200 }` with the matching HTTP status (400, 401, 403, 404, 409, 410, 413, 429, 500, 503). The REST codes are listed in the OpenAPI document (`ErrorCode`); beyond the generic ones they are `INVALID_CREDENTIALS`, `INVALID_INVITE`, `HANDLE_TAKEN`, `INVALID_HANDLE`, `TOTP_REQUIRED`, `TOTP_INVALID`, `ACCOUNT_DISABLED`, `INVALID_DEVICE_CERTIFICATE`, `EXCHANGE_EXPIRED` (410: a two-step exchange timed out or was already used), `TOO_MANY_DEVICES` and `INVALID_PROOF`.
 
 WebSocket close codes:
 
@@ -459,12 +468,13 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | Devices per account | 10 |
 | `Hello` deadline | 10 s |
 | Heartbeat interval / timeout | 30 s / 75 s * |
-| OPAQUE registration and login state | 60 s |
+| OPAQUE login state | 60 s |
+| Pending TOTP step | 5 min, 5 wrong codes |
 | Enrolment token | 5 min |
 | `FetchMessages` page | 200 messages |
 | Gateway requests per device | 30 per 10 s sustained, burst 60 |
 | Typing updates | 1 per 3 s per conversation |
-| Auth routes | 10 per minute per IP, 5 per minute per handle |
+| Auth routes | 30 per minute per client address, 5 per minute per handle |
 | Stored message retention | until acknowledged by all recipient devices, at most 30 days * |
 | Password (client-enforced) | at least 12 characters, strength score ≥ 3 of 4 |
 

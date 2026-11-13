@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 /// Environment variable names.
 pub mod vars {
@@ -24,11 +25,17 @@ pub mod vars {
     pub const LOG_FORMAT: &str = "TAVERN_LOG_FORMAT";
     /// Public URL of this instance's source code.
     pub const SOURCE_URL: &str = "TAVERN_SOURCE_URL";
+    /// Whether the last `X-Forwarded-For` entry is the client address.
+    pub const TRUST_FORWARDED_FOR: &str = "TAVERN_TRUST_FORWARDED_FOR";
+    /// Days an unused session stays valid.
+    pub const SESSION_TTL_DAYS: &str = "TAVERN_SESSION_TTL_DAYS";
 }
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
+const MAX_SESSION_TTL_DAYS: u64 = 3650;
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +63,11 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Public URL of this instance's source code, exposed by `GET /version`.
     pub source_url: Option<String>,
+    /// Whether requests arrive through a reverse proxy that appends the client
+    /// address to `X-Forwarded-For`. Only enable behind such a proxy.
+    pub trust_forwarded_for: bool,
+    /// How long an unused session stays valid.
+    pub session_ttl: Duration,
 }
 
 // Manual implementation so that the database URL, which contains a password,
@@ -70,6 +82,8 @@ impl fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
             .field("source_url", &self.source_url)
+            .field("trust_forwarded_for", &self.trust_forwarded_for)
+            .field("session_ttl", &self.session_ttl)
             .finish()
     }
 }
@@ -154,6 +168,27 @@ impl Config {
             }
         };
 
+        let trust_forwarded_for = match get(vars::TRUST_FORWARDED_FOR) {
+            None => false,
+            Some(raw) => parse_bool(&raw).ok_or_else(|| ConfigError::Invalid {
+                name: vars::TRUST_FORWARDED_FOR,
+                reason: "must be true or false".to_owned(),
+            })?,
+        };
+
+        let session_ttl_days = match get(vars::SESSION_TTL_DAYS) {
+            None => DEFAULT_SESSION_TTL_DAYS,
+            Some(raw) => match raw.parse::<u64>() {
+                Ok(days) if (1..=MAX_SESSION_TTL_DAYS).contains(&days) => days,
+                _ => {
+                    return Err(ConfigError::Invalid {
+                        name: vars::SESSION_TTL_DAYS,
+                        reason: "must be a number of days between 1 and 3650".to_owned(),
+                    });
+                }
+            },
+        };
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -162,6 +197,8 @@ impl Config {
             log_level: get(vars::LOG_LEVEL).unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned()),
             log_format,
             source_url: get(vars::SOURCE_URL),
+            trust_forwarded_for,
+            session_ttl: Duration::from_secs(session_ttl_days * 24 * 60 * 60),
         })
     }
 }
@@ -200,6 +237,8 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert_eq!(config.log_format, LogFormat::Text);
         assert_eq!(config.source_url, None);
+        assert!(!config.trust_forwarded_for);
+        assert_eq!(config.session_ttl, Duration::from_secs(90 * 24 * 60 * 60));
     }
 
     #[test]
@@ -236,6 +275,8 @@ mod tests {
             (vars::LOG_LEVEL, "debug"),
             (vars::LOG_FORMAT, "json"),
             (vars::SOURCE_URL, "https://example.org/src"),
+            (vars::TRUST_FORWARDED_FOR, "true"),
+            (vars::SESSION_TTL_DAYS, "7"),
         ])
         .unwrap();
 
@@ -257,6 +298,9 @@ mod tests {
             (vars::DB_MAX_CONNECTIONS, "0"),
             (vars::RUN_MIGRATIONS, "maybe"),
             (vars::LOG_FORMAT, "xml"),
+            (vars::TRUST_FORWARDED_FOR, "perhaps"),
+            (vars::SESSION_TTL_DAYS, "0"),
+            (vars::SESSION_TTL_DAYS, "forever"),
         ] {
             let err = config_from(&[DB, (name, value)]).unwrap_err();
             assert!(

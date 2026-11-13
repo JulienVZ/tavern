@@ -5,6 +5,9 @@
 //! Usage:
 //!
 //! - `tavern-server`: run the server.
+//! - `tavern-server gen-secrets`: print a fresh set of instance secrets.
+//! - `tavern-server create-admin-invite`: print the code of a single-use
+//!   invitation that makes its account an administrator.
 //! - `tavern-server healthcheck`: query the local `/health` endpoint and exit
 //!   with status 0 when it answers 200. Used by the container health check,
 //!   since the runtime image has no shell or HTTP client.
@@ -17,7 +20,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use tavern_server::config::Config;
-use tavern_server::{AppState, app, db, telemetry};
+use tavern_server::secrets::InstanceSecrets;
+use tavern_server::{AppState, Settings, app, db, routes, telemetry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -27,7 +31,14 @@ async fn main() -> ExitCode {
     let result = match (args.next().as_deref(), args.next()) {
         (None, _) => run().await,
         (Some("healthcheck"), None) => healthcheck().await,
-        _ => Err(anyhow::anyhow!("usage: tavern-server [healthcheck]")),
+        (Some("gen-secrets"), None) => {
+            gen_secrets();
+            Ok(())
+        }
+        (Some("create-admin-invite"), None) => create_admin_invite().await,
+        _ => Err(anyhow::anyhow!(
+            "usage: tavern-server [healthcheck | gen-secrets | create-admin-invite]"
+        )),
     };
 
     match result {
@@ -52,6 +63,10 @@ async fn run() -> anyhow::Result<()> {
         "starting tavern-server"
     );
 
+    // Checked before touching the database: a missing secret is a set-up
+    // mistake that the administrator must see first.
+    let secrets = InstanceSecrets::from_env()?;
+
     // The error text explains the cause and the fix; `main` prints it to
     // stderr, which is what `docker compose logs` shows.
     let pool = db::connect(&config.database_url, config.db_max_connections).await?;
@@ -65,22 +80,77 @@ async fn run() -> anyhow::Result<()> {
         tracing::warn!("database migrations are disabled");
     }
 
-    let state = AppState {
-        db: pool.clone(),
-        source_url: config.source_url.clone(),
-    };
+    let state = AppState::new(
+        pool.clone(),
+        secrets,
+        Settings {
+            source_url: config.source_url.clone(),
+            trust_forwarded_for: config.trust_forwarded_for,
+            session_ttl: config.session_ttl,
+        },
+    );
     let listener = TcpListener::bind(config.listen_addr)
         .await
         .with_context(|| format!("cannot listen on {}", config.listen_addr))?;
     tracing::info!(addr = %config.listen_addr, "listening");
 
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server failed")?;
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("HTTP server failed")?;
 
     pool.close().await;
     tracing::info!("shut down cleanly");
+    Ok(())
+}
+
+/// Prints a fresh set of instance secrets as `NAME=value` lines.
+///
+/// `deploy/scripts/init.sh` copies into `.env` the ones that are still empty.
+/// Nothing is written anywhere else, and nothing is logged.
+fn gen_secrets() {
+    for (name, value) in InstanceSecrets::generate() {
+        #[expect(
+            clippy::print_stdout,
+            reason = "the output of this command is its purpose"
+        )]
+        {
+            println!("{name}={value}");
+        }
+    }
+}
+
+/// Creates a single-use invitation whose account becomes an administrator,
+/// and prints its code once.
+async fn create_admin_invite() -> anyhow::Result<()> {
+    const VALID_HOURS: u32 = 24;
+
+    let config = Config::from_env().context("invalid configuration")?;
+    let pool = db::connect(&config.database_url, 1).await?;
+    if config.run_migrations {
+        db::migrate(&pool)
+            .await
+            .context("cannot apply database migrations")?;
+    }
+    let created = routes::admin::insert_invite(&pool, None, 1, VALID_HOURS, true)
+        .await
+        .map_err(|error| anyhow::anyhow!("cannot create the invitation: {}", error.message))?;
+    pool.close().await;
+
+    #[expect(
+        clippy::print_stdout,
+        reason = "the output of this command is its purpose"
+    )]
+    {
+        println!("Administrator invitation code (single use, valid {VALID_HOURS} hours):");
+        println!();
+        println!("    {}", created.code);
+        println!();
+        println!("Register with it in the Tavern client. It is not shown again.");
+    }
     Ok(())
 }
 

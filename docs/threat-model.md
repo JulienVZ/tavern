@@ -60,6 +60,7 @@ Includes a malicious admin running modified software and an intruder who took ov
 - **Can** serve wrong profiles, names and permissions, since those are server-side data.
 - **Can** issue LiveKit tokens for any room. Without the MLS exporter secret the media stays unreadable; an intruder in a call is visible as a participant with no valid frames.
 - **Can** run the offline password attack of section 3.1.
+- **Can** bypass or disable TOTP, which it enforces itself. TOTP protects a stolen password from being used over the network by a third party; it is not a defence against the server. An honest administrator disabling a user's TOTP on request (for a lost phone) is the visible, logged form of the same power.
 - **Can** withhold the Remove proposal after a kick and keep delivering to the kicked device, which is still in the group until someone commits its removal. A moderator's client commits the removal itself when it is online, which closes this window.
 
 ### 3.4 Stolen or seized device
