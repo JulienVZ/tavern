@@ -57,7 +57,7 @@ Hors périmètre v1 : fédération entre instances, applications mobiles (mais l
 | Média (audio/vidéo/écran) | **LiveKit Rust SDK** dans le cœur Rust | **Jamais via le WebRTC du webview** : WebKitGTK (Linux) n'a pas de WebRTC fiable |
 | Serveur média (SFU) | **LiveKit server** (auto-hébergé) | SFU éprouvé, pas de transcodage, E2EE supporté, TURN intégré |
 | API + gateway temps réel | **Rust : axum + tokio**, WebSocket | |
-| Sérialisation du protocole | **Protobuf (prost)**, versionné | Binaire (payloads chiffrés), évolution compatible |
+| Sérialisation du protocole | **Protobuf (prost)**, versionné, compilé avec **protox** (pas de `protoc` requis) | Binaire (payloads chiffrés), évolution compatible |
 | Base de données | **PostgreSQL** + **sqlx** (migrations versionnées) | Pas de Redis : inutile à cette échelle, simplifie l'auto-hébergement |
 | Stockage fichiers | Backend abstrait : **système de fichiers local** (défaut) ou **S3-compatible** | Blobs déjà chiffrés côté client |
 | E2EE messages | **MLS (RFC 9420) via OpenMLS** | Conçu pour les groupes ; un seul protocole pour DM, groupes, channels |
@@ -105,6 +105,7 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 │   ├── architecture.md
 │   ├── threat-model.md        # Ce que le serveur voit / ne voit pas, adversaires considérés
 │   ├── protocol.md            # Messages gateway, flux MLS, flux d'appel
+│   ├── database-schema.md     # Schéma PostgreSQL, classification de chaque colonne
 │   ├── self-hosting.md        # Guide pas à pas (VPS et serveur maison), ports, DNS, sauvegardes
 │   ├── configuration.md       # Référence de toutes les variables
 │   └── adr/                   # Architecture Decision Records : 0001-xxx.md
@@ -117,7 +118,7 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 Règles de dépendance entre crates :
 - `protocol` ne dépend de rien d'interne.
 - `crypto` dépend de `protocol` uniquement.
-- `server` dépend de `protocol` (et de `crypto` uniquement pour la vérification de signatures/KeyPackages, **jamais** pour déchiffrer).
+- `server` dépend de `protocol` (et de `crypto` uniquement pour la vérification de signatures/KeyPackages, le suivi de l'état public des groupes et la signature des propositions Remove, **jamais** pour déchiffrer).
 - `client-core` dépend de `protocol`, `crypto`, `media`.
 - `apps/desktop/src-tauri` dépend de `client-core` et ne contient pas de logique métier.
 
@@ -130,6 +131,8 @@ L'UI ne touche jamais aux clés ni au contenu chiffré : elle reçoit des donné
 ### Ce que le serveur peut voir (métadonnées, assumé et documenté dans `docs/threat-model.md`)
 Identifiants des comptes et appareils, liste d'amis, appartenance aux serveurs/channels/groupes, horodatage et taille des messages, présence, indicateur de frappe, qui est dans quel appel. La signalisation LiveKit n'est pas chiffrée de bout en bout (seulement TLS).
 
+Visibles aussi en v1 (décision du 2026-11-13) : les **handles**, les **noms de serveurs, de channels, de catégories et de rôles** (nécessaires aux permissions et aux invitations) et les **profils** (nom affiché, avatar, bannière, bio, statut personnalisé). Le chiffrement des profils par « profile key » est une évolution future (ADR 0008).
+
 ### Ce que le serveur ne doit JAMAIS voir
 Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, réactions, contenu des médias (audio/vidéo/écran), mots de passe, clés privées, aperçus de liens.
 
@@ -141,11 +144,15 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Un groupe MLS par conversation : un par DM, un par groupe privé, **un par channel textuel** de serveur.
 - Le serveur joue le rôle de **Delivery Service** et d'**Authentication Service** : stocke les KeyPackages, ordonne les commits par groupe (un seul commit accepté par epoch), relaie les messages chiffrés.
 - Ajout/retrait de membres piloté par les rôles du serveur : quand un membre perd l'accès (kick, ban, retrait de rôle), un commit le retire du groupe → nouvelle epoch → il ne peut plus déchiffrer la suite.
+- Retrait : le serveur coupe immédiatement la livraison au membre exclu, puis, en tant qu'**external sender** MLS déclaré dans le contexte de chaque groupe, émet la proposition `Remove` ; le premier client membre en ligne la committe automatiquement. Les clients refusent toute proposition externe autre que `Remove`.
+- La clé de signature de l'external sender est une **clé dédiée**, distincte de tout autre secret d'instance, incluse dans les sauvegardes. Perte et rotation : voir ADR 0002.
+- Messages de handshake (proposals, commits) en `PublicMessage` pour que le serveur puisse les valider et les ordonner ; messages applicatifs en `PrivateMessage`.
+- Identité : une clé d'identité de compte (AIK) signe le certificat de chaque appareil ; sa partie privée n'est stockée sur aucun appareil (copies chiffrées côté serveur sous la clé d'export OPAQUE et sous la clé de récupération, voir ADR 0003).
 - Rotation régulière des clés (commit de mise à jour périodique).
 - Vérification d'identité entre utilisateurs : numéros de sécurité / QR code (comparaison des clés d'identité).
 
 ### Médias
-- Clé E2EE d'un appel dérivée via `MLS-Exporter` du groupe MLS associé (channel vocal ↔ groupe MLS dédié, appel DM ↔ groupe du DM).
+- Clé E2EE d'un appel dérivée via `MLS-Exporter` du groupe MLS associé (channel vocal ↔ groupe MLS dédié, appel DM ↔ groupe du DM), une clé par (epoch, participant), poussée via `KeyProvider::set_key` du SDK LiveKit à chaque epoch.
 - Rotation de la clé média à chaque changement d'epoch (arrivée/départ d'un participant).
 - Le serveur délivre les tokens LiveKit **après** vérification des permissions.
 
@@ -192,8 +199,9 @@ Si une modification risque de dépasser un budget, mesure avant/après et indiqu
 - Windows : Windows Graphics Capture (repli DXGI Desktop Duplication).
 - macOS : ScreenCaptureKit (demande de permission « Enregistrement de l'écran »).
 - Linux : PipeWire via `xdg-desktop-portal` (obligatoire sous Wayland), X11 en repli.
-- Évaluer la crate `scap` (ou équivalent) avant d'écrire la capture à la main ; consigner le choix dans un ADR.
-- Encodage matériel prioritaire : NVENC, QuickSync, AMF, VideoToolbox, VAAPI ; repli logiciel.
+- Capture via `libwebrtc::desktop_capturer` (fourni par le SDK LiveKit) en premier choix ; la crate `scap` est écartée (non maintenue). Les API ci-dessus ne sont utilisées directement, en repli par OS, que si les mesures du M7 l'exigent (ADR 0004).
+- Audio système/application pendant le partage d'écran : implémenté par OS dans cette crate, au M7.
+- Encodage matériel en v1 : celui du SDK LiveKit (VideoToolbox sur macOS, NVENC et VAAPI sur Linux, NVENC sur Windows) ; repli logiciel OpenH264. Un encodeur Media Foundation (QuickSync/AMF) via `NativeVideoSource::new_encoded` est à décider au M7 après mesure.
 - Codecs : H.264 par défaut (compatibilité, encodage matériel partout) ; AV1/VP9 si l'encodeur matériel est disponible des deux côtés.
 - Défaut 1080p60 ≈ 8 Mb/s, réglable ; mode « texte/net » (priorité résolution) vs « jeu/fluide » (priorité fps).
 - Vérifier ce que le SDK Rust de LiveKit / libwebrtc gère nativement (sources vidéo, encodeurs matériels) avant de réimplémenter.
@@ -206,11 +214,12 @@ L'expérience d'un admin d'instance est une fonctionnalité à part entière.
 
 - Déploiement de référence : `deploy/docker-compose.yml` avec `server`, `postgres`, `livekit`, `caddy`. Une seule commande, un seul `.env`.
 - Toute la configuration passe par variables d'environnement (avec fichier de config optionnel). **Aucun domaine, IP ou secret codé en dur.**
-- Les secrets (clés LiveKit, clé de signature serveur) sont générés par un script (`deploy/scripts/init.sh`) si absents.
+- Les secrets sont générés par un script (`deploy/scripts/init.sh`) si absents, chacun avec un usage unique : clés LiveKit, setup serveur OPAQUE, clé de signature MLS external sender (dédiée), clé de chiffrement des secrets TOTP.
 - Migrations de base appliquées automatiquement au démarrage du serveur (avec option pour les désactiver).
 - `deploy/scripts/create-admin.sh` pour créer le premier compte admin / le premier code d'invitation.
 - Endpoint `/health` et `/version`.
-- Scripts de sauvegarde/restauration (dump Postgres + dossier des blobs).
+- Scripts de sauvegarde/restauration (dump Postgres + dossier des blobs + secrets d'instance, dont le setup OPAQUE et la clé external sender).
+- Ports LiveKit par défaut : signalisation derrière Caddy (443), un seul port UDP en mux pour le média, 7881/TCP en repli, TURN/TLS sur 5349. `network_mode: host` avec plage UDP documenté comme option avancée sous Linux.
 - Le client demande l'URL de l'instance au premier lancement (comme Element ou Mattermost). Architecture prête pour plusieurs instances dans un même client (pas obligatoire en v1).
 - Documentation `docs/self-hosting.md` : prérequis matériels, ports à ouvrir (HTTPS 443 ; ports RTC TCP/UDP et TURN de LiveKit — vérifier la doc LiveKit à jour), DNS, configuration box internet (serveur maison) vs VPS, mise à jour, sauvegarde.
 - Dimensionnement de référence (40 utilisateurs) : 4 vCPU, 8 Go RAM, SSD 100 Go + stockage fichiers, **upload ≥ 500 Mb/s (idéalement 1 Gb/s symétrique)**, IPv4 publique. La bande passante est le facteur limitant (un stream 1080p60 vu par 10 personnes ≈ 80 Mb/s sortants).
@@ -287,7 +296,7 @@ cd deploy && docker compose up -d
 | **M4** | Serveurs, channels textuels, catégories, rôles, permissions, modération | Kick/ban retire l'accès cryptographique |
 | **M5** | Pièces jointes chiffrées, avatars, bannières, emojis personnalisés, réactions, recherche locale | |
 | **M6** | Vocal : LiveKit, E2EE via exporter MLS, channels vocaux, appels DM | Appel à 5 personnes, E2EE actif, rotation à l'arrivée/départ |
-| **M7** | Webcam + partage d'écran 1080p60 sur les 3 OS | 1080p60 stable à 8 Mb/s avec encodage matériel |
+| **M7** | Webcam + partage d'écran 1080p60 sur les 3 OS | 1080p60 stable à 8 Mb/s, avec encodage matériel quand il est disponible |
 | **M8** | Finitions : notifications desktop, paramètres, thèmes, i18n, updater, packaging | Installeurs signés publiés par la CI |
 | **M9** | Durcissement : revue du threat model, fuzzing, audit des dépendances, guide d'auto-hébergement complet | |
 
@@ -295,10 +304,12 @@ cd deploy && docker compose up -d
 
 ## 12. Décisions ouvertes (à trancher avec le mainteneur, ne pas décider seul)
 
-1. **Historique pour les nouveaux membres d'un channel** : avec MLS, un nouveau membre ne peut pas lire les messages antérieurs à son arrivée. Défaut v1 : pas d'historique antérieur (documenté). Option future : partage d'historique chiffré par un membre existant (ADR à écrire).
-2. **Nom définitif du projet**.
-3. **Signature de code** des installeurs (certificat Windows, compte Apple Developer pour la notarisation macOS) : coût et procédure.
+1. **Historique pour les nouveaux membres d'un channel** : tranché pour la v1 — pas d'historique antérieur, ni pour un nouveau membre ni pour un nouvel appareil (ADR 0006). Option future : partage d'historique chiffré par un membre existant (ADR à écrire).
+2. **Nom définitif du projet** : reste Tavern pour l'instant.
+3. **Signature de code** des installeurs (certificat Windows, compte Apple Developer pour la notarisation macOS) : reportée au M8.
 4. **Rendu vidéo** : dans le webview (simple) ou natif via wgpu (plus performant) — à décider au jalon M7 après mesure.
+5. **Encodeur Media Foundation** (QuickSync/AMF sous Windows) : à décider au M7 après mesure.
+6. **Mécanisme d'entrée dans les channels d'un serveur** (external commit autorisé par les rôles, ou ajout par un membre en ligne) : à concevoir au M4.
 
 ---
 
