@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Fuzzes the protocol decoders. Never runs on pushes or pull requests: once a
+# week and on demand, for a bounded time per target, to keep Actions minutes
+# under control.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "180"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [client_frame, server_frame, device_certificate]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+      - name: Fuzz
+        working-directory: crates/protocol/fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '180' }}
+        run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="$SECONDS_PER_TARGET" -max_len=65536
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: crates/protocol/fuzz/artifacts

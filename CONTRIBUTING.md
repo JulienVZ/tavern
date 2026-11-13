@@ -47,6 +47,13 @@ pnpm --filter tavern-ui check
 pnpm --filter tavern-ui test
 ```
 
+Fuzz the protocol decoders (needs the nightly toolchain and `cargo install cargo-fuzz`; CI does it weekly):
+
+```bash
+cd crates/protocol/fuzz
+cargo +nightly fuzz run client_frame -- -max_total_time=60
+```
+
 Run a development server stack, published on the loopback interface only:
 
 ```bash
