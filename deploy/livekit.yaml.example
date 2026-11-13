@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# LiveKit server configuration for a Tavern instance.
+# init.sh copies this file to livekit.yaml. It contains no secret: the API key
+# and secret come from the LIVEKIT_KEYS environment variable (see .env).
+#
+# Reference: https://docs.livekit.io/transport/self-hosting/
+
+# Signalling (HTTP and WebSocket). Reached through Caddy only, never published.
+port: 7880
+
+rtc:
+  # ICE over TCP, used when UDP is blocked.
+  tcp_port: 7881
+  # A single UDP port multiplexes all media. Simple to forward on a home
+  # router and compatible with Docker's bridge network.
+  udp_port: 7882
+  # Do not ask external STUN servers for the public address: Tavern makes no
+  # call to third parties. The address comes from LIVEKIT_NODE_IP in .env.
+  use_external_ip: false
+
+# TURN is disabled by default. To enable TURN over TLS on port 5349 for users
+# behind restrictive networks, see docs/self-hosting.md.
+turn:
+  enabled: false
+
+logging:
+  level: info

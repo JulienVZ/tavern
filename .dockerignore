@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The server image is built from the repository root (see deploy/Dockerfile).
+# Cargo needs every workspace manifest, so apps/desktop/src-tauri stays in the
+# context, without its assets.
+
+.git
+.github
+.idea
+target
+**/node_modules
+**/dist
+docs
+deploy
+apps/desktop/ui
+apps/desktop/src-tauri/icons
+apps/desktop/src-tauri/gen
+**/.env
+**/.DS_Store

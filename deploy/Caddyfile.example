@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Caddy configuration for a Tavern instance.
+# init.sh copies this file to Caddyfile. Domains come from .env.
+#
+# Caddy obtains and renews TLS certificates automatically. For "localhost"
+# names it uses its own local certificate authority.
+#
+# No access log is configured, so client IP addresses are not recorded.
+
+{
+	admin off
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+# REST API and real-time gateway.
+{$TAVERN_DOMAIN} {
+	import security_headers
+	reverse_proxy server:8080
+}
+
+# LiveKit signalling.
+{$LIVEKIT_DOMAIN} {
+	import security_headers
+	reverse_proxy livekit:7880
+}

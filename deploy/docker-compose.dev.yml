@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Development override. Publishes the server and PostgreSQL on the loopback
+# interface only, so that a locally built client can reach the server over
+# plain HTTP and the integration tests can reach the database.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Never use this file on a real instance.
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${DEV_POSTGRES_PORT:-5432}:5432"
+
+  server:
+    ports:
+      - "127.0.0.1:${DEV_SERVER_PORT:-8080}:8080"
