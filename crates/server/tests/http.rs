@@ -98,3 +98,17 @@ async fn unknown_routes_return_404() {
 
     assert_eq!(response.status(), 404);
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn wrong_database_password_is_explained() {
+    let mut url = reqwest::Url::parse(&std::env::var(DATABASE_URL_VAR).unwrap()).unwrap();
+    url.set_password(Some("not-the-password")).unwrap();
+
+    let error = db::connect(url.as_str(), 1).await.unwrap_err();
+
+    assert!(
+        matches!(error, db::ConnectError::AuthenticationFailed),
+        "{error:?}"
+    );
+}

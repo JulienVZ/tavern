@@ -52,9 +52,9 @@ async fn run() -> anyhow::Result<()> {
         "starting tavern-server"
     );
 
-    let pool = db::connect(&config.database_url, config.db_max_connections)
-        .await
-        .context("cannot connect to PostgreSQL")?;
+    // The error text explains the cause and the fix; `main` prints it to
+    // stderr, which is what `docker compose logs` shows.
+    let pool = db::connect(&config.database_url, config.db_max_connections).await?;
 
     if config.run_migrations {
         db::migrate(&pool)
