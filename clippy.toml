@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# `unwrap`/`expect` are denied workspace-wide (see Cargo.toml) except in tests.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Gateway protocol, major version 1.
+//
+// Specification: docs/protocol.md. This file currently holds the session
+// subset only; authentication and messaging payloads arrive with M1 and M2.
+//
+// Compatibility rules: additive changes only, never reuse or renumber a field
+// or an enum value, mark removed ones as `reserved`.
+
+syntax = "proto3";
+
+package tavern.gateway.v1;
+
+// Client to server. One message per binary WebSocket frame.
+message ClientFrame {
+  // Chosen by the client, unique per connection, never 0. Echoed in the response.
+  uint64 request_id = 1;
+
+  oneof payload {
+    Hello hello = 10;
+    Heartbeat heartbeat = 11;
+  }
+}
+
+// Server to client.
+message ServerFrame {
+  // Copy of the request id for a response; 0 for an event.
+  uint64 request_id = 1;
+
+  oneof payload {
+    Error error = 9;
+    Ready ready = 10;
+    HeartbeatAck heartbeat_ack = 11;
+  }
+}
+
+// First frame of every connection. Must arrive within the Hello deadline.
+message Hello {
+  bytes session_token = 1;
+  uint32 protocol_minor = 2;
+  string client_version = 3;
+  string client_platform = 4;
+}
+
+message Ready {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  uint32 protocol_minor = 3;
+  uint64 server_time_ms = 4;
+  Limits limits = 5;
+  // Current Ed25519 public key of the instance's MLS external sender.
+  bytes mls_external_sender_key = 6;
+  uint32 key_packages_remaining = 7;
+}
+
+message Limits {
+  uint32 max_frame_bytes = 1;
+  uint32 max_application_message_bytes = 2;
+  uint64 max_upload_bytes = 3;
+  uint32 heartbeat_interval_ms = 4;
+}
+
+message Heartbeat {}
+
+message HeartbeatAck {
+  uint64 server_time_ms = 1;
+}
+
+message Error {
+  ErrorCode code = 1;
+  // English, for logs. User interfaces localise from the code.
+  string message = 2;
+  // Set for RATE_LIMITED and UNAVAILABLE.
+  uint32 retry_after_ms = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_ARGUMENT = 1;
+  ERROR_CODE_UNAUTHENTICATED = 2;
+  ERROR_CODE_FORBIDDEN = 3;
+  ERROR_CODE_NOT_FOUND = 4;
+  ERROR_CODE_ALREADY_EXISTS = 5;
+  ERROR_CODE_PAYLOAD_TOO_LARGE = 6;
+  ERROR_CODE_RATE_LIMITED = 7;
+  ERROR_CODE_UNSUPPORTED_VERSION = 8;
+  ERROR_CODE_UNSUPPORTED_MESSAGE = 9;
+  ERROR_CODE_INTERNAL = 10;
+  ERROR_CODE_UNAVAILABLE = 11;
+}

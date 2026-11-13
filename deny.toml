@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# cargo-deny configuration. Run with `cargo deny check`.
+# Policy: CLAUDE.md §10 and docs/adr/0007-agpl-license.md.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # proc-macro-error (unmaintained) is a build-time dependency of the GTK 3
+    # bindings that Tauri 2 uses on Linux. There is no upgrade until Tauri moves
+    # off GTK 3. To be re-evaluated on every Tauri upgrade and at milestone M9.
+    { id = "RUSTSEC-2024-0370", reason = "transitive build-time dependency of Tauri's GTK 3 stack on Linux" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# The allow list is a policy, not a mirror of the current dependency tree.
+unused-allowed-license = "allow"
+# Licences compatible with AGPL-3.0-or-later.
+allow = [
+    "AGPL-3.0-or-later",
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+# No OpenSSL in the default build: TLS goes through rustls.
+deny = [
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "native-tls", use-instead = "rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
