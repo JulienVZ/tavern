@@ -85,6 +85,7 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 ├── Cargo.toml                 # Workspace Rust
 ├── rust-toolchain.toml
 ├── deny.toml                  # cargo-deny (licences, advisories, sources)
+├── clippy.toml / rustfmt.toml # Lints et formatage
 ├── crates/
 │   ├── protocol/              # Types partagés client/serveur, .proto, versionnage
 │   ├── crypto/                # Wrapper OpenMLS, gestion des clés, dérivation clés média, chiffrement fichiers
@@ -97,10 +98,12 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 │       └── ui/                # Svelte 5 + TS
 ├── deploy/
 │   ├── docker-compose.yml     # server + postgres + livekit + caddy
+│   ├── docker-compose.dev.yml # Surcharge de dév : serveur et Postgres publiés sur 127.0.0.1
+│   ├── Dockerfile             # Image du serveur (multi-stage, distroless, non-root)
 │   ├── .env.example           # Toutes les variables documentées
 │   ├── livekit.yaml.example
 │   ├── Caddyfile.example
-│   └── scripts/               # backup.sh, restore.sh, create-admin.sh
+│   └── scripts/               # init.sh, backup.sh, restore.sh, create-admin.sh
 ├── docs/
 │   ├── architecture.md
 │   ├── threat-model.md        # Ce que le serveur voit / ne voit pas, adversaires considérés
@@ -264,15 +267,36 @@ L'expérience d'un admin d'instance est une fonctionnalité à part entière.
 
 ### Commandes utiles
 ```bash
+# Rust (la toolchain est épinglée par rust-toolchain.toml ; protoc n'est pas requis)
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo deny check
-cd apps/desktop/ui && pnpm install && pnpm check && pnpm test
+
+# UI (workspace pnpm dans apps/desktop, paquet tavern-ui)
+cd apps/desktop && pnpm install
+pnpm --filter tavern-ui check
+pnpm --filter tavern-ui test
+pnpm --filter tavern-ui build
+
+# Client desktop
 cd apps/desktop && pnpm tauri dev
-cd deploy && docker compose up -d
+
+# Instance complète (server + postgres + livekit + caddy)
+cd deploy && ./scripts/init.sh        # crée .env, Caddyfile, livekit.yaml et les secrets
+docker compose up -d
+curl https://<TAVERN_DOMAIN>/health
+
+# Pile de développement : serveur sur http://localhost:8080, Postgres sur localhost:5432
+cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+
+# Tests d'intégration serveur (nécessitent PostgreSQL ; mot de passe dans deploy/.env)
+TAVERN_TEST_DATABASE_URL=postgres://tavern:<mot de passe>@localhost:5432/tavern \
+  cargo test --package tavern-server -- --ignored
+
+# Sauvegarde / restauration
+cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.gz
 ```
-(À mettre à jour dès que le scaffolding existe.)
 
 ### CI (GitHub Actions)
 - Sur chaque PR : fmt, clippy, tests, `cargo deny`, `pnpm check`, build Tauri sur Windows, macOS et Linux.
