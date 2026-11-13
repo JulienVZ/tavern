@@ -78,7 +78,7 @@ jobs:
         working-directory: apps/desktop
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: apps/desktop/package.json
       - uses: actions/setup-node@v4
@@ -112,7 +112,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: apps/desktop/package.json
       - uses: actions/setup-node@v4
