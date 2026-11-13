@@ -22,10 +22,27 @@ publish = false
 [workspace.dependencies]
 # Internal crates
 tavern-protocol = { path = "crates/protocol" }
+tavern-crypto = { path = "crates/crypto" }
 tavern-client-core = { path = "crates/client-core" }
 
 # Shared third-party crates
 anyhow = "1.0"
+
+# Cryptography. These follow the RustCrypto generation that opaque-ke 4 is
+# built on (digest 0.10); see docs/adr/0011-account-identity-and-primitives.md.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+data-encoding = "2.11"
+ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
+hkdf = "0.12"
+opaque-ke = { version = "4.0.1", default-features = false, features = ["ristretto255", "argon2", "std"] }
+proptest = "1.12"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2.6"
+unicode-normalization = "0.1.26"
+zeroize = { version = "1.9", features = ["derive"] }
+
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "json", "tokio"] }
 prost = "0.14.6"
 prost-build = "0.14.6"
@@ -56,6 +73,18 @@ unwrap_used = "deny"
 expect_used = "deny"
 print_stdout = "warn"
 print_stderr = "warn"
+
+# Key stretching and curve arithmetic are unusably slow without optimisation:
+# a single Argon2id run at the production parameters takes seconds. These
+# packages are optimised in development and test builds too.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

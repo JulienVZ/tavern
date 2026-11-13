@@ -55,6 +55,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      # deny.toml ignores RUSTSEC-2026-0387 on the grounds that no crypto-bigint
+      # code is linked (docs/adr/0011). This keeps that claim true.
+      - name: crypto-bigint is not linked
+        run: |
+          CARGO_PROFILE_RELEASE_STRIP=none cargo build --release --locked \
+            --package tavern-crypto --example argon2_memory
+          count=$(nm target/release/examples/argon2_memory | grep -c crypto_bigint || true)
+          echo "crypto_bigint symbols: $count"
+          test "$count" -eq 0
       - name: Integration tests (PostgreSQL)
         run: cargo test --package tavern-server --locked -- --ignored
         env:

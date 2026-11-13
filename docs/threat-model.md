@@ -142,6 +142,7 @@ Rule: a feature that would require the server to read content is redesigned on t
 14. **Compromised device**: full access to that device's history and identity until revoked.
 15. **Dependencies before 1.0** (OpenMLS, LiveKit Rust SDK): no independent audit of Tavern's integration. The M9 milestone reviews this model, adds fuzzing and audits dependencies.
 16. **No TURN by default.** A client on a network that blocks UDP and non-HTTPS TCP cannot join calls unless the admin enables the optional TURN/TLS setup. This is an availability limit, not a confidentiality one.
+17. **Advisory RUSTSEC-2026-0387 accepted with justification.** `crypto-bigint` 0.5, a transitive dependency of `opaque-ke`, has known timing variability and no compatible fix. Its affected arithmetic is not linked into Tavern's binaries (our suite uses ristretto255 through `curve25519-dalek`), which CI verifies on every run. See [ADR 0011](adr/0011-account-identity-and-primitives.md).
 
 ## 6. Engineering rules that follow
 

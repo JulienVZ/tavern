@@ -12,8 +12,11 @@ The instance admin is part of the threat model: a curious admin, or anyone who c
 Use **OPAQUE** (RFC 9807) through the **`opaque-ke`** crate (4.0), with:
 
 - ristretto255 for the OPRF and key exchange groups, Triple-DH as the key exchange, SHA-512;
-- **Argon2id** as the key stretching function (feature `argon2`), parameters fixed in the `crypto` crate and benchmarked on low-end hardware at M1;
-- the handle as credential identifier.
+- **Argon2id** as the key stretching function (feature `argon2`): **128 MiB, 3 passes, 1 lane** (see "Argon2id parameters" below);
+- the canonical handle as client identity. **A handle therefore cannot be changed in v1**: the password record is bound to it. The canonical form is strict (ASCII `a–z 0–9 _ .`, 2 to 32 characters, lower case) and implemented once, in `tavern_protocol::handle`, for both sides;
+- no server identity tied to the domain name (the server's OPAQUE public key is used), so an instance can change its domain without invalidating passwords;
+- passwords normalised to Unicode NFKC before use, so the same password typed on two operating systems gives the same bytes;
+- a **suite number** stored with each account (`users.opaque_suite`, currently 1) and returned by `login/start`, so the parameters can evolve.
 
 Server side:
 
@@ -31,6 +34,43 @@ Client side, the OPAQUE **export key** (derived from the password, never known t
 - **Password strength is enforced on the client**, since the server never sees the password: at registration and at every password change the client requires at least 12 characters and a strength estimate of 3 out of 4 or better (zxcvbn-style estimator, run locally, fed with the handle and display name as penalised words). The UI explains why: the password also protects the account identity key.
 - **Every device enrolment is announced.** The server sends `DeviceListChanged` to all existing devices of the account, which show a notification naming the new device and offering to revoke it. Contacts see a visible notice ("Alice added a new device") in each shared conversation when the new leaf joins, and the server sends `UserDevicesChanged` to friends. An enrolment made by someone who cracked the password therefore cannot go unnoticed.
 - The recovery key is displayed once. It allows a password reset without losing the identity: the client unwraps the AIK with it, runs a new OPAQUE registration and uploads a new password-wrapped copy.
+
+## Argon2id parameters
+
+Measured on 2026-11-13 with the `argon2` crate 0.5, one lane, median of five runs:
+
+| Memory, passes | Apple M4 (macOS) | GitHub runner, Linux (2 cores, AMD EPYC 9V74) | GitHub runner, Windows (2 cores, Intel Xeon Platinum) |
+|---|---|---|---|
+| 19 MiB, t=2 | 12 ms | 13 ms | 22 ms |
+| 46 MiB, t=1 | 15 ms | 38 ms | 36 ms |
+| 64 MiB, t=1 | 21 ms | 54 ms | 50 ms |
+| 64 MiB, t=2 | 44 ms | 81 ms | 78 ms |
+| 64 MiB, t=3 | 67 ms | 109 ms | 105 ms |
+| 128 MiB, t=2 | 94 ms | 173 ms | 171 ms |
+| **128 MiB, t=3** | **141 ms** | **231 ms** | **228 ms** |
+| 256 MiB, t=2 | 198 ms | 364 ms | 349 ms |
+
+The runner figures come from the manual workflow `.github/workflows/argon2-bench.yml`. Hosted runners are recent server processors, not modest machines; assuming an old laptop three to five times slower, a login costs between 0.7 and 1.2 seconds there.
+
+Not measured yet: a container limited to one core (Docker was unavailable on the development machine that day). To be added here when done.
+
+Chosen: **128 MiB, 3 passes, 1 lane**. The `argon2` crate does not run lanes in parallel by default, so more lanes would add time without adding cost for an attacker.
+
+**Memory budget exception.** The client's idle budget is 150 MB. Argon2id needs 128 MiB for the duration of one registration or login, which exceeds it for a fraction of a second. This is accepted as a transient exception: the computation runs once per login, off the UI thread. Measured with `cargo run --release -p tavern-crypto --example argon2_memory` on macOS: physical footprint 1 MiB before, 129 MiB right after the computation, back to 1 MiB two seconds later (the allocator returns the block to the system with a short delay). The same check must be repeated on Windows and Linux before M1 is closed.
+
+The server never runs Argon2id.
+
+## Credential changes
+
+Every change is authorised by a signature of the account identity key over a single-use server challenge, the handle and the new values (`tavern_crypto::identity::CredentialUpdate`).
+
+- **Recovery** (`recover/start`, `recover/finish`): the client opens the "recovery" wrapped copy with the recovery key, registers a new password and uploads a new "password" wrapped copy. The server then revokes every session. TOTP stays enabled. For an unknown handle, `recover/start` returns a decoy copy derived from a dedicated instance secret (`TAVERN_HANDLE_PRIVACY_KEY`) and the handle, stable across requests like a real one.
+- **Password change** (`auth/reauth/*`, then `account/password/*`): requires a full OPAQUE login from an existing session (and TOTP when enabled). The AIK is re-wrapped under the new export key. Every other session of the account is revoked.
+- **Recovery key rotation**: after the same re-authentication, the client generates a new recovery key and uploads a new "recovery" wrapped copy. The previous recovery key stops working. This is the remedy for a user who thinks the key leaked.
+- **Reopening a session on an existing device**: after a login, the server issues a single-use nonce with the enrolment token; the device signs the nonce, the account id and its own id. Revoked devices are refused.
+- **An administrator can disable a user's TOTP** when the user lost both the authenticator and the recovery codes. All the user's devices are notified and the action is recorded in the administration log. TOTP is enforced by the server only, so this does not weaken the model: an administrator could already bypass it by other means, and it never protects the wrapped keys.
+
+The wrapped "password" copy is returned only after OPAQUE succeeded, and after TOTP when it is enabled.
 
 ## Alternatives considered
 

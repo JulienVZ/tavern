@@ -14,6 +14,14 @@ ignore = [
     # bindings that Tauri 2 uses on Linux. There is no upgrade until Tauri moves
     # off GTK 3. To be re-evaluated on every Tauri upgrade and at milestone M9.
     { id = "RUSTSEC-2024-0370", reason = "transitive build-time dependency of Tauri's GTK 3 stack on Linux" },
+    # crypto-bigint 0.5 (timing variability, fixed only in 0.7.6) comes from
+    # elliptic-curve 0.13, a dependency of opaque-ke 4 and voprf 0.5. Tavern's
+    # OPAQUE suite uses ristretto255 only, whose arithmetic is in
+    # curve25519-dalek: no crypto-bigint arithmetic is linked into our
+    # binaries. CI checks this on every run (see "crypto-bigint is not linked"
+    # in .github/workflows/ci.yml). Analysis: docs/adr/0011, section
+    # "Known advisory". Re-evaluate on every opaque-ke upgrade and at M9.
+    { id = "RUSTSEC-2026-0387", reason = "affected code is not linked: ristretto255 arithmetic uses curve25519-dalek; verified in CI" },
 ]
 
 [licenses]

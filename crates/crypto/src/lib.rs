@@ -2,12 +2,32 @@
 
 //! Cryptographic building blocks of Tavern.
 //!
-//! This crate will wrap OpenMLS (groups, credentials, KeyPackages, exporter),
-//! `opaque-ke` (registration and login), account identity keys, media key
-//! derivation and attachment encryption. It never implements a primitive
-//! itself. See `docs/adr/0002-mls-via-openmls.md` and
-//! `docs/adr/0003-opaque-authentication.md`.
+//! This crate assembles audited primitives (`opaque-ke`, `ed25519-dalek`,
+//! RustCrypto) and implements none itself. At milestone M1 it covers account
+//! authentication and identity:
 //!
-//! The crate is intentionally empty until milestone M1.
+//! - [`opaque`]: OPAQUE registration and login, client and server sides;
+//! - [`identity`]: account identity key, its wrapped copies, device keys,
+//!   device certificates and the signatures that authorise credential changes;
+//! - [`recovery`]: the recovery key shown once to the user;
+//! - [`token`]: random tokens and their hashes;
+//! - [`secret`]: containers that erase secrets from memory.
+//!
+//! MLS arrives with milestone M2. Design: `docs/adr/0003-opaque-authentication.md`
+//! and `docs/adr/0011-account-identity-and-primitives.md`.
+//!
+//! The server uses this crate to verify and to run the server half of OPAQUE.
+//! It never holds a key that decrypts user content.
 
 #![forbid(unsafe_code)]
+
+mod encoding;
+mod error;
+
+pub mod identity;
+pub mod opaque;
+pub mod recovery;
+pub mod secret;
+pub mod token;
+
+pub use error::CryptoError;
