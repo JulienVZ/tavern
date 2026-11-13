@@ -75,8 +75,8 @@ You need a Linux machine with Docker, two DNS names pointing to it, and ports 80
 git clone https://github.com/JulienVZ/tavern.git
 cd tavern/deploy
 
-./scripts/init.sh          # creates .env and generates the secrets
-nano .env                  # set the three values below
+./scripts/init.sh          # creates .env, generates the secrets, asks for the host names
+nano .env                  # set LIVEKIT_NODE_IP
 docker compose up -d
 ```
 

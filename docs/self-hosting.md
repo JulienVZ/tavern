@@ -79,10 +79,11 @@ Friends on the same local network as the server need the router to support NAT l
 git clone https://github.com/JulienVZ/tavern.git
 cd tavern/deploy
 
-# Creates .env, Caddyfile and livekit.yaml, and generates the secrets.
+# Creates .env, Caddyfile and livekit.yaml, generates the secrets and asks
+# for the two host names.
 ./scripts/init.sh
 
-# Set at least TAVERN_DOMAIN, LIVEKIT_DOMAIN and LIVEKIT_NODE_IP.
+# Set LIVEKIT_NODE_IP to the public IPv4 address of the machine.
 nano .env
 
 docker compose up -d
@@ -98,7 +99,11 @@ curl https://chat.example.org/health
 # {"status":"ok","database":"ok"}
 ```
 
-`deploy/.env` contains the instance secrets. Keep it private (`init.sh` sets its permissions to `600`) and include it in your backups.
+`init.sh` never overwrites an existing value. Without a terminal (in a provisioning script, for example) it cannot ask for the host names: it lists what is still empty and exits with an error, and you set `TAVERN_DOMAIN` and `LIVEKIT_DOMAIN` in `deploy/.env` yourself.
+
+`deploy/.env` contains the instance secrets. Keep it private (`init.sh` sets its permissions to `600`).
+
+> **`.env` and the database belong together.** PostgreSQL stores its password inside its data volume when the volume is first created, and never reads `POSTGRES_PASSWORD` again. If `.env` is deleted or regenerated while the volume is kept, the new password does not match: PostgreSQL still reports "healthy", and the Tavern server stops with *"PostgreSQL rejected the credentials"*. Always back up and restore `.env` together with the database; `backup.sh` puts both in the same archive.
 
 Every variable is described in [configuration.md](configuration.md).
 
@@ -108,9 +113,10 @@ Registration is closed by default: accounts are created with invitation codes is
 
 ### Trying it on your own computer
 
-For a local test without a domain, set `TAVERN_DOMAIN=localhost` and `LIVEKIT_DOMAIN=livekit.localhost`, leave `LIVEKIT_NODE_IP` empty, then:
+For a local test without a domain:
 
 ```bash
+./scripts/init.sh --dev    # sets localhost and livekit.localhost
 docker compose up -d
 curl --insecure https://localhost/health
 ```
@@ -137,7 +143,7 @@ cd deploy
 ./scripts/restore.sh backups/tavern-<timestamp>.tar.gz
 ```
 
-A backup contains the PostgreSQL dump, `.env` (configuration **and secrets**), `Caddyfile` and `livekit.yaml`. Encrypt it and copy it off the machine.
+A backup contains the PostgreSQL dump, `.env` (configuration **and secrets**), `Caddyfile` and `livekit.yaml`. Encrypt it and copy it off the machine. The dump alone is not enough: without the matching `.env` the restored instance cannot be used.
 
 What the secrets protect, and why they must be backed up together with the database:
 
@@ -184,7 +190,8 @@ Instead of a single multiplexed UDP port, LiveKit can use a range of UDP ports (
 
 | Symptom | Check |
 |---|---|
-| `docker compose up` says a variable is not set | Run `./scripts/init.sh`, then set the domains in `.env`. |
+| `docker compose up` says a variable is not set | Run `./scripts/init.sh` (or `./scripts/init.sh --dev` for a local test). |
+| The server restarts in a loop with "PostgreSQL rejected the credentials" | `.env` does not match the database volume. Restore the `.env` from your backup. On an instance with nothing to keep: `docker compose down -v`, then start again. |
 | Caddy cannot obtain a certificate | DNS records point to this machine; ports 80 and 443 reachable from outside; `docker compose logs caddy`. |
 | `/health` answers 503 | `docker compose logs server postgres`. The database is unreachable. |
 | The server restarts in a loop | `docker compose logs server`: an invalid variable is named in the error. |
