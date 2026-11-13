@@ -6,6 +6,7 @@ pub mod account;
 pub mod admin;
 pub mod auth;
 pub mod devices;
+pub mod gateway;
 pub mod system;
 
 use axum::routing::get;
@@ -62,10 +63,12 @@ pub fn router(state: AppState) -> Router<AppState> {
         .routes(routes!(admin::disable_user_totp))
         .split_for_parts();
 
-    router.route(
-        "/v1/openapi.json",
-        get(move || std::future::ready(Json(api.clone()))),
-    )
+    router
+        .route(
+            "/v1/openapi.json",
+            get(move || std::future::ready(Json(api.clone()))),
+        )
+        .route(tavern_protocol::GATEWAY_PATH, get(gateway::connect))
 }
 
 /// Parses a handle received from a client: it must already be canonical.

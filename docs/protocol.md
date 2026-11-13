@@ -43,6 +43,7 @@ message ClientFrame {
   oneof payload {
     Hello hello = 10;
     Heartbeat heartbeat = 11;
+    AckDeviceList ack_device_list = 12;
 
     // M2
     SendMessage send_message = 20;
@@ -66,15 +67,17 @@ message ServerFrame {
     Ready ready = 10;
     HeartbeatAck heartbeat_ack = 11;
 
+    Ack ack = 12;
+
     // M1 events
     SessionRevoked session_revoked = 15;
     DeviceListChanged device_list_changed = 16;
+    SecurityNotice security_notice = 17;
 
     // M2 responses
     SendMessageAck send_message_ack = 20;
     CommitAck commit_ack = 21;
     MessageBatch message_batch = 22;
-    Ack ack = 23;
     GroupInfo group_info = 25;
 
     // M2 events
@@ -105,8 +108,9 @@ Rules:
 2. It sends `Hello` within 10 seconds, otherwise the server closes with 4001.
 3. The server answers `Ready`, or `Error` followed by a close.
 4. The client sends `Heartbeat` every 30 seconds. The server closes a connection that has been silent for 75 seconds.
-5. After `Ready`, the client catches up: for each conversation, `FetchMessages` from its last acknowledged sequence number. Pending welcomes are re-sent by the server as `WelcomeEvent` until acknowledged.
-6. On disconnect the client reconnects with exponential backoff and jitter (1 s up to 60 s).
+5. On every `Heartbeat` the server checks that the session is still valid, and closes with 4003 when it is not. `Ready` lists the devices enrolled while this device was away; the client shows them, then sends `AckDeviceList`.
+6. From M2: after `Ready`, the client catches up: for each conversation, `FetchMessages` from its last acknowledged sequence number. Pending welcomes are re-sent by the server as `WelcomeEvent` until acknowledged.
+7. On disconnect the client reconnects with exponential backoff and jitter (1 s up to 60 s). It does not reconnect after 4002 or 4003: the session is gone and the user must log in again.
 
 One connection per device. A second connection with the same session closes the first (4004).
 
@@ -170,7 +174,18 @@ message Ready {
   Limits limits = 5;
   bytes mls_external_sender_key = 6;  // current Ed25519 public key
   uint32 key_packages_remaining = 7;
+  // Devices enrolled since this device last sent AckDeviceList.
+  repeated DeviceSummary new_devices = 8;
 }
+
+message DeviceSummary {
+  bytes device_id = 1;
+  Platform platform = 2;
+  uint64 created_at_ms = 3;
+}
+
+// The user has seen the device list. Answered with Ack.
+message AckDeviceList {}
 
 message Limits {
   uint32 max_frame_bytes = 1;
@@ -191,17 +206,22 @@ message Error {
   uint64 current_epoch = 4;    // set for EPOCH_CONFLICT and STALE_EPOCH
 }
 
-// The session was revoked (logout elsewhere, device removed, account disabled).
-// The server closes the connection right after.
+// The session of this device ended. The server closes the connection next
+// (4003, or 4004 when replaced by a newer connection of the same device).
 message SessionRevoked { RevocationReason reason = 1; }
+// REVOKED | CREDENTIALS_CHANGED | ACCOUNT_DISABLED | REPLACED
 
-// One of the user's own devices was added or revoked. Sent to every other
-// device of the account; clients show a notification with a revoke action
-// when a device was added.
+// A device of the account was enrolled (added) or revoked. Sent to every
+// other connected device of the account. For an enrolment the client notifies
+// the user and offers to revoke the new device.
 message DeviceListChanged {
   bytes device_id = 1;
   bool added = 2;
 }
+
+// Something security-relevant happened to the account, e.g. an administrator
+// disabled its TOTP.
+message SecurityNotice { SecurityNoticeKind kind = 1; }
 ```
 
 ## 5. Messages for M2 (friends and encrypted DMs)
@@ -485,4 +505,4 @@ Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE
 - Decoders treat every input as hostile: bounded allocation, no recursion on attacker-controlled depth, strict length checks before copying.
 - Neither side logs tokens, keys, `mls_*` fields or decrypted content.
 - The client verifies `mls_external_sender_key` from `Ready` against the `external_senders` extension of each group and repairs mismatches as described in [ADR 0002](adr/0002-mls-via-openmls.md#external-sender-key-lifecycle).
-- The gateway decoders are fuzz targets (`cargo-fuzz`); encode/decode round trips are property tested.
+- The gateway and certificate decoders are fuzz targets (`crates/protocol/fuzz`, run weekly and on demand by `.github/workflows/fuzz.yml`); encode/decode round trips are property tested.

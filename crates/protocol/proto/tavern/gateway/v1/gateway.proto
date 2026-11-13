@@ -2,8 +2,8 @@
 
 // Gateway protocol, major version 1.
 //
-// Specification: docs/protocol.md. This file currently holds the session
-// subset only; authentication and messaging payloads arrive with M1 and M2.
+// Specification: docs/protocol.md. This file holds the session and account
+// messages of milestone M1; messaging payloads arrive with M2.
 //
 // Compatibility rules: additive changes only, never reuse or renumber a field
 // or an enum value, mark removed ones as `reserved`.
@@ -20,6 +20,7 @@ message ClientFrame {
   oneof payload {
     Hello hello = 10;
     Heartbeat heartbeat = 11;
+    AckDeviceList ack_device_list = 12;
   }
 }
 
@@ -32,6 +33,12 @@ message ServerFrame {
     Error error = 9;
     Ready ready = 10;
     HeartbeatAck heartbeat_ack = 11;
+    Ack ack = 12;
+
+    // Events (request_id = 0).
+    SessionRevoked session_revoked = 15;
+    DeviceListChanged device_list_changed = 16;
+    SecurityNotice security_notice = 17;
   }
 }
 
@@ -52,6 +59,65 @@ message Ready {
   // Current Ed25519 public key of the instance's MLS external sender.
   bytes mls_external_sender_key = 6;
   uint32 key_packages_remaining = 7;
+  // Devices enrolled on the account since this device last acknowledged the
+  // device list. The client shows them to the user, with a way to revoke
+  // them, then sends AckDeviceList.
+  repeated DeviceSummary new_devices = 8;
+}
+
+message DeviceSummary {
+  bytes device_id = 1;
+  Platform platform = 2;
+  uint64 created_at_ms = 3;
+}
+
+enum Platform {
+  PLATFORM_UNSPECIFIED = 0;
+  PLATFORM_WINDOWS = 1;
+  PLATFORM_MACOS = 2;
+  PLATFORM_LINUX = 3;
+}
+
+// The user has seen the device list as of now.
+message AckDeviceList {}
+
+// Generic success response.
+message Ack {}
+
+// The session of this device ended. The server closes the connection next.
+message SessionRevoked {
+  RevocationReason reason = 1;
+}
+
+enum RevocationReason {
+  REVOCATION_REASON_UNSPECIFIED = 0;
+  // The user logged out or revoked this device.
+  REVOCATION_REASON_REVOKED = 1;
+  // The password was changed or recovered from another device.
+  REVOCATION_REASON_CREDENTIALS_CHANGED = 2;
+  // The account was disabled by an administrator.
+  REVOCATION_REASON_ACCOUNT_DISABLED = 3;
+  // A newer connection of the same device replaced this one.
+  REVOCATION_REASON_REPLACED = 4;
+}
+
+// A device of the account was enrolled or revoked. Sent to every other
+// connected device of the account. For an enrolment the client notifies the
+// user and offers to revoke the new device.
+message DeviceListChanged {
+  bytes device_id = 1;
+  bool added = 2;
+}
+
+// Something security-relevant happened to the account.
+message SecurityNotice {
+  SecurityNoticeKind kind = 1;
+}
+
+enum SecurityNoticeKind {
+  SECURITY_NOTICE_KIND_UNSPECIFIED = 0;
+  // An administrator disabled TOTP on this account.
+  SECURITY_NOTICE_KIND_TOTP_DISABLED_BY_ADMIN = 1;
 }
 
 message Limits {

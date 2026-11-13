@@ -10,6 +10,8 @@ members = [
     "crates/media",
     "apps/desktop/src-tauri",
 ]
+# Built only by the fuzzing workflow, with a nightly toolchain.
+exclude = ["crates/protocol/fuzz"]
 
 [workspace.package]
 version = "0.0.1"
@@ -43,7 +45,8 @@ subtle = "2.6"
 unicode-normalization = "0.1.26"
 zeroize = { version = "1.9", features = ["derive"] }
 
-axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "json", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "json", "tokio", "ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 prost = "0.14.6"
 prost-build = "0.14.6"
 protox = "0.10.0"
@@ -59,6 +62,7 @@ totp-rs = { version = "6.0.0", features = ["otpauth"] }
 utoipa = { version = "6.0.0", features = ["uuid"] }
 utoipa-axum = "0.3.0"
 uuid = { version = "1.29", features = ["serde", "v4"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "net", "signal", "time", "io-util"] }
 tower-http = { version = "0.7.1", features = ["trace", "timeout", "limit"] }
 tracing = "0.1.44"

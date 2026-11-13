@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Fuzz targets for the protocol decoders (cargo-fuzz, nightly toolchain).
+# This package is outside the main workspace: it is built only by the fuzzing
+# workflow (.github/workflows/fuzz.yml) or by hand:
+#
+#   cargo +nightly fuzz run client_frame -- -max_total_time=60
+
+[package]
+name = "tavern-protocol-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.14.6"
+tavern-protocol = { path = ".." }
+
+[[bin]]
+name = "client_frame"
+path = "fuzz_targets/client_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_frame"
+path = "fuzz_targets/server_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_certificate"
+path = "fuzz_targets/device_certificate.rs"
+test = false
+doc = false
+bench = false
+
+# Not a member of the repository workspace.
+[workspace]

@@ -40,6 +40,36 @@ pub const GATEWAY_SUBPROTOCOL: &str = "tavern.v1";
 /// Largest gateway frame accepted by default, in bytes.
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1024 * 1024;
 
+/// Path of the gateway WebSocket endpoint.
+pub const GATEWAY_PATH: &str = "/gateway/v1";
+
+/// How long the server waits for `Hello` after the WebSocket opens, in milliseconds.
+pub const GATEWAY_HELLO_DEADLINE_MS: u64 = 10_000;
+
+/// How often a client sends `Heartbeat`, in milliseconds.
+pub const GATEWAY_HEARTBEAT_INTERVAL_MS: u32 = 30_000;
+
+/// Silence after which the server closes a connection, in milliseconds.
+pub const GATEWAY_HEARTBEAT_TIMEOUT_MS: u64 = 75_000;
+
+/// WebSocket close codes used by the gateway. See `docs/protocol.md`.
+pub mod close_code {
+    /// `Hello` not received in time.
+    pub const HELLO_TIMEOUT: u16 = 4001;
+    /// Authentication failed.
+    pub const AUTHENTICATION_FAILED: u16 = 4002;
+    /// The session was revoked.
+    pub const SESSION_REVOKED: u16 = 4003;
+    /// Replaced by a newer connection of the same device.
+    pub const REPLACED: u16 = 4004;
+    /// Unsupported protocol version.
+    pub const UNSUPPORTED_VERSION: u16 = 4005;
+    /// Heartbeat timeout.
+    pub const HEARTBEAT_TIMEOUT: u16 = 4006;
+    /// Malformed frame.
+    pub const MALFORMED_FRAME: u16 = 4008;
+}
+
 /// Largest JSON body accepted by the REST API by default, in bytes.
 pub const DEFAULT_MAX_REST_BODY_BYTES: usize = 64 * 1024;
 
