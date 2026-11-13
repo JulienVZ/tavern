@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: Self-hosting question
+description: Help with installing or running your own instance.
+labels: [self-hosting, question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read docs/self-hosting.md first. Never paste your `.env`, passwords, API keys or your public IP address.
+  - type: dropdown
+    id: hosting
+    attributes:
+      label: Where does the instance run?
+      options:
+        - VPS or dedicated server
+        - Home server behind a router
+        - Local test on my computer
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do, and what happens?
+    validations:
+      required: true
+  - type: textarea
+    id: services
+    attributes:
+      label: Output of `docker compose ps`
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: For example `docker compose logs server caddy livekit --tail 50`, with private data removed.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: From `GET /version`, or the image tag.

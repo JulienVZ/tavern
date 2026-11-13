@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: Feature request
+description: Suggest an improvement.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tavern is end-to-end encrypted: the server never reads message content. A feature that needs the
+        server to read content has to be designed on the client side, or it will be declined.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: e2ee
+    attributes:
+      label: End-to-end encryption
+      options:
+        - label: This can work without the server seeing message content, files or media.

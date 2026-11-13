@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Do not paste secrets, session tokens, `.env` contents or private messages.
+        For a security problem, use private vulnerability reporting instead (see SECURITY.md).
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Desktop client
+        - Server
+        - Deployment (Docker, Caddy, LiveKit)
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Client version and server version (`GET /version`), or commit hash.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system of the client
+      multiple: true
+      options:
+        - Windows
+        - macOS
+        - Linux (Wayland)
+        - Linux (X11)
+        - Not applicable
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log lines, with anything private removed.
+      render: text

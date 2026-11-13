@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, tests)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: tavern
+          POSTGRES_PASSWORD: tavern
+          POSTGRES_DB: tavern
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username tavern"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+      # The toolchain version comes from rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # `tauri::generate_context!` needs the frontend directory to exist.
+      - name: Create placeholder frontend directory
+        run: mkdir -p apps/desktop/ui/dist
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Integration tests (PostgreSQL)
+        run: cargo test --package tavern-server --locked -- --ignored
+        env:
+          TAVERN_TEST_DATABASE_URL: postgres://tavern:tavern@localhost:5432/tavern
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  ui:
+    name: UI (check, tests)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: apps/desktop/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter tavern-ui check
+      - run: pnpm --filter tavern-ui test
+      - run: pnpm --filter tavern-ui build
+
+  desktop:
+    name: Desktop build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies for Tauri
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: apps/desktop/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      # Compiles the frontend and the application; installers are built by the
+      # release workflow only.
+      - run: pnpm tauri build --debug --no-bundle
+
+  docker:
+    name: Server image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Validate the compose file
+        working-directory: deploy
+        run: |
+          ./scripts/init.sh
+          sed -i 's/^TAVERN_DOMAIN=$/TAVERN_DOMAIN=localhost/; s/^LIVEKIT_DOMAIN=$/LIVEKIT_DOMAIN=livekit.localhost/' .env
+          docker compose config --quiet
