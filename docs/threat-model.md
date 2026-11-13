@@ -138,10 +138,10 @@ Rule: a feature that would require the server to read content is redesigned on t
 10. **Members of a DM or group who are not in a call** hold the exporter secret from which that call's keys derive.
 11. **Prebuilt libwebrtc.** The LiveKit SDK downloads a binary WebRTC build at compile time. It processes plaintext media before encryption. Mitigation: exact version pinning, restricted sources in `deny.toml`, review on each upgrade. A build from source is an option for M9.
 12. **No history for new members or new devices** ([ADR 0006](adr/0006-no-prior-history-v1.md)); losing all devices loses the history. The UI says so; a remedy for a user's own devices is proposed in [ADR 0009](adr/0009-history-on-new-devices.md).
-16. **No TURN by default.** A client on a network that blocks UDP and non-HTTPS TCP cannot join calls unless the admin enables the optional TURN/TLS setup. This is an availability limit, not a confidentiality one.
 13. **Deleted messages** disappear from honest clients only. Ciphertext already delivered cannot be recalled.
 14. **Compromised device**: full access to that device's history and identity until revoked.
 15. **Dependencies before 1.0** (OpenMLS, LiveKit Rust SDK): no independent audit of Tavern's integration. The M9 milestone reviews this model, adds fuzzing and audits dependencies.
+16. **No TURN by default.** A client on a network that blocks UDP and non-HTTPS TCP cannot join calls unless the admin enables the optional TURN/TLS setup. This is an availability limit, not a confidentiality one.
 
 ## 6. Engineering rules that follow
 
