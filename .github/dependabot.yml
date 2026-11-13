@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# One pull request per week and per ecosystem: every update of an ecosystem,
+# whatever its size, lands in a single group.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -6,28 +9,42 @@ updates:
     schedule:
       interval: weekly
     groups:
-      rust-minor:
-        update-types: [minor, patch]
+      cargo:
+        patterns: ["*"]
 
   - package-ecosystem: npm
     directory: /apps/desktop
     schedule:
       interval: weekly
     groups:
-      npm-minor:
-        update-types: [minor, patch]
+      npm:
+        patterns: ["*"]
+    ignore:
+      # svelte-check supports TypeScript 5 and 6 only. Remove this entry when
+      # its peer dependency range accepts the next major version.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
 
   - package-ecosystem: docker
     directory: /deploy
     schedule:
       interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
 
   - package-ecosystem: docker-compose
     directory: /deploy
     schedule:
       interval: weekly
+    groups:
+      docker-compose:
+        patterns: ["*"]

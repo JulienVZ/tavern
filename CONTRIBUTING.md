@@ -51,8 +51,7 @@ Run a development server stack, published on the loopback interface only:
 
 ```bash
 cd deploy
-./scripts/init.sh
-# set TAVERN_DOMAIN=localhost and LIVEKIT_DOMAIN=livekit.localhost in .env
+./scripts/init.sh --dev    # local names: localhost and livekit.localhost
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 curl http://localhost:8080/health
 ```
@@ -85,5 +84,5 @@ pnpm tauri dev
 - [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `security:`.
 - Small, coherent commits. One topic per pull request.
 - Never commit secrets, `.env` files or real data.
-- CI must pass: formatting, clippy, tests, `cargo deny`, UI checks, and the desktop build on Linux, Windows and macOS.
+- CI must pass: formatting, clippy, tests, `cargo deny`, UI checks, and the desktop build. While the repository is private, pull requests build the desktop client on Linux only; Windows and macOS are built on pushes to `main`. **When the repository becomes public, re-enable the three systems on pull requests** (the `desktop` job matrix in `.github/workflows/ci.yml`).
 - Say in the pull request what you could not test (for example a platform you do not have).

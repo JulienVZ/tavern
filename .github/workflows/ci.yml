@@ -96,7 +96,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
+        # While the repository is private, pull requests build on Linux only
+        # and the three systems are built on pushes to main, to save Actions
+        # minutes. When the repository becomes public, build all three on pull
+        # requests too (see CONTRIBUTING.md).
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04", "windows-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -141,6 +145,5 @@ jobs:
       - name: Validate the compose file
         working-directory: deploy
         run: |
-          ./scripts/init.sh
-          sed -i 's/^TAVERN_DOMAIN=$/TAVERN_DOMAIN=localhost/; s/^LIVEKIT_DOMAIN=$/LIVEKIT_DOMAIN=livekit.localhost/' .env
+          ./scripts/init.sh --dev
           docker compose config --quiet
