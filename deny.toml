@@ -18,9 +18,13 @@ ignore = [
     # elliptic-curve 0.13, a dependency of opaque-ke 4 and voprf 0.5. Tavern's
     # OPAQUE suite uses ristretto255 only, whose arithmetic is in
     # curve25519-dalek: no crypto-bigint arithmetic is linked into our
-    # binaries. CI checks this on every run (see "crypto-bigint is not linked"
-    # in .github/workflows/ci.yml). Analysis: docs/adr/0011, section
-    # "Known advisory". Re-evaluate on every opaque-ke upgrade and at M9.
+    # binaries. Verified with `nm` on an optimised build (0 symbols) and on the
+    # unoptimised test binary (2 symbols, both generic helpers from `subtle`
+    # and `core` that the compiler placed in that crate's unit; no arithmetic).
+    # CI repeats the optimised check on every run (step "crypto-bigint is not
+    # linked" in .github/workflows/ci.yml). Method and results:
+    # docs/adr/0011-account-identity-and-primitives.md, "Known advisory".
+    # Re-evaluate on every opaque-ke upgrade and at M9.
     { id = "RUSTSEC-2026-0387", reason = "affected code is not linked: ristretto255 arithmetic uses curve25519-dalek; verified in CI" },
 ]
 

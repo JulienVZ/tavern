@@ -71,6 +71,30 @@ Analysis (2026-11-14):
 - Our OPAQUE suite uses ristretto255 for both the OPRF and the key exchange. That arithmetic is implemented by `curve25519-dalek`. `crypto-bigint` backs the scalar types of the NIST curves in `elliptic-curve`, which our suite does not instantiate; from `elliptic-curve` we only use the hash-to-field message expansion, which works on digests.
 - Verified on the binaries: an optimised build that runs a full registration contains no symbol from `crypto-bigint`. The unoptimised test binary, which exercises every OPAQUE flow, contains two symbols whose mangled names mention the crate; both are instances of generic helpers from other crates that happened to be compiled in its unit (`subtle::black_box::<u8>` and a `core::ptr::read_volatile` debug check). No arithmetic function of `crypto-bigint` is linked.
 
+Method, reproducible on any machine:
+
+```sh
+# 1. Optimised binary that runs a full OPAQUE registration, symbols kept.
+CARGO_PROFILE_RELEASE_STRIP=none cargo build --release -p tavern-crypto --example argon2_memory
+nm target/release/examples/argon2_memory | grep -c crypto_bigint      # expected: 0
+
+# 2. Unoptimised unit-test binary, which links every OPAQUE flow (registration,
+#    login, decoy records, server setup).
+cargo test -p tavern-crypto --no-run          # prints the path of the test binary
+nm <test binary> | grep crypto_bigint         # expected: the two helpers below, nothing else
+```
+
+Result of step 2 on 2026-11-14 (macOS arm64, Rust 1.100): 9 625 symbols in total, 710 from `opaque_ke`, 138 from `curve25519_dalek`, and two that mention `crypto_bigint`:
+
+| Symbol (demangled) | What it is |
+|---|---|
+| `subtle::black_box::<u8>`, instantiated in the `crypto_bigint` compilation unit | An optimisation barrier from the `subtle` crate. Generic code is compiled in the first crate that instantiates it, and the linker reuses that copy for every caller. |
+| `core::ptr::read_volatile::precondition_check`, same unit | A debug-build assertion of the standard library, used by `black_box`. Absent from optimised builds. |
+
+Neither is an arithmetic routine, and neither is code written in `crypto-bigint`: the crate name appears only because that is where the compiler placed the instance. The functions named by the advisory (subtraction, zero counting, division, Montgomery multiplication, `UintRef` equality, `BoxedMontyForm::invert`) are absent from both binaries.
+
+Limits of this check: it shows that the code is not linked, which is stronger than "not called", but it was run on macOS arm64 only. The CI step repeats step 1 on Linux x86-64 at every run.
+
 Decision: the advisory is ignored in `deny.toml` with this justification. A CI step rebuilds the measurement example without stripping and fails if any `crypto_bigint` symbol appears, so that a future change that starts using the affected code cannot go unnoticed. The exception is re-evaluated on every `opaque-ke` upgrade and at milestone M9.
 
 ## Alternatives considered
