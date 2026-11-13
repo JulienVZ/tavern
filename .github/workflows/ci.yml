@@ -139,7 +139,7 @@ jobs:
       - run: pnpm tauri build --debug --no-bundle
 
   docker:
-    name: Server image
+    name: Server image and deployment
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -149,10 +149,56 @@ jobs:
           context: .
           file: deploy/Dockerfile
           push: false
+          # Loaded under the name the compose file expects, so that the steps
+          # below run this image instead of building it again.
+          load: true
+          tags: tavern-server:local
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Validate the compose file
+      - name: Prepare a local deployment (init.sh --dev)
         working-directory: deploy
         run: |
           ./scripts/init.sh --dev
           docker compose config --quiet
+          # Running it again must change nothing.
+          cp .env .env.first
+          ./scripts/init.sh --dev
+          diff .env.first .env
+      # Rate limiting trusts the X-Forwarded-For entry added by Caddy. That is
+      # sound only if nothing else can reach the server.
+      - name: The server is reachable through Caddy only
+        working-directory: deploy
+        run: |
+          published=$(docker compose config --format json | jq '.services.server.ports // [] | length')
+          echo "ports published by the server service: $published"
+          test "$published" -eq 0
+          docker compose config --format json \
+            | jq -e '.services.server.environment.TAVERN_TRUST_FORWARDED_FOR == "true"'
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml config --format json \
+            | jq -e '.services.server.environment.TAVERN_TRUST_FORWARDED_FOR == "false"'
+      - name: Start the stack and query it through Caddy
+        working-directory: deploy
+        run: |
+          docker compose up -d --wait --wait-timeout 120
+          docker compose ps
+          for attempt in $(seq 1 20); do
+            if curl --silent --insecure --fail https://localhost/health; then break; fi
+            sleep 3
+          done
+          echo
+          curl --silent --insecure --fail https://localhost/health | jq -e '.status == "ok"'
+          curl --silent --insecure --fail https://localhost/version | jq -e '.mls_external_sender_key | length > 0'
+      - name: Create the administrator invitation, back up and restore
+        working-directory: deploy
+        run: |
+          ./scripts/create-admin.sh | tee invite.txt
+          grep -Eq '^ +[0-9A-Z]{4}(-[0-9A-Z]{2,4}){6}$' invite.txt
+          ./scripts/backup.sh
+          ./scripts/restore.sh --yes "$(ls backups/*.tar.gz | tail -n 1)"
+          sleep 5
+          curl --silent --insecure --fail --retry 10 --retry-delay 3 --retry-all-errors \
+            https://localhost/health | jq -e '.status == "ok"'
+      - name: Show logs on failure
+        if: failure()
+        working-directory: deploy
+        run: docker compose logs --tail 80

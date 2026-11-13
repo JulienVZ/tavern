@@ -7,9 +7,12 @@
 #   - Caddyfile, livekit.yaml
 #
 # The archive contains secrets. Store it encrypted and off the machine.
-# From milestone M1, .env also holds the OPAQUE server setup and the MLS
-# external sender key: losing them invalidates every password and disables
-# server-initiated removals in existing groups (docs/adr/0002, docs/adr/0003).
+#
+# .env holds the instance secrets: the OPAQUE server setup (without it no
+# password works any more), the MLS external sender key (without it the server
+# cannot remove members from existing groups by itself), the TOTP encryption
+# key and the handle privacy key. The database dump is useless without the
+# .env it was made with, which is why both go in the same archive.
 #
 # Usage: ./scripts/backup.sh [output-directory]
 #

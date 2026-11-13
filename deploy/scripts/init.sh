@@ -13,9 +13,11 @@
 #
 # Safe to run again: existing files, values and secrets are never modified.
 #
-# Secrets generated today: PostgreSQL password, LiveKit API key and secret.
-# The OPAQUE server setup, the dedicated MLS external sender key and the TOTP
-# encryption key are added with milestone M1, when the server can use them.
+# Secrets: the PostgreSQL password and the LiveKit key pair are random values
+# generated here. The four instance secrets (OPAQUE server setup, MLS external
+# sender key, TOTP encryption key, handle privacy key) are produced by
+# `tavern-server gen-secrets`, run in the server image. The first run builds
+# that image, which takes a few minutes.
 
 set -eu
 
@@ -156,6 +158,33 @@ if [ -n "$missing" ]; then
     echo "Set them (edit deploy/.env, or run this script again in a terminal)," >&2
     echo "or run ./scripts/init.sh --dev for a local test. Then: docker compose up -d" >&2
     exit 1
+fi
+
+instance_secrets="TAVERN_OPAQUE_SERVER_SETUP TAVERN_MLS_EXTERNAL_SENDER_KEY TAVERN_TOTP_ENCRYPTION_KEY TAVERN_HANDLE_PRIVACY_KEY"
+need_instance_secrets=false
+for name in $instance_secrets; do
+    if [ -z "$(get_value "$name")" ]; then
+        need_instance_secrets=true
+    fi
+done
+
+if [ "$need_instance_secrets" = true ]; then
+    echo "Generating the instance secrets (this builds the server image the first time)..."
+    if ! generated=$(docker compose run --rm --no-deps -T server gen-secrets); then
+        echo >&2
+        echo "NOT READY. The instance secrets could not be generated." >&2
+        echo "Check that Docker is running, then run this script again." >&2
+        exit 1
+    fi
+    for name in $instance_secrets; do
+        value=$(printf '%s\n' "$generated" | tr -d '\r' | sed -n "s/^$name=//p" | head -n 1)
+        if [ -z "$value" ]; then
+            echo "NOT READY. gen-secrets did not return $name." >&2
+            exit 1
+        fi
+        set_if_empty "$name" "$value"
+    done
+    echo
 fi
 
 if [ "$dev" != true ] && [ -z "$(get_value LIVEKIT_NODE_IP)" ]; then

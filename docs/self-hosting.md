@@ -2,7 +2,7 @@
 
 This guide takes you from an empty machine to a running Tavern instance for a group of friends.
 
-> **Status: work in progress.** The server currently answers health and version requests only. Accounts, messaging and calls arrive with the next milestones. Installing today is useful to prepare your machine and network, not to chat yet.
+> **Status: work in progress.** The server handles accounts: invitations, registration, login, devices and two-factor authentication. Messaging and calls arrive with the next milestones. Installing today is useful to prepare your machine and network, not to chat yet.
 
 ## 1. What you need
 
@@ -79,8 +79,8 @@ Friends on the same local network as the server need the router to support NAT l
 git clone https://github.com/JulienVZ/tavern.git
 cd tavern/deploy
 
-# Creates .env, Caddyfile and livekit.yaml, generates the secrets and asks
-# for the two host names.
+# Creates .env, Caddyfile and livekit.yaml, asks for the two host names and
+# generates the secrets. The first run builds the server image (a few minutes).
 ./scripts/init.sh
 
 # Set LIVEKIT_NODE_IP to the public IPv4 address of the machine.
@@ -109,7 +109,15 @@ Every variable is described in [configuration.md](configuration.md).
 
 ### Creating the first administrator
 
-Registration is closed by default: accounts are created with invitation codes issued by an administrator. `./scripts/create-admin.sh` will create the first invitation; it becomes available with milestone M1.
+Registration is closed by default: accounts are created with invitation codes issued by an administrator.
+
+```bash
+./scripts/create-admin.sh
+```
+
+This prints a single-use invitation code, valid 24 hours and shown only once. Register with it in the Tavern client: that account becomes an administrator and can then create invitations for everyone else. The server never creates an account with a password itself, so that it never sees one.
+
+Run the script again if you need another administrator, or if the code expired before you used it.
 
 ### Trying it on your own computer
 
@@ -147,8 +155,9 @@ A backup contains the PostgreSQL dump, `.env` (configuration **and secrets**), `
 
 What the secrets protect, and why they must be backed up together with the database:
 
-- From milestone M1, `.env` holds the **OPAQUE server setup**. Without it no user can log in again with their password.
-- It also holds the **MLS external sender key**. If it is lost or replaced, the server can no longer remove kicked members from existing encrypted groups by itself until a member's client repairs each group. See [ADR 0002](adr/0002-mls-via-openmls.md#external-sender-key-lifecycle) for the consequences and the rotation procedure.
+- `.env` holds the **OPAQUE server setup**. Without it no user can log in again with their password.
+- It also holds the dedicated **MLS external sender key**. If it is lost or replaced, the server can no longer remove kicked members from existing encrypted groups by itself until a member's client repairs each group. See [ADR 0002](adr/0002-mls-via-openmls.md#external-sender-key-lifecycle) for the consequences and the rotation procedure.
+- It holds the **TOTP encryption key** and the **handle privacy key** as well. The table in [configuration.md](configuration.md#secrets) says what happens when each one is lost.
 
 What a backup does **not** contain: readable messages. The server only stores ciphertext waiting for delivery; message history lives on your users' devices.
 
@@ -193,6 +202,8 @@ Instead of a single multiplexed UDP port, LiveKit can use a range of UDP ports (
 | `docker compose up` says a variable is not set | Run `./scripts/init.sh` (or `./scripts/init.sh --dev` for a local test). |
 | The server restarts in a loop with "PostgreSQL rejected the credentials" | `.env` does not match the database volume. Restore the `.env` from your backup. On an instance with nothing to keep: `docker compose down -v`, then start again. |
 | Caddy cannot obtain a certificate | DNS records point to this machine; ports 80 and 443 reachable from outside; `docker compose logs caddy`. |
+| The server stops with "the instance secret ... is not set" | Run `./scripts/init.sh`, or restore the `.env` that belongs to this database. |
+| Everyone gets "too many requests" at once | The server is behind a proxy that does not append the client address, so all clients share one rate-limit bucket. See `TAVERN_TRUST_FORWARDED_FOR` in [configuration.md](configuration.md). |
 | `/health` answers 503 | `docker compose logs server postgres`. The database is unreachable. |
 | The server restarts in a loop | `docker compose logs server`: an invalid variable is named in the error. |
 | Calls connect but there is no audio or video | `LIVEKIT_NODE_IP` is the public address; UDP 7882 and TCP 7881 are forwarded. |
