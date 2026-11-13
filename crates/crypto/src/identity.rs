@@ -382,6 +382,57 @@ pub fn decoy_wrapped_key(
     Ok(out)
 }
 
+/// The public key shown with a decoy wrapped copy.
+///
+/// It is a valid Ed25519 public key derived from the handle-privacy key and
+/// the handle, so that it parses like a real one and is stable per handle.
+/// Nobody holds the matching private key in a usable form.
+pub fn decoy_identity_key(
+    handle_privacy_key: &Secret<32>,
+    handle: &Handle,
+) -> Result<IdentityPublicKey, CryptoError> {
+    let mut seed = Zeroizing::new([0u8; SEED_LEN]);
+    Hkdf::<Sha512>::new(None, handle_privacy_key.expose())
+        .expand_multi_info(&[LABEL_DECOY, &[1], handle.as_bytes()], seed.as_mut())
+        .map_err(|_| CryptoError::Internal)?;
+    Ok(IdentityPublicKey(
+        SigningKey::from_bytes(&seed).verifying_key(),
+    ))
+}
+
+/// The instance's MLS external sender key: a dedicated Ed25519 key with which
+/// the server signs `Remove` proposals (from milestone M2). It is used for
+/// nothing else. At M1 only its public half is published.
+pub struct ExternalSenderKey(SigningKey);
+
+impl ExternalSenderKey {
+    /// Generates a new key.
+    pub fn generate() -> Self {
+        Self(SigningKey::generate(&mut OsRng))
+    }
+
+    /// Restores the key from its seed.
+    pub fn from_seed(seed: &Secret<SEED_LEN>) -> Self {
+        Self(SigningKey::from_bytes(seed.expose()))
+    }
+
+    /// The seed, as stored in the instance configuration. Secret.
+    pub fn seed(&self) -> Secret<SEED_LEN> {
+        Secret::new(self.0.to_bytes())
+    }
+
+    /// The public half, published by `GET /version` and the gateway.
+    pub fn public_bytes(&self) -> [u8; PUBLIC_KEY_LEN] {
+        self.0.verifying_key().to_bytes()
+    }
+}
+
+impl std::fmt::Debug for ExternalSenderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExternalSenderKey(<redacted>)")
+    }
+}
+
 /// What a credential change is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialUpdatePurpose {
@@ -693,6 +744,28 @@ mod tests {
             AccountIdentityKey::unwrap(&decoy, &key, &identity.public()).unwrap_err(),
             CryptoError::InvalidWrappedKey
         );
+    }
+
+    #[test]
+    fn decoy_identity_keys_are_valid_and_stable() {
+        let privacy_key = Secret::<32>::random();
+        let nobody = Handle::parse_canonical("nobody").unwrap();
+        let someone = Handle::parse_canonical("someone").unwrap();
+
+        let decoy = decoy_identity_key(&privacy_key, &nobody).unwrap();
+
+        assert_eq!(decoy, decoy_identity_key(&privacy_key, &nobody).unwrap());
+        assert_ne!(decoy, decoy_identity_key(&privacy_key, &someone).unwrap());
+        assert!(IdentityPublicKey::from_bytes(&decoy.to_bytes()).is_ok());
+    }
+
+    #[test]
+    fn the_external_sender_key_survives_its_seed_round_trip() {
+        let key = ExternalSenderKey::generate();
+        let restored = ExternalSenderKey::from_seed(&key.seed());
+
+        assert_eq!(restored.public_bytes(), key.public_bytes());
+        assert_eq!(format!("{key:?}"), "ExternalSenderKey(<redacted>)");
     }
 
     #[test]
