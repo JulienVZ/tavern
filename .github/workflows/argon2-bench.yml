@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Measures Argon2id on GitHub-hosted runners (2 cores), used as a stand-in for
+# a modest machine when choosing the OPAQUE key stretching parameters.
+# Results are recorded in docs/adr/0003-opaque-authentication.md.
+#
+# Manual only: it never runs on pushes or pull requests.
+name: Argon2id benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Argon2id (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Describe the machine
+        run: |
+          echo "cores: $(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
+          grep -m1 "model name" /proc/cpuinfo 2>/dev/null || true
+      - name: Create the benchmark
+        run: |
+          mkdir -p bench/src && cd bench
+          cat > Cargo.toml <<'TOML'
+          [package]
+          name = "argon-bench"
+          version = "0.0.0"
+          edition = "2021"
+          publish = false
+          [dependencies]
+          argon2 = "0.5"
+          TOML
+          cat > src/main.rs <<'RUST'
+          use argon2::{Algorithm, Argon2, Params, Version};
+          use std::time::Instant;
+
+          fn main() {
+              let candidates =
+                  [(19, 2), (46, 1), (64, 1), (64, 2), (64, 3), (128, 2), (128, 3), (256, 2)];
+              println!("{:>8} {:>3} {:>10}", "m (MiB)", "t", "median ms");
+              for (m, t) in candidates {
+                  let params = Params::new(m * 1024, t, 1, Some(64)).expect("valid parameters");
+                  let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+                  let mut times = Vec::new();
+                  for _ in 0..5 {
+                      let mut out = [0u8; 64];
+                      let start = Instant::now();
+                      argon
+                          .hash_password_into(b"correct horse battery staple", b"0123456789abcdef", &mut out)
+                          .expect("hashing works");
+                      times.push(start.elapsed().as_millis());
+                  }
+                  times.sort_unstable();
+                  println!("{:>8} {:>3} {:>10}", m, t, times[2]);
+              }
+          }
+          RUST
+      - name: Run
+        working-directory: bench
+        run: cargo run --release --quiet
