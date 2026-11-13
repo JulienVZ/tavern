@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Identity structures: device certificates.
+//
+// Specification: docs/adr/0011-account-identity-and-primitives.md.
+
+syntax = "proto3";
+
+package tavern.identity.v1;
+
+// What the account identity key (AIK) signs when it certifies a device.
+//
+// The payload is serialised once by the issuing client. The signature covers
+// those exact bytes, and verifiers check the signature over the bytes they
+// received before decoding them: the payload is never re-encoded.
+message DeviceCertificatePayload {
+  // Format version, currently 1.
+  uint32 version = 1;
+  // Account the device belongs to (16 bytes).
+  bytes user_id = 2;
+  // Device identifier, chosen at random by the device (16 bytes).
+  bytes device_id = 3;
+  // Ed25519 public key of the device (32 bytes). Also its MLS signature key.
+  bytes signature_key = 4;
+  // When the certificate was issued, in milliseconds since the Unix epoch.
+  uint64 issued_at_ms = 5;
+}
+
+message DeviceCertificate {
+  // Serialised DeviceCertificatePayload.
+  bytes payload = 1;
+  // Ed25519 signature by the AIK over a domain separation label and `payload`.
+  bytes signature = 2;
+}

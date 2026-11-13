@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod handle;
 pub mod rest;
 
 /// Gateway protocol, generated from `proto/tavern/gateway/v1/gateway.proto`.
@@ -14,6 +15,14 @@ pub mod gateway {
     /// Major version 1 of the gateway protocol.
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/tavern.gateway.v1.rs"));
+    }
+}
+
+/// Identity structures, generated from `proto/tavern/identity/v1/identity.proto`.
+pub mod identity {
+    /// Version 1 of the identity structures.
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/tavern.identity.v1.rs"));
     }
 }
 

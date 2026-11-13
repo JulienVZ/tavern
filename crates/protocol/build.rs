@@ -6,7 +6,10 @@
 use std::error::Error;
 
 const PROTO_ROOT: &str = "proto";
-const PROTO_FILES: &[&str] = &["tavern/gateway/v1/gateway.proto"];
+const PROTO_FILES: &[&str] = &[
+    "tavern/gateway/v1/gateway.proto",
+    "tavern/identity/v1/identity.proto",
+];
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={PROTO_ROOT}");
