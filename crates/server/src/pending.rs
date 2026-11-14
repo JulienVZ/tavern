@@ -52,6 +52,19 @@ impl<K: Eq + Hash, V> ExpiringMap<K, V> {
         (expires > Instant::now()).then_some(value)
     }
 
+    /// Returns a copy of the value under `key` without consuming it, for
+    /// exchanges whose first step must leave the entry in place.
+    pub fn peek(&self, key: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .get(key)
+            .filter(|(expires, _)| *expires > Instant::now())
+            .map(|(_, v)| v.clone())
+    }
+
     /// How long entries live.
     pub fn ttl(&self) -> Duration {
         self.ttl
@@ -70,6 +83,21 @@ mod tests {
         assert_eq!(map.take(&"a"), Some(1));
         assert_eq!(map.take(&"a"), None);
         assert_eq!(map.take(&"never"), None);
+    }
+
+    #[test]
+    fn peeking_does_not_consume() {
+        let map = ExpiringMap::new(Duration::from_secs(60), 10);
+        map.insert("a", 1);
+
+        assert_eq!(map.peek(&"a"), Some(1));
+        assert_eq!(map.peek(&"a"), Some(1));
+        assert_eq!(map.take(&"a"), Some(1));
+        assert_eq!(map.peek(&"a"), None);
+        assert_eq!(
+            ExpiringMap::<&str, i32>::new(Duration::ZERO, 1).peek(&"x"),
+            None
+        );
     }
 
     #[test]

@@ -74,6 +74,17 @@ pub fn test_secrets() -> InstanceSecrets {
 
 impl TestApp {
     pub async fn spawn() -> Self {
+        Self::spawn_with(false).await
+    }
+
+    /// Like [`TestApp::spawn`], without the authentication rate limits, for
+    /// tests that make many attempts on one handle. The limits themselves are
+    /// tested with the default configuration.
+    pub async fn spawn_unlimited() -> Self {
+        Self::spawn_with(true).await
+    }
+
+    async fn spawn_with(unlimited: bool) -> Self {
         let database_url = std::env::var(DATABASE_URL_VAR)
             .unwrap_or_else(|_| panic!("{DATABASE_URL_VAR} must be set to run this test"));
         let pool = db::connect(&database_url, 5)
@@ -81,15 +92,18 @@ impl TestApp {
             .expect("database must be reachable");
         db::migrate(&pool).await.expect("migrations must apply");
 
-        let state = AppState::new(
-            pool,
-            test_secrets(),
-            Settings {
-                source_url: Some("https://example.org/source".to_owned()),
-                trust_forwarded_for: false,
-                session_ttl: Duration::from_secs(3600),
-            },
-        );
+        let state = AppState::new(pool, test_secrets(), {
+            let mut settings = Settings::new(
+                Some("https://example.org/source".to_owned()),
+                false,
+                Duration::from_secs(3600),
+            );
+            if unlimited {
+                settings.auth_per_ip_per_minute = 10_000;
+                settings.auth_per_handle_per_minute = 10_000;
+            }
+            settings
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = app(state.clone());

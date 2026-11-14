@@ -5,6 +5,7 @@
 pub mod account;
 pub mod admin;
 pub mod auth;
+pub mod credentials;
 pub mod devices;
 pub mod gateway;
 pub mod system;
@@ -39,6 +40,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .routes(routes!(auth::login_finish))
         .routes(routes!(auth::login_totp))
         .routes(routes!(auth::logout))
+        .routes(routes!(credentials::reauth_start))
+        .routes(routes!(credentials::reauth_finish))
+        .routes(routes!(credentials::recover_start))
+        .routes(routes!(credentials::recover_finish))
         .layer(middleware::from_fn_with_state(
             state,
             rate_limit::limit_by_ip,
@@ -55,6 +60,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         .routes(routes!(account::totp_enable))
         .routes(routes!(account::totp_confirm))
         .routes(routes!(account::totp_disable))
+        .routes(routes!(credentials::password_start))
+        .routes(routes!(credentials::password_finish))
+        .routes(routes!(credentials::rotate_recovery_key))
         .routes(routes!(admin::create_invite, admin::list_invites))
         .routes(routes!(admin::revoke_invite))
         .routes(routes!(admin::list_users))

@@ -21,9 +21,9 @@ use crate::AppState;
 use crate::error::{ApiError, ApiResult};
 
 /// Requests per minute and per address on `/v1/auth/*`.
-const AUTH_PER_IP_PER_MINUTE: u32 = 30;
+pub const AUTH_PER_IP_PER_MINUTE: u32 = 30;
 /// Attempts per minute and per handle (login, recovery, registration).
-const AUTH_PER_HANDLE_PER_MINUTE: u32 = 5;
+pub const AUTH_PER_HANDLE_PER_MINUTE: u32 = 5;
 /// Above this many tracked keys, idle ones are dropped.
 const PRUNE_THRESHOLD: usize = 10_000;
 

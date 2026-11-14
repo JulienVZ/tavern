@@ -123,6 +123,27 @@ pub struct Settings {
     pub trust_forwarded_for: bool,
     /// How long an unused session stays valid.
     pub session_ttl: Duration,
+    /// Authentication requests allowed per minute and per client address.
+    pub auth_per_ip_per_minute: u32,
+    /// Authentication attempts allowed per minute and per handle.
+    pub auth_per_handle_per_minute: u32,
+}
+
+impl Settings {
+    /// Settings with the production rate limits.
+    pub fn new(
+        source_url: Option<String>,
+        trust_forwarded_for: bool,
+        session_ttl: Duration,
+    ) -> Self {
+        Self {
+            source_url,
+            trust_forwarded_for,
+            session_ttl,
+            auth_per_ip_per_minute: rate_limit::AUTH_PER_IP_PER_MINUTE,
+            auth_per_handle_per_minute: rate_limit::AUTH_PER_HANDLE_PER_MINUTE,
+        }
+    }
 }
 
 /// State shared by all request handlers.
@@ -145,12 +166,16 @@ pub struct AppState {
 impl AppState {
     /// Assembles the state of a server.
     pub fn new(db: PgPool, secrets: InstanceSecrets, settings: Settings) -> Self {
+        let rate_limits = RateLimits::new(
+            settings.auth_per_ip_per_minute,
+            settings.auth_per_handle_per_minute,
+        );
         Self {
             db,
             secrets: Arc::new(secrets),
             settings: Arc::new(settings),
             pending: Arc::new(Pending::default()),
-            rate_limits: Arc::new(RateLimits::default()),
+            rate_limits: Arc::new(rate_limits),
             gateway: Arc::new(Registry::default()),
         }
     }
