@@ -2,7 +2,7 @@
 
 **A self-hosted, end-to-end encrypted chat for groups of friends.** Text, voice, video and screen sharing, on a server you run yourself.
 
-> **Work in progress.** Tavern is at the scaffolding stage: the server, the desktop client and the deployment start, and nothing else works yet. It has not been audited. Do not use it for real conversations. "Tavern" is a provisional name.
+> **Work in progress.** Accounts work: invitations, registration, sign-in from several devices, two-factor authentication, account recovery. Messaging and calls do not exist yet. Nothing has been audited. Do not use it for real conversations. "Tavern" is a provisional name.
 
 ## Why
 
@@ -35,8 +35,8 @@ Screenshots will be added when there is something to show.
 | Milestone | Content | State |
 |---|---|---|
 | M0 | Project scaffolding, deployment, CI | done |
-| M1 | Accounts: OPAQUE login, devices, invitations, TOTP | next |
-| M2 | Friends and encrypted direct messages | planned |
+| M1 | Accounts: OPAQUE login, devices, invitations, TOTP, recovery | done |
+| M2 | Friends and encrypted direct messages | next |
 | M3 | Private groups | planned |
 | M4 | Servers, channels, roles, moderation | planned |
 | M5 | Attachments, avatars, custom emojis, reactions, local search | planned |
@@ -60,7 +60,7 @@ Desktop client (Tauri 2)                     Your instance (Docker Compose)
 
 - Messages are encrypted with **MLS** (RFC 9420, through OpenMLS). Every device is a member of each conversation's group; removing someone rotates the keys.
 - Call media is encrypted with keys derived from the same MLS groups, so the media relay only forwards frames it cannot read.
-- Passwords never reach the server: login uses **OPAQUE**.
+- Passwords never reach the server: login uses **OPAQUE**. A recovery key, shown once at registration, lets you set a new password without losing your identity.
 - Files are encrypted on the device before upload.
 
 What the server can still see is metadata: who talks to whom and when, the names of servers and channels, and profiles. This is spelled out in the [threat model](docs/threat-model.md).
@@ -78,6 +78,7 @@ cd tavern/deploy
 ./scripts/init.sh          # creates .env, generates the secrets, asks for the host names
 nano .env                  # set LIVEKIT_NODE_IP
 docker compose up -d
+./scripts/create-admin.sh  # prints the invitation code of the first administrator
 ```
 
 Minimal configuration in `deploy/.env`:
@@ -94,6 +95,8 @@ Check it:
 curl https://chat.example.org/health
 # {"status":"ok","database":"ok"}
 ```
+
+Then open the client, enter your instance address, and create your account with the invitation code. As administrator you create the invitations for everyone else.
 
 TLS certificates are obtained automatically. For hardware sizing (about 40 users: 4 vCPU, 8 GB RAM, 500 Mb/s upload), home routers, updates and backups, read the [self-hosting guide](docs/self-hosting.md). Every setting is listed in the [configuration reference](docs/configuration.md).
 
@@ -119,6 +122,7 @@ Signed installers for Windows, macOS and Linux will be published with releases.
 | `crates/server` | Instance server |
 | `crates/client-core` | Client logic without UI |
 | `crates/media` | Capture and encoding |
+| `crates/e2e-tests` | End-to-end tests: the real client against the real server |
 | `apps/desktop` | Tauri shell and Svelte UI |
 | `deploy` | Docker Compose stack and scripts |
 | `docs` | Architecture, threat model, protocol, guides, decision records |

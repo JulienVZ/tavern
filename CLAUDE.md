@@ -91,7 +91,8 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 │   ├── crypto/                # Wrapper OpenMLS, gestion des clés, dérivation clés média, chiffrement fichiers
 │   ├── server/                # Binaire serveur : API REST, gateway WS, auth, permissions, stockage
 │   ├── client-core/           # Logique client sans UI : réseau, MLS, store local, LiveKit, état
-│   └── media/                 # Capture écran/caméra/audio par OS, encodage matériel
+│   ├── media/                 # Capture écran/caméra/audio par OS, encodage matériel
+│   └── e2e-tests/             # Tests de bout en bout : vrai client contre vrai serveur (PostgreSQL requis)
 ├── apps/
 │   └── desktop/
 │       ├── src-tauri/         # Glue Tauri : commandes, événements, fenêtres (mince, délègue à client-core)
@@ -172,7 +173,12 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Chaque enrôlement d'appareil est notifié à tous les appareils existants du compte (avec action de révocation) et affiché à ses contacts dans les conversations partagées.
 - Un nouvel appareil n'a pas d'historique en v1 : l'UI l'explique à l'enrôlement et en tête de chaque conversation (ADR 0006, ADR 0009).
 - Quand le serveur répond `REMOVAL_PENDING` ou `STALE_EPOCH`, le client committe/applique ce qui est en attente puis renvoie le message automatiquement, sans erreur visible.
-- Rate limiting sur toutes les routes d'auth.
+- Rate limiting sur toutes les routes d'auth (30/min par adresse, 5/min par handle). Derrière Caddy, l'adresse est la **dernière** entrée de `X-Forwarded-For` ; le serveur ne publie aucun port (vérifié en CI).
+- Le **handle** est l'identifiant OPAQUE : non modifiable en v1, forme canonique stricte (ASCII `a–z 0–9 _ .`, 2 à 32 caractères, minuscules), implémentée une seule fois dans `tavern_protocol::handle` pour le client et le serveur.
+- Changements d'identifiants (ADR 0003) : chacun est autorisé par une signature de l'AIK sur un défi à usage unique. Récupération : nouveau mot de passe, toutes les sessions révoquées, TOTP conservé. Changement de mot de passe : les autres sessions sont révoquées. La clé de récupération peut être régénérée (l'ancienne cesse de fonctionner).
+- Un admin peut désactiver le TOTP d'un utilisateur (téléphone et codes perdus) : appareils notifiés, action journalisée (`admin_audit_log`).
+- Argon2id : 128 Mio, t=3, p=1 (mesures dans l'ADR 0003). Dépassement transitoire assumé du budget RAM pendant une connexion.
+- En M1 le client ne stocke qu'une petite fiche par instance dans le trousseau OS (ADR 0014) ; SQLCipher arrive en M2.
 
 ### Règles de code liées à la sécurité
 - **Ne jamais implémenter de primitive cryptographique soi-même.** Utiliser OpenMLS, RustCrypto, `rustls`, `opaque-ke`.
@@ -221,7 +227,7 @@ L'expérience d'un admin d'instance est une fonctionnalité à part entière.
 
 - Déploiement de référence : `deploy/docker-compose.yml` avec `server`, `postgres`, `livekit`, `caddy`. Une seule commande, un seul `.env`.
 - Toute la configuration passe par variables d'environnement (avec fichier de config optionnel). **Aucun domaine, IP ou secret codé en dur.**
-- Les secrets sont générés par un script (`deploy/scripts/init.sh`) si absents, chacun avec un usage unique : clés LiveKit, setup serveur OPAQUE, clé de signature MLS external sender (dédiée), clé de chiffrement des secrets TOTP.
+- Les secrets sont générés par un script (`deploy/scripts/init.sh`, qui appelle `tavern-server gen-secrets`) si absents, chacun avec un usage unique : clés LiveKit, setup serveur OPAQUE, clé de signature MLS external sender (dédiée), clé de chiffrement des secrets TOTP, clé de confidentialité des handles (réponses factices).
 - Migrations de base appliquées automatiquement au démarrage du serveur (avec option pour les désactiver).
 - `deploy/scripts/create-admin.sh` pour créer le premier compte admin / le premier code d'invitation.
 - Endpoint `/health` et `/version`.
@@ -283,16 +289,23 @@ pnpm --filter tavern-ui build
 cd apps/desktop && pnpm tauri dev
 
 # Instance complète (server + postgres + livekit + caddy)
-cd deploy && ./scripts/init.sh        # crée .env, Caddyfile, livekit.yaml et les secrets
+cd deploy && ./scripts/init.sh        # crée .env, Caddyfile, livekit.yaml et les secrets (--dev pour un test local)
 docker compose up -d
 curl https://<TAVERN_DOMAIN>/health
+./scripts/create-admin.sh             # code d'invitation du premier administrateur
 
 # Pile de développement : serveur sur http://localhost:8080, Postgres sur localhost:5432
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 
-# Tests d'intégration serveur (nécessitent PostgreSQL ; mot de passe dans deploy/.env)
+# Tests d'intégration et de bout en bout (nécessitent PostgreSQL ; mot de passe dans deploy/.env)
 TAVERN_TEST_DATABASE_URL=postgres://tavern:<mot de passe>@localhost:5432/tavern \
-  cargo test --package tavern-server -- --ignored
+  cargo test --package tavern-server --package tavern-e2e-tests -- --ignored
+
+# Deux clients sur la même machine (profils de trousseau séparés)
+cd apps/desktop && TAVERN_PROFILE=second pnpm tauri dev
+
+# Mesure Argon2id (durée et mémoire rendue)
+cargo run --release --package tavern-crypto --example argon2_memory
 
 # Sauvegarde / restauration
 cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.gz
@@ -340,6 +353,8 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 5. **Encodeur Media Foundation** (QuickSync/AMF sous Windows) : à décider au M7 après mesure.
 6. **Mécanisme d'entrée dans les channels d'un serveur** : orientation retenue — external commit autorisé par les rôles (le nouveau membre n'attend pas), arrivée toujours affichée dans le channel, plus une option « channel privé » où l'entrée exige l'ajout par un membre. Décision finale au M4.
 7. **Historique sur un nouvel appareil** : ADR 0009 (proposé), transfert d'appareil à appareil au M5b ; sauvegarde chiffrée sous la clé de récupération à évaluer ensuite.
+8. **Identifiant de l'application** (`io.github.julienvz.tavern`, provisoire) : à fixer avant M2, qui crée le store local et rend les données locales durables.
+9. **SQLCipher et OpenSSL** : SQLCipher embarqué exige OpenSSL sous Windows et Linux, ce que `deny.toml` interdit aujourd'hui. ADR à écrire au début de M2.
 
 ---
 

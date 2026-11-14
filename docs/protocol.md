@@ -137,12 +137,23 @@ The authoritative description is the OpenAPI document served at `GET /v1/openapi
 | `DELETE /v1/devices/{id}` | Revoke a device and its session | session |
 | `GET /v1/users/me` | The signed-in account | session |
 | `POST /v1/account/totp/enable`, `/confirm`, `/disable` | TOTP enrolment | session |
+| `POST /v1/auth/reauth/start`, `/finish` | A full OPAQUE login from an existing session (plus the TOTP code when enabled) → re-authentication token, challenge, wrapped AIK | session |
+| `POST /v1/account/password/start`, `/finish` | Change the password: OPAQUE registration of the new one, new "password" wrapped copy, AIK signature | session + re-authentication token |
+| `POST /v1/account/recovery-key` | Replace the recovery key: new "recovery" wrapped copy, AIK signature | session + re-authentication token |
+| `POST /v1/auth/recover/start` | Handle, OPAQUE `RegistrationRequest` for the new password → challenge, AIK public key, "recovery" wrapped copy, `RegistrationResponse` | none |
+| `POST /v1/auth/recover/finish` | OPAQUE `RegistrationUpload`, new "password" wrapped copy, AIK signature → 204 | none |
 | `POST /v1/admin/invites`, `GET`, `DELETE /v1/admin/invites/{id}` | Instance invitations | admin session |
 | `GET /v1/admin/users` | Accounts of the instance | admin session |
 | `POST /v1/admin/users/{id}/disable`, `/enable` | Disable or re-enable an account | admin session |
 | `POST /v1/admin/users/{id}/totp/disable` | Disable the TOTP of a user who lost their authenticator and codes | admin session |
 
-Credential changes (re-authentication, password change, recovery with the recovery key, recovery key rotation) are added at the end of M1 and described in [ADR 0003](adr/0003-opaque-authentication.md#credential-changes).
+Credential changes are described in [ADR 0003](adr/0003-opaque-authentication.md#credential-changes). In short:
+
+- Each one is authorised by a signature of the account identity key over a single-use challenge, the handle and the new values. A refused change answers `INVALID_PROOF`, whatever the reason.
+- A re-authentication token authorises one change, for five minutes, in the session that obtained it.
+- **Password change**: every other session of the account ends (`SessionRevoked`, reason `CREDENTIALS_CHANGED`); the calling device stays signed in.
+- **Recovery**: every session ends. TOTP stays enabled. For an unknown handle `recover/start` returns decoys with the same shape, stable across requests; `recover/finish` can then never succeed.
+- **Recovery key rotation**: the previous recovery key stops working at once.
 
 Notes:
 

@@ -63,18 +63,24 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 curl http://localhost:8080/health
 ```
 
-Run the server integration tests against that PostgreSQL (use the password from `deploy/.env`):
+Run the integration and end-to-end tests against that PostgreSQL (use the password from `deploy/.env`):
 
 ```bash
 TAVERN_TEST_DATABASE_URL=postgres://tavern:<password>@localhost:5432/tavern \
-  cargo test --package tavern-server -- --ignored
+  cargo test --package tavern-server --package tavern-e2e-tests -- --ignored
 ```
 
-Run the desktop client, then enter `http://localhost:8080` as the instance address:
+Create the first administrator invitation, then run the desktop client and enter `http://localhost:8080` as the instance address:
 
 ```bash
-cd apps/desktop
-pnpm tauri dev
+cd deploy && ./scripts/create-admin.sh
+cd ../apps/desktop && pnpm tauri dev
+```
+
+To try two devices on one computer, start a second client with its own keychain profile:
+
+```bash
+TAVERN_PROFILE=second pnpm tauri dev
 ```
 
 ## Code conventions
