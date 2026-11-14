@@ -21,7 +21,7 @@ use tavern_protocol::rest::{
 use uuid::Uuid;
 
 use super::{exchange_id, parse_handle, validate_display_name};
-use crate::error::{ApiError, ApiResult, is_unique_violation};
+use crate::error::{ApiError, ApiJson, ApiResult, is_unique_violation};
 use crate::gateway::RevocationReason;
 use crate::session::Session;
 use crate::{AppState, CLIENT_TOKEN_LEN, Enrolment, ExchangeId, PendingLogin, totp};
@@ -83,7 +83,7 @@ async fn handle_exists(db: &PgPool, handle: &str) -> ApiResult<bool> {
 )]
 pub(crate) async fn register_start(
     State(state): State<AppState>,
-    Json(request): Json<RegisterStartRequest>,
+    ApiJson(request): ApiJson<RegisterStartRequest>,
 ) -> ApiResult<Json<RegistrationResponse>> {
     let handle = parse_handle(&request.handle)?;
     state.rate_limits.check_handle(&handle)?;
@@ -117,7 +117,7 @@ pub(crate) async fn register_start(
 )]
 pub(crate) async fn register_finish(
     State(state): State<AppState>,
-    Json(request): Json<RegisterFinishRequest>,
+    ApiJson(request): ApiJson<RegisterFinishRequest>,
 ) -> ApiResult<(StatusCode, Json<RegisterFinishResponse>)> {
     let handle = parse_handle(&request.handle)?;
     validate_display_name(&request.display_name)?;
@@ -263,7 +263,7 @@ pub(crate) fn finish_login(
 )]
 pub(crate) async fn login_start(
     State(state): State<AppState>,
-    Json(request): Json<LoginStartRequest>,
+    ApiJson(request): ApiJson<LoginStartRequest>,
 ) -> ApiResult<Json<LoginStartResponse>> {
     start_login(
         &state,
@@ -327,7 +327,7 @@ async fn grant(state: &AppState, user_id: Uuid) -> ApiResult<LoginGrant> {
 )]
 pub(crate) async fn login_finish(
     State(state): State<AppState>,
-    Json(request): Json<LoginFinishRequest>,
+    ApiJson(request): ApiJson<LoginFinishRequest>,
 ) -> ApiResult<Json<LoginOutcome>> {
     let user_id = finish_login(
         &state,
@@ -372,7 +372,7 @@ pub(crate) async fn login_finish(
 )]
 pub(crate) async fn login_totp(
     State(state): State<AppState>,
-    Json(request): Json<LoginTotpRequest>,
+    ApiJson(request): ApiJson<LoginTotpRequest>,
 ) -> ApiResult<Json<LoginOutcome>> {
     let login_id = exchange_id(&request.login_id)?;
     let (user_id, failures) = state

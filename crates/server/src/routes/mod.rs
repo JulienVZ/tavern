@@ -77,6 +77,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(move || std::future::ready(Json(api.clone()))),
         )
         .route(tavern_protocol::GATEWAY_PATH, get(gateway::connect))
+        // Unknown routes and methods answer in the API's error format, with
+        // a code that tells a newer client "this server does not know this".
+        .fallback(|| std::future::ready(ApiError::unknown_endpoint()))
+        .method_not_allowed_fallback(|| std::future::ready(ApiError::unknown_endpoint()))
 }
 
 /// Parses a handle received from a client: it must already be canonical.

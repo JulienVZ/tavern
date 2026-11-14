@@ -13,7 +13,7 @@ use tavern_protocol::rest::{
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::error::{ApiError, ApiResult, is_unique_violation};
+use crate::error::{ApiError, ApiJson, ApiResult, is_unique_violation};
 use crate::gateway::{Event, RevocationReason};
 use crate::session::{self, EnrolmentAuth, Session};
 
@@ -44,7 +44,7 @@ fn invalid_certificate() -> ApiError {
 pub(crate) async fn enrol(
     State(state): State<AppState>,
     EnrolmentAuth(enrolment): EnrolmentAuth,
-    Json(request): Json<EnrolDeviceRequest>,
+    ApiJson(request): ApiJson<EnrolDeviceRequest>,
 ) -> ApiResult<(StatusCode, Json<SessionResponse>)> {
     if request
         .name_encrypted
@@ -148,7 +148,7 @@ pub(crate) async fn reopen_session(
     State(state): State<AppState>,
     Path(device_id): Path<Uuid>,
     EnrolmentAuth(enrolment): EnrolmentAuth,
-    Json(request): Json<ReopenSessionRequest>,
+    ApiJson(request): ApiJson<ReopenSessionRequest>,
 ) -> ApiResult<Json<SessionResponse>> {
     let refused = || ApiError::new(ErrorCode::InvalidProof, "the session proof is not valid");
 

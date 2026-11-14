@@ -10,7 +10,7 @@ use tavern_protocol::rest::{
     B64, ErrorBody, ErrorCode, Me, TotpCodeRequest, TotpEnrolment, TotpRecoveryCodes,
 };
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::session::Session;
 use crate::{AppState, totp};
 
@@ -100,7 +100,7 @@ pub(crate) async fn totp_enable(
 pub(crate) async fn totp_confirm(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<TotpCodeRequest>,
+    ApiJson(request): ApiJson<TotpCodeRequest>,
 ) -> ApiResult<Json<TotpRecoveryCodes>> {
     let enabled: bool =
         sqlx::query_scalar("SELECT totp_enabled_at IS NOT NULL FROM users WHERE id = $1")
@@ -164,7 +164,7 @@ pub(crate) async fn totp_confirm(
 pub(crate) async fn totp_disable(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<TotpCodeRequest>,
+    ApiJson(request): ApiJson<TotpCodeRequest>,
 ) -> ApiResult<StatusCode> {
     totp::verify_code_or_recovery(
         &state.db,

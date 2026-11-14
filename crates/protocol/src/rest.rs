@@ -39,6 +39,10 @@ pub struct VersionResponse {
     pub name: String,
     /// Server version (semver).
     pub version: String,
+    /// REST API version served by this instance. Absent on servers older
+    /// than REST 1.1, which reads as 0.0.
+    #[serde(default)]
+    pub rest: RestVersion,
     /// Gateway protocol versions served by this instance.
     pub gateway: GatewayVersions,
     /// Ed25519 public key of the instance's MLS external sender.
@@ -46,6 +50,16 @@ pub struct VersionResponse {
     /// Where the source code of this instance can be obtained (AGPL network clause).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+}
+
+/// REST API version served by an instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RestVersion {
+    /// Major version: the number in the `/v1` path prefix.
+    pub major: u32,
+    /// Minor version, incremented with every addition.
+    pub minor: u32,
 }
 
 /// Gateway protocol versions served by an instance.
@@ -151,6 +165,9 @@ pub enum ErrorCode {
     Forbidden,
     /// The resource does not exist.
     NotFound,
+    /// This server has no such route or method: it is older than the client,
+    /// or otherwise incompatible with it.
+    UnknownEndpoint,
     /// The resource already exists.
     AlreadyExists,
     /// The request body is too large.
@@ -695,6 +712,7 @@ mod tests {
         let body = VersionResponse {
             name: "tavern".to_owned(),
             version: "0.0.1".to_owned(),
+            rest: RestVersion { major: 1, minor: 1 },
             gateway: GatewayVersions {
                 min_major: 1,
                 max_major: 1,
@@ -711,6 +729,18 @@ mod tests {
             serde_json::from_str::<VersionResponse>(&json).unwrap(),
             body
         );
+    }
+
+    #[test]
+    fn a_version_answer_without_rest_version_reads_as_zero() {
+        // What a server older than REST 1.1 sends.
+        let json = r#"{"name":"tavern","version":"0.0.1",
+            "gateway":{"min_major":1,"max_major":1,"minor":0},
+            "mls_external_sender_key":"AQID"}"#;
+
+        let body: VersionResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(body.rest, RestVersion { major: 0, minor: 0 });
     }
 
     #[test]

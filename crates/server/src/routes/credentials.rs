@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::auth::{finish_login, start_login};
 use super::{exchange_id, parse_handle};
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::gateway::RevocationReason;
 use crate::session::{self, Session};
 use crate::{AppState, CLIENT_TOKEN_LEN, CredentialChange, ExchangeId, totp};
@@ -92,7 +92,7 @@ fn take_reauth(state: &AppState, session: &Session, raw: &B64) -> ApiResult<Cred
 pub(crate) async fn reauth_start(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<ReauthStartRequest>,
+    ApiJson(request): ApiJson<ReauthStartRequest>,
 ) -> ApiResult<Json<LoginStartResponse>> {
     let handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
         .bind(session.user_id)
@@ -121,7 +121,7 @@ pub(crate) async fn reauth_start(
 pub(crate) async fn reauth_finish(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<ReauthFinishRequest>,
+    ApiJson(request): ApiJson<ReauthFinishRequest>,
 ) -> ApiResult<Json<ReauthGrant>> {
     let user_id = finish_login(
         &state,
@@ -185,7 +185,7 @@ pub(crate) async fn reauth_finish(
 pub(crate) async fn password_start(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<PasswordStartRequest>,
+    ApiJson(request): ApiJson<PasswordStartRequest>,
 ) -> ApiResult<Json<RegistrationResponse>> {
     // The token is only looked at here; `password/finish` consumes it.
     let change = state
@@ -218,7 +218,7 @@ pub(crate) async fn password_start(
 pub(crate) async fn password_finish(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<PasswordFinishRequest>,
+    ApiJson(request): ApiJson<PasswordFinishRequest>,
 ) -> ApiResult<StatusCode> {
     let change = take_reauth(&state, &session, &request.reauth_token)?;
     let wrapped = wrapped_key(&request.wrapped_password_copy)?;
@@ -284,7 +284,7 @@ async fn store_password(
 pub(crate) async fn rotate_recovery_key(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<RotateRecoveryKeyRequest>,
+    ApiJson(request): ApiJson<RotateRecoveryKeyRequest>,
 ) -> ApiResult<StatusCode> {
     let change = take_reauth(&state, &session, &request.reauth_token)?;
     let wrapped = wrapped_key(&request.wrapped_recovery_copy)?;
@@ -351,7 +351,7 @@ async fn recovery_material(
 )]
 pub(crate) async fn recover_start(
     State(state): State<AppState>,
-    Json(request): Json<RecoverStartRequest>,
+    ApiJson(request): ApiJson<RecoverStartRequest>,
 ) -> ApiResult<Json<RecoverStartResponse>> {
     let handle = parse_handle(&request.handle)?;
     state.rate_limits.check_handle(&handle)?;
@@ -397,7 +397,7 @@ pub(crate) async fn recover_start(
 )]
 pub(crate) async fn recover_finish(
     State(state): State<AppState>,
-    Json(request): Json<RecoverFinishRequest>,
+    ApiJson(request): ApiJson<RecoverFinishRequest>,
 ) -> ApiResult<StatusCode> {
     let change = state
         .pending

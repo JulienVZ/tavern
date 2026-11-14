@@ -72,14 +72,66 @@ async fn migrations_can_run_twice() {
     db::migrate(&pool).await.unwrap();
 }
 
+/// Every error is in the API's own format, so that a client never has to
+/// guess. In particular an unknown route says so with a dedicated code: a
+/// client built for a newer server then tells its user that the instance is
+/// too old, instead of "this is not a Tavern instance".
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
-async fn unknown_routes_return_404() {
+async fn unknown_routes_and_methods_answer_with_a_coded_error() {
+    use tavern_protocol::rest::{ErrorBody, ErrorCode};
+
     let addr = spawn_app().await;
+    let client = reqwest::Client::new();
 
-    let response = reqwest::get(format!("http://{addr}/nope")).await.unwrap();
+    for request in [
+        client.get(format!("http://{addr}/nope")),
+        client
+            .post(format!("http://{addr}/v1/auth/some/future/route"))
+            .json(&()),
+        // A known path with a method it does not have.
+        client.delete(format!("http://{addr}/health")),
+        client.get(format!("http://{addr}/v1/auth/login/start")),
+    ] {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 404);
+        let body: ErrorBody = response.json().await.unwrap();
+        assert_eq!(body.code, ErrorCode::UnknownEndpoint);
+    }
+}
 
-    assert_eq!(response.status(), 404);
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn malformed_bodies_answer_with_a_coded_error() {
+    use tavern_protocol::rest::{ErrorBody, ErrorCode};
+
+    let addr = spawn_app().await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/v1/auth/login/start");
+
+    for request in [
+        client.post(&url).json(&serde_json::json!({})),
+        client
+            .post(&url)
+            .json(&serde_json::json!({ "handle": 4, "credential_request": "AA" })),
+        client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body("{not json"),
+        client.post(&url).body("handle=alice"),
+    ] {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        let body: ErrorBody = response.json().await.unwrap();
+        assert_eq!(body.code, ErrorCode::InvalidArgument);
+    }
+
+    // Too large for the REST body limit.
+    let huge = serde_json::json!({ "handle": "a".repeat(200_000), "credential_request": "AA" });
+    let response = client.post(&url).json(&huge).send().await.unwrap();
+    assert_eq!(response.status(), 413);
+    let body: ErrorBody = response.json().await.unwrap();
+    assert_eq!(body.code, ErrorCode::PayloadTooLarge);
 }
 
 #[tokio::test]
@@ -96,9 +148,44 @@ async fn wrong_database_password_is_explained() {
     );
 }
 
+/// The routes of REST 1.1, frozen. If this test fails because a route was
+/// added or removed, update the list **and increment
+/// `tavern_protocol::REST_MINOR_VERSION`**: that number is how a client tells
+/// its user that an instance is older than the client.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
-async fn openapi_document_lists_the_routes() {
+async fn the_route_list_matches_the_announced_rest_version() {
+    const REST_MINOR_OF_THIS_LIST: u32 = 1;
+    const ROUTES: &[&str] = &[
+        "/health",
+        "/v1/account/password/finish",
+        "/v1/account/password/start",
+        "/v1/account/recovery-key",
+        "/v1/account/totp/confirm",
+        "/v1/account/totp/disable",
+        "/v1/account/totp/enable",
+        "/v1/admin/invites",
+        "/v1/admin/invites/{invite_id}",
+        "/v1/admin/users",
+        "/v1/admin/users/{user_id}/disable",
+        "/v1/admin/users/{user_id}/enable",
+        "/v1/admin/users/{user_id}/totp/disable",
+        "/v1/auth/login/finish",
+        "/v1/auth/login/start",
+        "/v1/auth/login/totp",
+        "/v1/auth/logout",
+        "/v1/auth/reauth/finish",
+        "/v1/auth/reauth/start",
+        "/v1/auth/recover/finish",
+        "/v1/auth/recover/start",
+        "/v1/auth/register/finish",
+        "/v1/auth/register/start",
+        "/v1/devices",
+        "/v1/devices/{device_id}",
+        "/v1/devices/{device_id}/session",
+        "/v1/users/me",
+        "/version",
+    ];
     let addr = spawn_app().await;
 
     let document: serde_json::Value = reqwest::get(format!("http://{addr}/v1/openapi.json"))
@@ -107,18 +194,31 @@ async fn openapi_document_lists_the_routes() {
         .json()
         .await
         .unwrap();
+    let mut paths: Vec<&str> = document["paths"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    paths.sort_unstable();
 
-    let paths = document["paths"].as_object().unwrap();
-    for path in [
-        "/health",
-        "/v1/auth/login/start",
-        "/v1/devices",
-        "/v1/admin/invites",
-    ] {
-        assert!(
-            paths.contains_key(path),
-            "{path} is missing from the OpenAPI document"
-        );
-    }
+    assert_eq!(
+        paths, ROUTES,
+        "the route list changed: see the comment on this test"
+    );
+    assert_eq!(
+        tavern_protocol::REST_MINOR_VERSION,
+        REST_MINOR_OF_THIS_LIST,
+        "REST_MINOR_VERSION changed: update the frozen route list with it"
+    );
     assert!(document["components"]["schemas"]["LoginGrant"].is_object());
+
+    let version: VersionResponse = reqwest::get(format!("http://{addr}/version"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(version.rest.major, tavern_protocol::REST_MAJOR_VERSION);
+    assert_eq!(version.rest.minor, tavern_protocol::REST_MINOR_VERSION);
 }

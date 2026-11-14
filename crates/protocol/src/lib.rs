@@ -34,6 +34,20 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 /// Incremented on every additive change within a major version.
 pub const GATEWAY_MINOR_VERSION: u32 = 0;
 
+/// Major version of the REST API implemented by this crate (the `/v1` prefix).
+pub const REST_MAJOR_VERSION: u32 = 1;
+
+/// Minor version of the REST API implemented by this crate.
+///
+/// **Increment it whenever a route is added** or a response gains a field
+/// that clients rely on. A client compares it with the value announced by
+/// `GET /version` to tell the user that the instance is older than the
+/// client, instead of failing on a missing route. History:
+///
+/// - 0: health and version only (M0), and M1 before credential changes;
+/// - 1: accounts, devices, TOTP, administration, credential changes (M1).
+pub const REST_MINOR_VERSION: u32 = 1;
+
 /// WebSocket subprotocol negotiated by the gateway.
 pub const GATEWAY_SUBPROTOCOL: &str = "tavern.v1";
 

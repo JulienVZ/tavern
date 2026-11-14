@@ -6,9 +6,11 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use tavern_protocol::rest::{
-    B64, ComponentStatus, GatewayVersions, HealthResponse, VersionResponse,
+    B64, ComponentStatus, GatewayVersions, HealthResponse, RestVersion, VersionResponse,
 };
-use tavern_protocol::{GATEWAY_MAJOR_VERSION, GATEWAY_MINOR_VERSION};
+use tavern_protocol::{
+    GATEWAY_MAJOR_VERSION, GATEWAY_MINOR_VERSION, REST_MAJOR_VERSION, REST_MINOR_VERSION,
+};
 
 use crate::{AppState, db};
 
@@ -44,6 +46,10 @@ pub(crate) async fn version(State(state): State<AppState>) -> Json<VersionRespon
     Json(VersionResponse {
         name: "tavern".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        rest: RestVersion {
+            major: REST_MAJOR_VERSION,
+            minor: REST_MINOR_VERSION,
+        },
         gateway: GatewayVersions {
             min_major: GATEWAY_MAJOR_VERSION,
             max_major: GATEWAY_MAJOR_VERSION,

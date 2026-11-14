@@ -15,7 +15,7 @@ use tavern_protocol::rest::{
 };
 use uuid::Uuid;
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::gateway::{Event, RevocationReason};
 use crate::session::{self, Session};
 use crate::{AppState, totp};
@@ -136,7 +136,7 @@ pub async fn insert_invite(
 pub(crate) async fn create_invite(
     State(state): State<AppState>,
     session: Session,
-    Json(request): Json<CreateInviteRequest>,
+    ApiJson(request): ApiJson<CreateInviteRequest>,
 ) -> ApiResult<(StatusCode, Json<CreatedInvite>)> {
     session.require_admin()?;
     let max_uses = request.max_uses.unwrap_or(1);

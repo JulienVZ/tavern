@@ -3,9 +3,11 @@
 //! Errors of the REST API.
 
 use axum::Json;
+use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::http::header::RETRY_AFTER;
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 use tavern_protocol::rest::{ErrorBody, ErrorCode};
 
 /// An error returned to an API client.
@@ -53,6 +55,15 @@ impl ApiError {
     /// The resource does not exist.
     pub const fn not_found() -> Self {
         Self::new(ErrorCode::NotFound, "not found")
+    }
+
+    /// No such route, or no such method on this route. A client that gets
+    /// this from an instance it already validated is newer than the server.
+    pub const fn unknown_endpoint() -> Self {
+        Self::new(
+            ErrorCode::UnknownEndpoint,
+            "this server has no such endpoint",
+        )
     }
 
     /// Wrong handle or password. The same error for every cause.
@@ -105,7 +116,7 @@ impl ApiError {
             ErrorCode::Forbidden | ErrorCode::AccountDisabled | ErrorCode::InvalidInvite => {
                 StatusCode::FORBIDDEN
             }
-            ErrorCode::NotFound => StatusCode::NOT_FOUND,
+            ErrorCode::NotFound | ErrorCode::UnknownEndpoint => StatusCode::NOT_FOUND,
             ErrorCode::AlreadyExists | ErrorCode::HandleTaken | ErrorCode::TooManyDevices => {
                 StatusCode::CONFLICT
             }
@@ -140,6 +151,34 @@ impl IntoResponse for ApiError {
             }
         }
         response
+    }
+}
+
+/// `axum::Json` with refusals in the API's own error format.
+///
+/// The stock extractor answers a malformed or mistyped body with plain text.
+/// Every error of this API is an [`ErrorBody`], so that clients never have to
+/// guess what a response means.
+#[derive(Debug, Clone, Copy)]
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> ApiResult<Self> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(match rejection.status() {
+                StatusCode::PAYLOAD_TOO_LARGE => {
+                    ApiError::new(ErrorCode::PayloadTooLarge, "the request body is too large")
+                }
+                _ => ApiError::invalid("the request body is not valid for this endpoint"),
+            }),
+        }
     }
 }
 
