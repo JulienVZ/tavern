@@ -22,11 +22,10 @@ tavern-client-core.workspace = true
 tavern-protocol.workspace = true
 
 serde.workspace = true
-tauri.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+tauri.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
