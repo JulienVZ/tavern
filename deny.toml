@@ -14,6 +14,14 @@ ignore = [
     # bindings that Tauri 2 uses on Linux. There is no upgrade until Tauri moves
     # off GTK 3. To be re-evaluated on every Tauri upgrade and at milestone M9.
     { id = "RUSTSEC-2024-0370", reason = "transitive build-time dependency of Tauri's GTK 3 stack on Linux" },
+    # zvariant, zbus_names and zvariant_derive were merged into zbus 6 and are
+    # flagged as no longer maintained as separate crates. They reach us on
+    # Linux only, through keyring's Secret Service store (secret-service 5,
+    # zbus 5). No vulnerability is reported. secret-service 6 (zbus 6) is in
+    # release candidate; drop these three entries when keyring picks it up.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; Linux keychain dependency, awaiting keyring upgrade" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; Linux keychain dependency, awaiting keyring upgrade" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; Linux keychain dependency, awaiting keyring upgrade" },
     # crypto-bigint 0.5 (timing variability, fixed only in 0.7.6) comes from
     # elliptic-curve 0.13, a dependency of opaque-ke 4 and voprf 0.5. Tavern's
     # OPAQUE suite uses ristretto255 only, whose arithmetic is in

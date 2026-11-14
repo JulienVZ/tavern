@@ -8,6 +8,8 @@ use std::time::Duration;
 use tavern_protocol::rest::HealthResponse;
 use url::{Host, Url};
 
+use crate::error::ClientError;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = concat!("tavern-client/", env!("CARGO_PKG_VERSION"));
@@ -80,10 +82,20 @@ impl InstanceUrl {
         self.0.as_str()
     }
 
-    fn endpoint(&self, path: &str) -> Result<Url, ClientError> {
+    pub(crate) fn endpoint(&self, path: &str) -> Result<Url, ClientError> {
         self.0
             .join(path)
             .map_err(|_| ClientError::UnexpectedResponse)
+    }
+
+    /// The gateway WebSocket URL of this instance: `wss` for `https`, and
+    /// `ws` only for the loopback hosts for which `http` is accepted.
+    pub(crate) fn gateway_url(&self) -> Result<Url, ClientError> {
+        let mut url = self.endpoint(tavern_protocol::GATEWAY_PATH.trim_start_matches('/'))?;
+        let scheme = if url.scheme() == "http" { "ws" } else { "wss" };
+        url.set_scheme(scheme)
+            .map_err(|()| ClientError::UnexpectedResponse)?;
+        Ok(url)
     }
 }
 
@@ -95,31 +107,12 @@ fn is_loopback(host: &Host<&str>) -> bool {
     }
 }
 
-/// A request to an instance failed.
-#[derive(Debug, thiserror::Error)]
-pub enum ClientError {
-    /// The instance could not be reached (DNS, TCP, TLS or timeout).
-    #[error("the instance cannot be reached")]
-    Unreachable(#[source] reqwest::Error),
-    /// Something answered, but not like a Tavern instance.
-    #[error("the server did not answer like a Tavern instance")]
-    UnexpectedResponse,
-}
-
 /// Queries `GET /health` on the instance.
 ///
 /// A 503 answer with a well-formed body is returned as `Ok`: the instance
 /// exists and reports that it is unhealthy.
 pub async fn fetch_health(instance: &InstanceUrl) -> Result<HealthResponse, ClientError> {
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(ClientError::Unreachable)?;
-
-    let response = client
+    let response = http_client()?
         .get(instance.endpoint("health")?)
         .send()
         .await
@@ -133,6 +126,19 @@ pub async fn fetch_health(instance: &InstanceUrl) -> Result<HealthResponse, Clie
         .json::<HealthResponse>()
         .await
         .map_err(|_| ClientError::UnexpectedResponse)
+}
+
+/// Builds the HTTP client used for every request to an instance: rustls,
+/// timeouts on connection and on the whole request, and no redirects, so an
+/// instance cannot silently send the client elsewhere.
+pub(crate) fn http_client() -> Result<reqwest::Client, ClientError> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(ClientError::Unreachable)
 }
 
 #[cfg(test)]
@@ -155,6 +161,20 @@ mod tests {
         assert_eq!(
             url.endpoint("health").unwrap().as_str(),
             "https://example.org/tavern/health"
+        );
+    }
+
+    #[test]
+    fn the_gateway_url_follows_the_scheme_and_prefix() {
+        let secure = InstanceUrl::parse("https://example.org/tavern").unwrap();
+        assert_eq!(
+            secure.gateway_url().unwrap().as_str(),
+            "wss://example.org/tavern/gateway/v1"
+        );
+        let local = InstanceUrl::parse("http://localhost:8080").unwrap();
+        assert_eq!(
+            local.gateway_url().unwrap().as_str(),
+            "ws://localhost:8080/gateway/v1"
         );
     }
 
