@@ -70,3 +70,18 @@ jobs:
       - name: Run
         working-directory: bench
         run: cargo run --release --quiet
+
+  memory:
+    name: Memory returned after Argon2id (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      # One full client-side OPAQUE registration at the production parameters,
+      # with the process's resident memory before and after.
+      - name: Measure
+        run: cargo run --release --locked --package tavern-crypto --example argon2_memory
