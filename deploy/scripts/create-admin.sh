@@ -22,4 +22,9 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
+# Use the image built from this repository as it is now, unless a published
+# image is named in TAVERN_SERVER_IMAGE.
+if [ -z "$(sed -n 's/^TAVERN_SERVER_IMAGE=//p' .env | head -n 1)" ]; then
+    docker compose build --quiet server
+fi
 docker compose run --rm -T server create-admin-invite

@@ -4,7 +4,10 @@
 # interface only, so that a locally built client can reach the server over
 # plain HTTP and the integration tests can reach the database.
 #
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# `./scripts/init.sh --dev` enables it for every compose command run in this
+# directory, by writing COMPOSE_FILE into .env. Then simply:
+#
+#   docker compose up -d
 #
 # Never use this file on a real instance.
 

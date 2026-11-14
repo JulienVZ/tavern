@@ -58,8 +58,8 @@ Run a development server stack, published on the loopback interface only:
 
 ```bash
 cd deploy
-./scripts/init.sh --dev    # local names: localhost and livekit.localhost
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+./scripts/init.sh --dev    # localhost names, and enables docker-compose.dev.yml
+docker compose up -d --build
 curl http://localhost:8080/health
 ```
 

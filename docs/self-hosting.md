@@ -121,15 +121,16 @@ Run the script again if you need another administrator, or if the code expired b
 
 ### Trying it on your own computer
 
-For a local test without a domain:
+For a test on your own computer, without a domain:
 
 ```bash
-./scripts/init.sh --dev    # sets localhost and livekit.localhost
+./scripts/init.sh --dev    # localhost names, and the development override
 docker compose up -d
+./scripts/create-admin.sh
 curl --insecure https://localhost/health
 ```
 
-Caddy uses its own local certificate authority for `localhost`, hence `--insecure`. The desktop client refuses such a certificate; to connect a locally built client, use the development override described in [CONTRIBUTING.md](../CONTRIBUTING.md).
+Caddy uses its own local certificate authority for `localhost`, hence `--insecure`. The desktop client refuses such a certificate. `--dev` therefore also enables `docker-compose.dev.yml` (through `COMPOSE_FILE` in `.env`), which publishes the server on `http://localhost:8080`, on the loopback interface only: enter that address in the client. Never use `--dev` on a real instance.
 
 ## 5. Updating
 
@@ -140,6 +141,8 @@ git pull
 cd deploy
 docker compose up -d --build
 ```
+
+Then run `./scripts/init.sh` again: a new version may need secrets that your `.env` does not have yet, and the script adds only what is missing. The server refuses to start, with a message naming the variable, when one is absent.
 
 Database migrations are applied automatically when the server starts. Read the release notes before updating: they list any change to `.env.example`, `Caddyfile.example` or `livekit.yaml.example` that you need to carry over to your own files. Running `./scripts/init.sh` again is safe: it never overwrites existing files or secrets.
 

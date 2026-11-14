@@ -67,7 +67,7 @@ The server refuses to start when one of its four secrets is missing or malformed
 |---|---|
 | `deploy/Caddyfile` | Reverse proxy and TLS. Created from `Caddyfile.example`. Domains come from `.env`. |
 | `deploy/livekit.yaml` | LiveKit settings without secrets. Created from `livekit.yaml.example`. |
-| `deploy/docker-compose.dev.yml` | Development override that publishes the server and PostgreSQL on `127.0.0.1`. Not for real instances. |
+| `deploy/docker-compose.dev.yml` | Development override that publishes the server and PostgreSQL on `127.0.0.1`. Enabled by `init.sh --dev`, which writes `COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml` into `.env`. Not for real instances. |
 
 ## Endpoints useful to operators
 

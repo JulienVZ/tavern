@@ -178,13 +178,20 @@ jobs:
       - name: The server is reachable through Caddy only
         working-directory: deploy
         run: |
-          published=$(docker compose config --format json | jq '.services.server.ports // [] | length')
+          # The production file alone (init.sh --dev enables the development
+          # override through COMPOSE_FILE, so it is named explicitly here).
+          production="docker compose -f docker-compose.yml"
+          published=$($production config --format json | jq '.services.server.ports // [] | length')
           echo "ports published by the server service: $published"
           test "$published" -eq 0
-          docker compose config --format json \
+          $production config --format json \
             | jq -e '.services.server.environment.TAVERN_TRUST_FORWARDED_FOR == "true"'
-          docker compose -f docker-compose.yml -f docker-compose.dev.yml config --format json \
+          # With the development override the server is reached directly, on
+          # the loopback interface only, and must not trust forwarded headers.
+          docker compose config --format json \
             | jq -e '.services.server.environment.TAVERN_TRUST_FORWARDED_FOR == "false"'
+          docker compose config --format json \
+            | jq -e '[.services.server.ports[].host_ip] | all(. == "127.0.0.1")'
       - name: Start the stack and query it through Caddy
         working-directory: deploy
         run: |
@@ -197,6 +204,8 @@ jobs:
           echo
           curl --silent --insecure --fail https://localhost/health | jq -e '.status == "ok"'
           curl --silent --insecure --fail https://localhost/version | jq -e '.mls_external_sender_key | length > 0'
+          # The development override publishes the server on the loopback interface.
+          curl --silent --fail http://localhost:8080/version | jq -e '.rest.minor >= 1'
       - name: Create the administrator invitation, back up and restore
         working-directory: deploy
         run: |

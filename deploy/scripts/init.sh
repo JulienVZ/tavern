@@ -9,7 +9,8 @@
 # Usage:
 #   ./scripts/init.sh          real instance: asks for the domains when run in
 #                              a terminal, otherwise lists what is missing
-#   ./scripts/init.sh --dev    local test: fills in localhost names
+#   ./scripts/init.sh --dev    development on this computer: localhost names,
+#                              and the server reachable on http://localhost:8080
 #
 # Safe to run again: existing files, values and secrets are never modified.
 #
@@ -128,6 +129,11 @@ set_if_empty LIVEKIT_API_SECRET "$(random_hex 32)"
 if [ "$dev" = true ]; then
     set_if_empty TAVERN_DOMAIN localhost "set     "
     set_if_empty LIVEKIT_DOMAIN livekit.localhost "set     "
+    # Every `docker compose` command run in this directory, by hand or by the
+    # scripts, then includes the development override, which publishes the
+    # server and PostgreSQL on the loopback interface. Without this, commands
+    # run with and without the override would recreate each other's containers.
+    set_if_empty COMPOSE_FILE docker-compose.yml:docker-compose.dev.yml "set     "
 elif [ -t 0 ]; then
     if [ -z "$(get_value TAVERN_DOMAIN)" ] || [ -z "$(get_value LIVEKIT_DOMAIN)" ]; then
         echo
@@ -170,10 +176,19 @@ done
 
 if [ "$need_instance_secrets" = true ]; then
     echo "Generating the instance secrets (this builds the server image the first time)..."
+    # When the image is built from this repository, rebuild it first: an image
+    # left over from an older version does not know `gen-secrets`. An image
+    # named in TAVERN_SERVER_IMAGE is used as it is.
+    if [ -z "$(get_value TAVERN_SERVER_IMAGE)" ] && ! docker compose build --quiet server; then
+        echo >&2
+        echo "NOT READY. The server image could not be built. Check that Docker is running." >&2
+        exit 1
+    fi
     if ! generated=$(docker compose run --rm --no-deps -T server gen-secrets); then
         echo >&2
         echo "NOT READY. The instance secrets could not be generated." >&2
-        echo "Check that Docker is running, then run this script again." >&2
+        echo "Check that Docker is running. If TAVERN_SERVER_IMAGE is set in deploy/.env," >&2
+        echo "make sure that image is recent enough to know the gen-secrets command." >&2
         exit 1
     fi
     for name in $instance_secrets; do
