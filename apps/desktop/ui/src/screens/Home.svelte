@@ -4,6 +4,7 @@
   import { t } from "../lib/i18n";
   import { guarded, session, signedOut } from "../lib/session.svelte";
   import Admin from "./Admin.svelte";
+  import Credentials from "./Credentials.svelte";
   import Devices from "./Devices.svelte";
   import Security from "./Security.svelte";
 
@@ -87,6 +88,7 @@
 
     <div class="panel"><Devices /></div>
     <div class="panel"><Security /></div>
+    <div class="panel"><Credentials /></div>
     {#if session.account.isAdmin}
       <div class="panel"><Admin /></div>
     {/if}

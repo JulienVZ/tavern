@@ -138,6 +138,36 @@ const en = {
   "admin.users.disable_totp.confirm":
     "Disable two-factor authentication for @{handle}? Do this only for someone who lost their authenticator and recovery codes. Their devices will be notified and the action is logged.",
 
+  "auth.tab.recover": "Forgot password",
+  "recover.intro":
+    "Set a new password with the recovery key you saved when you created your account. Every device will be signed out.",
+  "recover.key": "Recovery key",
+  "recover.key.hint": "52 characters. Upper or lower case, with or without hyphens.",
+  "recover.new_password": "New password",
+  "recover.submit": "Set the new password",
+  "recover.working": "Recovering…",
+  "recover.done": "Your password was changed. Sign in with the new one.",
+  "recover.totp_note":
+    "If two-factor authentication is enabled, it stays enabled: you will still need a code to sign in.",
+
+  "password.title": "Password and recovery key",
+  "password.change": "Change password",
+  "password.current": "Current password",
+  "password.totp": "Two-factor code",
+  "password.totp.hint": "Required because two-factor authentication is enabled.",
+  "password.new": "New password",
+  "password.change.note": "Your other devices will be signed out and must sign in again.",
+  "password.change.submit": "Change the password",
+  "password.changed": "Password changed. Your other devices were signed out.",
+  "password.working": "Working…",
+  "recoverykey.new": "New recovery key",
+  "recoverykey.intro":
+    "Generate a new recovery key if you lost yours or think someone else saw it. The current key stops working at once.",
+  "recoverykey.submit": "Generate a new key",
+  "recoverykey.shown":
+    "This is your new recovery key. The previous one no longer works. It is shown only now.",
+  "recoverykey.done": "I have saved it",
+
   "ended.revoked": "This device was signed out.",
   "ended.credentials_changed": "Your password was changed on another device. Sign in again.",
   "ended.account_disabled": "Your account was disabled by an administrator.",
@@ -165,6 +195,10 @@ const en = {
   "error.weak_password.too_guessable":
     "This password is too easy to guess. Use a longer passphrase of unrelated words.",
   "error.totp_invalid": "This code is not valid.",
+  "error.totp_required": "Enter your two-factor code.",
+  "error.invalid_recovery_key":
+    "This recovery key does not match this account. Check the handle and the key.",
+  "error.invalid_proof": "The instance refused this change.",
   "error.exchange_expired": "This took too long. Start again.",
   "error.account_disabled": "This account is disabled. Contact the administrator.",
   "error.rate_limited": "Too many attempts. Wait a moment and try again.",
@@ -328,6 +362,36 @@ const fr: Catalogue = {
   "admin.users.disable_totp.confirm":
     "Désactiver l'authentification à deux facteurs de @{handle} ? À réserver à une personne qui a perdu son application et ses codes de secours. Ses appareils seront prévenus et l'action est journalisée.",
 
+  "auth.tab.recover": "Mot de passe oublié",
+  "recover.intro":
+    "Définissez un nouveau mot de passe avec la clé de récupération conservée à la création de votre compte. Tous les appareils seront déconnectés.",
+  "recover.key": "Clé de récupération",
+  "recover.key.hint": "52 caractères. Majuscules ou minuscules, avec ou sans tirets.",
+  "recover.new_password": "Nouveau mot de passe",
+  "recover.submit": "Définir le nouveau mot de passe",
+  "recover.working": "Récupération…",
+  "recover.done": "Votre mot de passe a été modifié. Connectez-vous avec le nouveau.",
+  "recover.totp_note":
+    "Si l'authentification à deux facteurs est activée, elle le reste : un code sera toujours demandé à la connexion.",
+
+  "password.title": "Mot de passe et clé de récupération",
+  "password.change": "Changer de mot de passe",
+  "password.current": "Mot de passe actuel",
+  "password.totp": "Code à deux facteurs",
+  "password.totp.hint": "Requis car l'authentification à deux facteurs est activée.",
+  "password.new": "Nouveau mot de passe",
+  "password.change.note": "Vos autres appareils seront déconnectés et devront se reconnecter.",
+  "password.change.submit": "Changer le mot de passe",
+  "password.changed": "Mot de passe modifié. Vos autres appareils ont été déconnectés.",
+  "password.working": "Traitement…",
+  "recoverykey.new": "Nouvelle clé de récupération",
+  "recoverykey.intro":
+    "Générez une nouvelle clé de récupération si vous avez perdu la vôtre ou pensez que quelqu'un l'a vue. La clé actuelle cesse de fonctionner immédiatement.",
+  "recoverykey.submit": "Générer une nouvelle clé",
+  "recoverykey.shown":
+    "Voici votre nouvelle clé de récupération. La précédente ne fonctionne plus. Elle n'est affichée que maintenant.",
+  "recoverykey.done": "Je l'ai conservée",
+
   "ended.revoked": "Cet appareil a été déconnecté.",
   "ended.credentials_changed":
     "Votre mot de passe a été modifié sur un autre appareil. Reconnectez-vous.",
@@ -356,6 +420,10 @@ const fr: Catalogue = {
   "error.weak_password.too_guessable":
     "Ce mot de passe est trop facile à deviner. Utilisez une phrase plus longue, faite de mots sans rapport.",
   "error.totp_invalid": "Ce code n'est pas valide.",
+  "error.totp_required": "Saisissez votre code à deux facteurs.",
+  "error.invalid_recovery_key":
+    "Cette clé de récupération ne correspond pas à ce compte. Vérifiez l'identifiant et la clé.",
+  "error.invalid_proof": "L'instance a refusé cette modification.",
   "error.exchange_expired": "L'opération a pris trop de temps. Recommencez.",
   "error.account_disabled": "Ce compte est désactivé. Contactez l'administrateur.",
   "error.rate_limited": "Trop de tentatives. Patientez un instant puis réessayez.",

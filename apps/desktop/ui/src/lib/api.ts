@@ -144,6 +144,12 @@ export const api = {
   totpEnable: () => invoke<TotpEnrolment>("totp_enable"),
   totpConfirm: (code: string) => invoke<string[]>("totp_confirm", { code }),
   totpDisable: (code: string) => invoke<void>("totp_disable", { code }),
+  recover: (handle: string, recoveryKey: string, newPassword: string) =>
+    invoke<void>("recover", { handle, recoveryKey, newPassword }),
+  changePassword: (currentPassword: string, totpCode: string | null, newPassword: string) =>
+    invoke<void>("change_password", { currentPassword, totpCode, newPassword }),
+  rotateRecoveryKey: (currentPassword: string, totpCode: string | null) =>
+    invoke<string>("rotate_recovery_key", { currentPassword, totpCode }),
   adminCreateInvite: (maxUses: number | null, expiresInHours: number | null) =>
     invoke<CreatedInvite>("admin_create_invite", { maxUses, expiresInHours }),
   adminInvites: () => invoke<Invite[]>("admin_invites"),

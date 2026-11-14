@@ -412,6 +412,68 @@ async fn totp_disable(shell: State<'_, Shell>, code: String) -> Result<()> {
     Ok(client(&session)?.totp_disable(code.trim()).await?)
 }
 
+// --- Credential changes -----------------------------------------------------------------
+
+/// Sets a new password with the recovery key, for a user who forgot theirs.
+#[tauri::command]
+async fn recover(
+    shell: State<'_, Shell>,
+    handle: String,
+    recovery_key: String,
+    new_password: String,
+) -> Result<()> {
+    let session = shell.session.lock().await;
+    Ok(instance(&session)?
+        .recover(handle.trim(), &recovery_key, &new_password)
+        .await?)
+}
+
+/// Changes the password. The current one is checked again first; every other
+/// device of the account is signed out.
+#[tauri::command]
+async fn change_password(
+    shell: State<'_, Shell>,
+    current_password: String,
+    totp_code: Option<String>,
+    new_password: String,
+) -> Result<()> {
+    let session = shell.session.lock().await;
+    let client = client(&session)?;
+    // Refuse a weak password before asking the instance for anything.
+    let me = client.me().await?;
+    if let Err(issue) = password::check(&new_password, &[&me.handle, &me.display_name]) {
+        return Err(tavern_client_core::ClientError::WeakPassword(issue).into());
+    }
+    let code = totp_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    let reauth = client.reauthenticate(&current_password, code).await?;
+    Ok(client.change_password(reauth, &new_password).await?)
+}
+
+/// Replaces the recovery key and returns the new one, to be shown once.
+/// The previous key stops working.
+#[tauri::command]
+async fn rotate_recovery_key(
+    shell: State<'_, Shell>,
+    current_password: String,
+    totp_code: Option<String>,
+) -> Result<String> {
+    let session = shell.session.lock().await;
+    let client = client(&session)?;
+    let code = totp_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    let reauth = client.reauthenticate(&current_password, code).await?;
+    Ok(client
+        .rotate_recovery_key(reauth)
+        .await?
+        .display()
+        .to_string())
+}
+
 // --- Administration -------------------------------------------------------------------
 
 #[tauri::command]
@@ -491,6 +553,9 @@ pub fn run() -> std::result::Result<(), tauri::Error> {
             totp_enable,
             totp_confirm,
             totp_disable,
+            recover,
+            change_password,
+            rotate_recovery_key,
             admin_create_invite,
             admin_invites,
             admin_revoke_invite,
