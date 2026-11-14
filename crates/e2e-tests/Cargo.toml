@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[package]
+name = "tavern-e2e-tests"
+description = "End-to-end tests: the real client core against the real server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tavern-client-core.workspace = true
+tavern-server = { path = "../server" }
+
+axum.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tavern-crypto.workspace = true
+tavern-protocol.workspace = true
+totp-rs.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

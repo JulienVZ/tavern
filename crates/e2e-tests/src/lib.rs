@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Harness for the end-to-end tests: starts the real server in-process on an
+//! ephemeral port, against a real PostgreSQL database, and hands out real
+//! clients (`tavern-client-core`) with in-memory secret stores.
+//!
+//! Nothing here is used in production. The tests need PostgreSQL:
+//!
+//! ```sh
+//! TAVERN_TEST_DATABASE_URL=postgres://... cargo test -p tavern-e2e-tests -- --ignored
+//! ```
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    reason = "a test harness panics on set-up failure"
+)]
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tavern_client_core::{GatewayEvent, InstanceClient, InstanceUrl, MemoryStore};
+use tavern_server::secrets::InstanceSecrets;
+use tavern_server::{AppState, Settings, app, db, routes};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc::Receiver;
+
+/// Environment variable holding the test database URL.
+pub const DATABASE_URL_VAR: &str = "TAVERN_TEST_DATABASE_URL";
+/// A password that meets the strength requirement.
+pub const PASSWORD: &str = "tournesol-vexant-42-brume";
+
+/// A running server.
+pub struct Server {
+    /// Where it listens.
+    pub addr: SocketAddr,
+    /// Its state, for assertions on the database.
+    pub state: AppState,
+}
+
+impl Server {
+    /// Starts a server with fresh instance secrets.
+    pub async fn spawn() -> Self {
+        let database_url = std::env::var(DATABASE_URL_VAR)
+            .unwrap_or_else(|_| panic!("{DATABASE_URL_VAR} must be set to run this test"));
+        let pool = db::connect(&database_url, 5)
+            .await
+            .expect("database must be reachable");
+        db::migrate(&pool).await.expect("migrations must apply");
+
+        let generated: HashMap<String, String> = InstanceSecrets::generate()
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        let secrets = InstanceSecrets::from_lookup(|name| generated.get(name).cloned()).unwrap();
+        let state = AppState::new(
+            pool,
+            secrets,
+            Settings {
+                source_url: None,
+                trust_forwarded_for: false,
+                session_ttl: Duration::from_secs(3600),
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        Self { addr, state }
+    }
+
+    /// A client on a computer that has never been used: empty secret store.
+    pub fn new_computer(&self) -> InstanceClient {
+        let url = InstanceUrl::parse(&format!("http://{}", self.addr)).unwrap();
+        InstanceClient::new(url, Arc::new(MemoryStore::default()), None).unwrap()
+    }
+
+    /// Creates an invitation on the host, as `create-admin.sh` does.
+    pub async fn host_invite(&self, grants_admin: bool) -> String {
+        routes::admin::insert_invite(&self.state.db, None, 1, 24, grants_admin)
+            .await
+            .unwrap()
+            .code
+    }
+}
+
+/// A handle that no other test uses.
+pub fn random_handle(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!(
+        "{prefix}_{}_{nanos:x}",
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Waits for the next gateway event, failing the test after five seconds.
+pub async fn next_event(events: &mut Receiver<GatewayEvent>) -> GatewayEvent {
+    tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("no gateway event arrived in time")
+        .expect("the gateway stopped")
+}

@@ -16,6 +16,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # No debug information in CI builds: it is not used there, and with it the
+  # workspace (Tauri, the test binaries, a release build) outgrows the
+  # runner's disk, which makes the linker crash.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   rust:
@@ -64,8 +69,12 @@ jobs:
           count=$(nm target/release/examples/argon2_memory | grep -c crypto_bigint || true)
           echo "crypto_bigint symbols: $count"
           test "$count" -eq 0
-      - name: Integration tests (PostgreSQL)
-        run: cargo test --package tavern-server --locked -- --ignored
+      - name: Free disk space
+        run: |
+          df -h / | tail -n 1
+          rm -rf target/release
+      - name: Integration and end-to-end tests (PostgreSQL)
+        run: cargo test --package tavern-server --package tavern-e2e-tests --locked -- --ignored
         env:
           TAVERN_TEST_DATABASE_URL: postgres://tavern:tavern@localhost:5432/tavern
 
