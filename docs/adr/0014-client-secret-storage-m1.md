@@ -34,7 +34,7 @@ At M1 the device stores **one small record per instance directly in the OS crede
 ## Consequences
 
 - No local database at M1, so no migration to write when M2 introduces one: the M2 database is created fresh, and this record either stays in the keychain or moves into it.
-- The application identifier is still provisional (`io.github.julienvz.tavern`). Entries written under it are orphaned if it changes; it must be fixed before M2, when durable local data starts to exist.
+- The application identifier is `io.github.julienvz.tavern`, final since 2026-11-14. It names the keychain entries, and from M2 the local data directory; changing it would orphan both.
 - On Linux without a running Secret Service (minimal desktops, some containers) the client cannot stay signed in between launches. It reports the keychain as unavailable instead of falling back to a file.
 - On Linux, `keyring` talks to the Secret Service through `zbus` 5, three sub-crates of which (`zvariant`, `zbus_names`, `zvariant_derive`) are flagged by RustSec as unmaintained because they were merged into `zbus` 6. No vulnerability is reported. The three advisories are ignored in `deny.toml` until `keyring` moves to `secret-service` 6, which is in release candidate.
 - A malicious program running as the same user can read the record on every platform; this is the "compromised device" case of the threat model.

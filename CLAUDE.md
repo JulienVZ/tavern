@@ -68,6 +68,8 @@ Hors périmètre v1 : fédération entre instances, applications mobiles (mais l
 
 Avant d'ajouter une dépendance, vérifie qu'elle est maintenue, que sa licence est compatible (voir §10) et qu'elle passe `cargo deny`. Toute dépendance crypto ou réseau nouvelle doit faire l'objet d'un ADR.
 
+**Aucune exception dans `deny.toml` (avis ignoré, licence ou source ajoutée, interdiction levée) sans l'accord préalable du mainteneur.** Si `cargo deny` échoue, arrête-toi, présente l'analyse et attends la décision.
+
 Les versions des crates évoluent : vérifie toujours la version actuelle et la doc à jour (docs.rs, changelogs) au lieu de te fier à ta mémoire, en particulier pour Tauri, OpenMLS, LiveKit et axum.
 
 ---
@@ -295,7 +297,8 @@ curl https://<TAVERN_DOMAIN>/health
 ./scripts/create-admin.sh             # code d'invitation du premier administrateur
 
 # Pile de développement : serveur sur http://localhost:8080, Postgres sur localhost:5432
-cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+# (init.sh --dev écrit COMPOSE_FILE dans .env : toutes les commandes compose incluent alors la surcharge de dév)
+cd deploy && ./scripts/init.sh --dev && docker compose up -d --build
 
 # Tests d'intégration et de bout en bout (nécessitent PostgreSQL ; mot de passe dans deploy/.env)
 TAVERN_TEST_DATABASE_URL=postgres://tavern:<mot de passe>@localhost:5432/tavern \
@@ -353,7 +356,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 5. **Encodeur Media Foundation** (QuickSync/AMF sous Windows) : à décider au M7 après mesure.
 6. **Mécanisme d'entrée dans les channels d'un serveur** : orientation retenue — external commit autorisé par les rôles (le nouveau membre n'attend pas), arrivée toujours affichée dans le channel, plus une option « channel privé » où l'entrée exige l'ajout par un membre. Décision finale au M4.
 7. **Historique sur un nouvel appareil** : ADR 0009 (proposé), transfert d'appareil à appareil au M5b ; sauvegarde chiffrée sous la clé de récupération à évaluer ensuite.
-8. **Identifiant de l'application** (`io.github.julienvz.tavern`, provisoire) : à fixer avant M2, qui crée le store local et rend les données locales durables.
+8. **Identifiant de l'application** : `io.github.julienvz.tavern`, définitif depuis le 2026-11-14 (il nomme les entrées de trousseau et, à partir de M2, le dossier de données local). Ne plus le modifier.
 9. **SQLCipher et OpenSSL** : SQLCipher embarqué exige OpenSSL sous Windows et Linux, ce que `deny.toml` interdit aujourd'hui. ADR à écrire au début de M2.
 10. **Mémoire Argon2id sur macOS** : après une connexion, l'allocateur de macOS peut conserver les 128 Mio (libérés en 2 s sur un Mac, toujours retenus après 10 s sur un runner). Linux les rend immédiatement ; Windows reste à mesurer. Options : accepter, exécuter l'étirement de clé dans un processus auxiliaire éphémère, ou baisser le paramètre mémoire (ADR 0003).
 
@@ -365,6 +368,8 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 2. **Un jalon à la fois.** Ne commence pas le suivant sans validation.
 3. **Écris un ADR** (`docs/adr/NNNN-titre.md` : contexte, décision, alternatives, conséquences) pour toute décision structurante.
 4. **Mets à jour la doc dans le même commit** que le code (README, `docs/`, `.env.example`, ce fichier si une décision change).
-5. **Vérifie avant de déclarer terminé** : fmt, clippy, tests, build. Dis clairement ce qui n'a pas pu être testé (ex. capture d'écran sur un OS non disponible).
+5. **Vérifie avant de déclarer terminé** : fmt, clippy, tests, build. Dis clairement ce qui n'a pas pu être testé (ex. capture d'écran sur un OS non disponible). Avant de remettre un serveur ou un client à tester à la main, relance-le depuis le build courant et vérifie que les routes ajoutées répondent : un processus démarré avant les derniers changements fait échouer le test pour une mauvaise raison.
+8. **Version REST** : toute route ajoutée ou retirée incrémente `tavern_protocol::REST_MINOR_VERSION` (un test fige la liste des routes) ; c'est ce qui permet au client d'annoncer qu'une instance est plus ancienne que lui.
+9. **Espace disque** : la machine du mainteneur est presque pleine. Préviens dès que `target/` dépasse 8 Go et avant toute opération qui consomme beaucoup d'espace.
 6. **Signale les risques** : si une demande affaiblit la sécurité ou le budget RAM, dis-le avant de l'implémenter.
 7. Pas de code mort, pas de TODO non suivi : tout TODO référence une issue ou un jalon.
