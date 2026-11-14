@@ -177,7 +177,7 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Le **handle** est l'identifiant OPAQUE : non modifiable en v1, forme canonique stricte (ASCII `a–z 0–9 _ .`, 2 à 32 caractères, minuscules), implémentée une seule fois dans `tavern_protocol::handle` pour le client et le serveur.
 - Changements d'identifiants (ADR 0003) : chacun est autorisé par une signature de l'AIK sur un défi à usage unique. Récupération : nouveau mot de passe, toutes les sessions révoquées, TOTP conservé. Changement de mot de passe : les autres sessions sont révoquées. La clé de récupération peut être régénérée (l'ancienne cesse de fonctionner).
 - Un admin peut désactiver le TOTP d'un utilisateur (téléphone et codes perdus) : appareils notifiés, action journalisée (`admin_audit_log`).
-- Argon2id : 128 Mio, t=3, p=1 (mesures dans l'ADR 0003). Dépassement transitoire assumé du budget RAM pendant une connexion.
+- Argon2id : 128 Mio, t=3, p=1 (mesures dans l'ADR 0003). Dépassement transitoire assumé du budget RAM pendant une connexion ; rétention possible sur macOS (point ouvert n° 10).
 - En M1 le client ne stocke qu'une petite fiche par instance dans le trousseau OS (ADR 0014) ; SQLCipher arrive en M2.
 
 ### Règles de code liées à la sécurité
@@ -355,6 +355,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 7. **Historique sur un nouvel appareil** : ADR 0009 (proposé), transfert d'appareil à appareil au M5b ; sauvegarde chiffrée sous la clé de récupération à évaluer ensuite.
 8. **Identifiant de l'application** (`io.github.julienvz.tavern`, provisoire) : à fixer avant M2, qui crée le store local et rend les données locales durables.
 9. **SQLCipher et OpenSSL** : SQLCipher embarqué exige OpenSSL sous Windows et Linux, ce que `deny.toml` interdit aujourd'hui. ADR à écrire au début de M2.
+10. **Mémoire Argon2id sur macOS** : après une connexion, l'allocateur de macOS peut conserver les 128 Mio (libérés en 2 s sur un Mac, toujours retenus après 10 s sur un runner). Linux les rend immédiatement ; Windows reste à mesurer. Options : accepter, exécuter l'étirement de clé dans un processus auxiliaire éphémère, ou baisser le paramètre mémoire (ADR 0003).
 
 ---
 

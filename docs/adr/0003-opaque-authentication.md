@@ -56,7 +56,18 @@ Not measured yet: a container limited to one core (Docker was unavailable on the
 
 Chosen: **128 MiB, 3 passes, 1 lane**. The `argon2` crate does not run lanes in parallel by default, so more lanes would add time without adding cost for an attacker.
 
-**Memory budget exception.** The client's idle budget is 150 MB. Argon2id needs 128 MiB for the duration of one registration or login, which exceeds it for a fraction of a second. This is accepted as a transient exception: the computation runs once per login, off the UI thread. Measured with `cargo run --release -p tavern-crypto --example argon2_memory` on macOS: physical footprint 1 MiB before, 129 MiB right after the computation, back to 1 MiB two seconds later (the allocator returns the block to the system with a short delay). The same check must be repeated on Windows and Linux before M1 is closed.
+**Memory budget exception.** The client's idle budget is 150 MB. Argon2id needs 128 MiB for the duration of one registration or login, which exceeds it for a fraction of a second. This is accepted as a transient exception: the computation runs once per login, off the UI thread.
+
+Whether the memory goes back to the system afterwards depends on the platform's allocator. Measured with `cargo run --release -p tavern-crypto --example argon2_memory` (three registrations in a row, then idle):
+
+| Platform | Before | Right after | 10 s later |
+|---|---|---|---|
+| Linux, GitHub runner (ubuntu-24.04, glibc) | 2 MiB | 2 MiB | 2 MiB |
+| macOS, development machine (Apple M4) | 1 MiB | 129 MiB | 1 MiB (already back after 2 s) |
+| macOS, GitHub runner (`macos-latest`) | 1 MiB | 129 MiB | **129 MiB** |
+| Windows | not measured | | |
+
+On Linux the block is returned at once. On macOS the system allocator may keep it cached: it was released within two seconds on one machine and still held after ten on another. Three runs in a row never used more than one block, so this is a cache, not a leak, but a macOS client can sit about 128 MiB above its idle footprint after a login. **This is an open point**: the options are to accept it, to run the key stretching in a short-lived helper process (memory returned at exit on every platform), or to lower the memory parameter. To be decided with the maintainer; see `CLAUDE.md` §12. Windows remains to be measured.
 
 The server never runs Argon2id.
 
