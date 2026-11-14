@@ -49,6 +49,7 @@ zeroize = { version = "1.9", features = ["derive"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "json", "tokio", "ws"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 prost = "0.14.6"
+qrcode = { version = "0.14.1", default-features = false }
 prost-build = "0.14.6"
 protox = "0.10.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
@@ -86,6 +87,15 @@ unwrap_used = "deny"
 expect_used = "deny"
 print_stdout = "warn"
 print_stderr = "warn"
+
+# Debug information is what makes target/ large (20 GB for this workspace with
+# the defaults). Our own crates keep line numbers for backtraces; dependencies
+# carry none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 # Key stretching and curve arithmetic are unusably slow without optimisation:
 # a single Argon2id run at the production parameters takes seconds. These
