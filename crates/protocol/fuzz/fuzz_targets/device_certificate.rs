@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! :identity::v1::DeviceCertificate:Device certificates, decoded by the server and by every client that verifies one.
+//! Device certificates, decoded by the server and by every client that verifies one.
 //!
 //! Decoding arbitrary bytes must never panic, and whatever decodes must
 //! encode and decode again to the same value.
@@ -9,7 +9,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use prost::Message;
-use tavern_protocol as Target;
+use tavern_protocol::identity::v1::DeviceCertificate as Target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(decoded) = Target::decode(data) {

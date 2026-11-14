@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! :gateway::v1::ServerFrame:Frames sent by the server: clients decode these, and the server may be hostile.
+//! Frames sent by the server: clients decode these, and the server may be hostile.
 //!
 //! Decoding arbitrary bytes must never panic, and whatever decodes must
 //! encode and decode again to the same value.
@@ -9,7 +9,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use prost::Message;
-use tavern_protocol as Target;
+use tavern_protocol::gateway::v1::ServerFrame as Target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(decoded) = Target::decode(data) {
