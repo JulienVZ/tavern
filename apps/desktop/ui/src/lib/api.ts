@@ -1,34 +1,155 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Typed wrappers around the Tauri commands exposed by `src-tauri`.
-// The UI only ever receives already-decrypted view models through this layer.
+//
+// The interface never handles keys, tokens or ciphertext: it sends what the
+// user typed and receives what must be displayed. Passwords are passed to the
+// Rust core and are not kept in any store here.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type ComponentStatus = "ok" | "unavailable";
+export type Platform = "windows" | "macos" | "linux";
+
+export interface Account {
+  userId: string;
+  deviceId: string;
+  handle: string;
+  displayName: string;
+  isAdmin: boolean;
+  totpEnabled: boolean;
+}
 
 export interface InstanceProbe {
   url: string;
-  health: {
-    status: ComponentStatus;
-    database: ComponentStatus;
-  };
+  health: { status: ComponentStatus; database: ComponentStatus };
+  rememberedHandle: string | null;
+  account: Account | null;
 }
 
-export const COMMAND_ERRORS = [
-  "invalid_url",
-  "insecure_url",
-  "unreachable",
-  "not_an_instance",
-] as const;
+export type PasswordIssue = "too_short" | "too_long" | "too_guessable";
 
-export type CommandError = (typeof COMMAND_ERRORS)[number];
+export interface PasswordStrength {
+  score: number;
+  length: number;
+  issue: PasswordIssue | null;
+}
+
+export interface Registered {
+  handle: string;
+  isAdmin: boolean;
+  recoveryKey: string;
+}
+
+export type LoginResult =
+  | { status: "totp_required" }
+  | { status: "signed_in"; account: Account; newDevice: boolean };
+
+export interface Device {
+  deviceId: string;
+  platform: Platform;
+  createdAtMs: number;
+  lastSeenAtMs: number | null;
+  current: boolean;
+}
+
+export interface TotpEnrolment {
+  secret: string;
+  otpauth_url: string;
+}
+
+export interface Invite {
+  invite_id: string;
+  max_uses: number;
+  uses: number;
+  grants_admin: boolean;
+  revoked: boolean;
+  created_at_ms: number;
+  expires_at_ms: number | null;
+}
+
+export interface CreatedInvite {
+  code: string;
+  invite: Invite;
+}
+
+export interface AdminUser {
+  user_id: string;
+  handle: string;
+  display_name: string;
+  is_admin: boolean;
+  disabled: boolean;
+  totp_enabled: boolean;
+  device_count: number;
+  created_at_ms: number;
+}
+
+export type SessionEndReason =
+  | "revoked"
+  | "credentials_changed"
+  | "account_disabled"
+  | "invalid"
+  | "replaced";
+
+export type GatewayEvent =
+  | { type: "connected"; newDevices: string[] }
+  | { type: "device_added"; deviceId: string }
+  | { type: "device_removed"; deviceId: string }
+  | { type: "totp_disabled_by_admin" }
+  | { type: "disconnected" }
+  | { type: "session_ended"; reason: SessionEndReason };
+
+/** Failure of a command: a code the interface maps to a localised message. */
+export interface CommandError {
+  code: string;
+  detail?: string;
+  retryAfterMs?: number;
+}
 
 export function isCommandError(value: unknown): value is CommandError {
-  return typeof value === "string" && (COMMAND_ERRORS as readonly string[]).includes(value);
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "code" in value &&
+    typeof (value as { code: unknown }).code === "string"
+  );
 }
 
-/** Validates the address and asks the instance for its health. */
-export function probeInstance(url: string): Promise<InstanceProbe> {
-  return invoke<InstanceProbe>("probe_instance", { url });
+/** Normalises whatever a command threw into a `CommandError`. */
+export function toCommandError(value: unknown): CommandError {
+  return isCommandError(value) ? value : { code: "internal" };
 }
+
+const GATEWAY_EVENT = "tavern://gateway";
+
+export function onGatewayEvent(handler: (event: GatewayEvent) => void): Promise<UnlistenFn> {
+  return listen<GatewayEvent>(GATEWAY_EVENT, (event) => handler(event.payload));
+}
+
+export const api = {
+  probeInstance: (url: string) => invoke<InstanceProbe>("probe_instance", { url }),
+  assessPassword: (password: string, handle: string, displayName: string) =>
+    invoke<PasswordStrength>("assess_password", { password, handle, displayName }),
+  register: (inviteCode: string, handle: string, displayName: string, password: string) =>
+    invoke<Registered>("register", { inviteCode, handle, displayName, password }),
+  login: (handle: string, password: string) => invoke<LoginResult>("login", { handle, password }),
+  submitTotp: (code: string) => invoke<LoginResult>("submit_totp", { code }),
+  logout: () => invoke<void>("logout"),
+  sessionEnded: () => invoke<void>("session_ended"),
+  account: () => invoke<Account>("account"),
+  devices: () => invoke<Device[]>("devices"),
+  revokeDevice: (deviceId: string) => invoke<void>("revoke_device", { deviceId }),
+  ackNewDevices: () => invoke<void>("ack_new_devices"),
+  totpEnable: () => invoke<TotpEnrolment>("totp_enable"),
+  totpConfirm: (code: string) => invoke<string[]>("totp_confirm", { code }),
+  totpDisable: (code: string) => invoke<void>("totp_disable", { code }),
+  adminCreateInvite: (maxUses: number | null, expiresInHours: number | null) =>
+    invoke<CreatedInvite>("admin_create_invite", { maxUses, expiresInHours }),
+  adminInvites: () => invoke<Invite[]>("admin_invites"),
+  adminRevokeInvite: (inviteId: string) => invoke<void>("admin_revoke_invite", { inviteId }),
+  adminUsers: () => invoke<AdminUser[]>("admin_users"),
+  adminSetUserDisabled: (userId: string, disabled: boolean) =>
+    invoke<void>("admin_set_user_disabled", { userId, disabled }),
+  adminDisableUserTotp: (userId: string) => invoke<void>("admin_disable_user_totp", { userId }),
+};

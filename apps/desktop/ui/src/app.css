@@ -7,13 +7,17 @@
 
   --bg: #16181d;
   --surface: #1f232b;
+  --surface-2: #272c36;
   --border: #363c48;
   --text: #eceef2;
   --text-muted: #a9b0bd;
   --accent: #5cc8b0;
   --accent-text: #0c1f1b;
   --ok: #6fd08c;
+  --warn: #f2c14e;
+  --warn-bg: #3a3118;
   --error: #ff8f8f;
+  --error-bg: #3a1f1f;
   --focus: #9be3d2;
 
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
@@ -25,13 +29,17 @@
   :root {
     --bg: #f5f6f8;
     --surface: #ffffff;
+    --surface-2: #eef0f4;
     --border: #c9ced8;
     --text: #1b1e24;
     --text-muted: #555d6b;
     --accent: #0f7662;
     --accent-text: #ffffff;
     --ok: #17703a;
+    --warn: #7a5600;
+    --warn-bg: #fff4d6;
     --error: #b3261e;
+    --error-bg: #fde8e6;
     --focus: #0f7662;
   }
 }
@@ -57,6 +65,205 @@ body {
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.5rem;
+  line-height: 1.25;
+}
+
+h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.125rem;
+}
+
+h3 {
+  margin: 0 0 0.375rem;
+  font-size: 1rem;
+}
+
+p {
+  margin: 0 0 0.75rem;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.small {
+  font-size: 0.875rem;
+}
+
+/* Layout */
+.centered {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+}
+
+.card {
+  width: min(100%, 30rem);
+  padding: 2rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+}
+
+.stack > * + * {
+  margin-top: 1rem;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.spread {
+  justify-content: space-between;
+}
+
+/* Forms */
+label {
+  display: block;
+  margin-bottom: 0.375rem;
+  font-weight: 600;
+}
+
+input[type="text"],
+input[type="password"] {
+  width: 100%;
+  padding: 0.625rem 0.75rem;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+input[aria-invalid="true"] {
+  border-color: var(--error);
+}
+
+.field + .field {
+  margin-top: 1rem;
+}
+
+.hint {
+  margin: 0.375rem 0 0;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+button {
+  padding: 0.5rem 0.875rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+button.primary {
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: transparent;
+}
+
+button.danger {
+  color: var(--error);
+}
+
+button.wide {
+  width: 100%;
+  padding: 0.625rem 1rem;
+}
+
+button.link {
+  padding: 0;
+  font-weight: 400;
+  color: var(--accent);
+  background: none;
+  border: none;
+  text-decoration: underline;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Messages */
+.alert {
+  margin: 0;
+  padding: 0.625rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border);
+}
+
+.alert.error {
+  color: var(--error);
+  background: var(--error-bg);
+  border-color: var(--error);
+}
+
+.alert.warn {
+  color: var(--text);
+  background: var(--warn-bg);
+  border-color: var(--warn);
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.0625rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent-text);
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.badge.neutral {
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+code,
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.secret {
+  display: block;
+  padding: 0.75rem;
+  font-size: 1.0625rem;
+  letter-spacing: 0.03em;
+  overflow-wrap: anywhere;
+  user-select: all;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+ul.plain {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+ul.plain > li {
+  padding: 0.625rem 0;
+  border-top: 1px solid var(--border);
+}
+
+ul.plain > li:first-child {
+  border-top: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
