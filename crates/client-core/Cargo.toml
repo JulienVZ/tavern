@@ -18,6 +18,7 @@ data-encoding.workspace = true
 futures-util.workspace = true
 keyring.workspace = true
 prost.workspace = true
+qrcode.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true

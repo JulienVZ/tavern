@@ -82,6 +82,17 @@ describe("errorMessage", () => {
     expect(errorMessage({ code: "something_new" })).toBe("Something went wrong.");
   });
 
+  it("tells the four kinds of instance failure apart", () => {
+    setLocale("en");
+    const messages = ["unreachable", "not_an_instance", "incompatible_server", "server_error"].map(
+      (code) => errorMessage({ code }),
+    );
+    expect(new Set(messages).size).toBe(4);
+    // A route missing on a validated instance must never read as "not Tavern".
+    expect(errorMessage({ code: "incompatible_server" })).not.toMatch(/not a Tavern instance/);
+    expect(errorMessage({ code: "server_error" })).not.toMatch(/not a Tavern instance/);
+  });
+
   it("never claims that a wrong handle differs from a wrong password", () => {
     for (const catalogue of Object.values(catalogues)) {
       const message = catalogue["error.invalid_credentials"].toLowerCase();

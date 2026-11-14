@@ -24,6 +24,9 @@ export interface Account {
 export interface InstanceProbe {
   url: string;
   health: { status: ComponentStatus; database: ComponentStatus };
+  serverVersion: string;
+  /** The instance is older than this client: some features will not work. */
+  serverOutdated: boolean;
   rememberedHandle: string | null;
   account: Account | null;
 }
@@ -54,9 +57,16 @@ export interface Device {
   current: boolean;
 }
 
+/** A QR code as rows of "0" (light) and "1" (dark) modules. */
+export interface QrMatrix {
+  size: number;
+  rows: string[];
+}
+
 export interface TotpEnrolment {
   secret: string;
-  otpauth_url: string;
+  otpauthUrl: string;
+  qr: QrMatrix;
 }
 
 export interface Invite {

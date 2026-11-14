@@ -14,9 +14,20 @@ pub enum ClientError {
     /// The instance could not be reached (DNS, TCP, TLS or timeout).
     #[error("the instance cannot be reached")]
     Unreachable(#[source] reqwest::Error),
-    /// Something answered, but not like a Tavern instance.
-    #[error("the server did not answer like a Tavern instance")]
-    UnexpectedResponse,
+    /// Something answered at this address, but it is not a Tavern instance.
+    /// Only reported while an address is being checked for the first time.
+    #[error("the server at this address is not a Tavern instance")]
+    NotTavern,
+    /// The instance does not know a route or a message this client uses: it
+    /// runs an older (or otherwise incompatible) version of the server.
+    #[error("the instance runs a version that is too old for this client")]
+    IncompatibleServer,
+    /// The instance speaks a newer major version than this client supports.
+    #[error("this client is too old for the instance")]
+    ClientTooOld,
+    /// The instance failed (5xx) or sent an answer that makes no sense.
+    #[error("the instance reported an internal error")]
+    ServerError,
     /// The instance refused the request.
     #[error("the instance refused the request ({code:?})")]
     Api {

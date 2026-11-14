@@ -16,6 +16,7 @@ pub mod error;
 pub mod gateway;
 pub mod instance;
 pub mod password;
+pub mod qr;
 pub mod store;
 
 pub use account::{
@@ -23,5 +24,7 @@ pub use account::{
 };
 pub use error::ClientError;
 pub use gateway::{Gateway, GatewayEvent, NewDevice, SessionEnd};
-pub use instance::{InstanceUrl, InstanceUrlError, fetch_health};
+pub use instance::{
+    Compatibility, InstanceUrl, InstanceUrlError, compatibility, fetch_health, fetch_version,
+};
 pub use store::{KeychainStore, MemoryStore, SecretStore, StoredDevice};

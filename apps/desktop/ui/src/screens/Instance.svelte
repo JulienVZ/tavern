@@ -25,6 +25,7 @@
       }
       session.instanceUrl = probe.url;
       session.rememberedHandle = probe.rememberedHandle;
+      session.serverOutdated = probe.serverOutdated;
       session.endedMessage = null;
       if (probe.account !== null) {
         session.account = probe.account;

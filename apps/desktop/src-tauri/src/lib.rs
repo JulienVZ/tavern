@@ -16,12 +16,14 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tavern_client_core::password::{self, PasswordStrength};
+use tavern_client_core::qr::{self, QrMatrix};
 use tavern_client_core::{
-    Client, Gateway, GatewayEvent, InstanceClient, InstanceUrl, KeychainStore, LoginStep,
-    NewAccount, PendingTotp, SecretStore, SessionEnd, SignedIn, fetch_health,
+    Client, ClientError, Compatibility, Gateway, GatewayEvent, InstanceClient, InstanceUrl,
+    KeychainStore, LoginStep, NewAccount, PendingTotp, SecretStore, SessionEnd, SignedIn,
+    compatibility, fetch_health, fetch_version,
 };
 use tavern_protocol::rest::{
-    AdminUser, CreatedInvite, DeviceInfo, HealthResponse, InviteInfo, Platform, TotpEnrolment,
+    AdminUser, CreatedInvite, DeviceInfo, HealthResponse, InviteInfo, Platform,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -74,6 +76,11 @@ struct InstanceProbe {
     url: String,
     /// What `GET /health` answered.
     health: HealthResponse,
+    /// Version of the server software.
+    server_version: String,
+    /// `true` when the instance is older than this client: some features
+    /// will not work until its administrator updates it.
+    server_outdated: bool,
     /// The handle last used on this computer for this instance.
     remembered_handle: Option<String>,
     /// The account, when a saved session is still valid.
@@ -240,6 +247,13 @@ async fn probe_instance(
 ) -> Result<InstanceProbe> {
     let instance_url = InstanceUrl::parse(&url)?;
     let health = fetch_health(&instance_url).await?;
+    let version = fetch_version(&instance_url).await?;
+    let server_outdated = match compatibility(&version) {
+        Compatibility::Compatible => false,
+        Compatibility::ServerOlder => true,
+        // Nothing would work reliably: refuse now, with a clear reason.
+        Compatibility::ServerNewer => return Err(ClientError::ClientTooOld.into()),
+    };
     let instance =
         InstanceClient::new(instance_url, shell.store.clone(), shell.profile.as_deref())?;
 
@@ -259,6 +273,8 @@ async fn probe_instance(
     Ok(InstanceProbe {
         url,
         health,
+        server_version: version.version,
+        server_outdated,
         remembered_handle,
         account,
     })
@@ -391,10 +407,28 @@ async fn ack_new_devices(shell: State<'_, Shell>) -> Result<()> {
     }
 }
 
+/// What the user needs to add the account to an authenticator app.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TotpEnrolmentView {
+    /// The secret, for manual entry.
+    secret: String,
+    /// The same information as a link.
+    otpauth_url: String,
+    /// The link as a QR code, computed on this device.
+    qr: QrMatrix,
+}
+
 #[tauri::command]
-async fn totp_enable(shell: State<'_, Shell>) -> Result<TotpEnrolment> {
+async fn totp_enable(shell: State<'_, Shell>) -> Result<TotpEnrolmentView> {
     let session = shell.session.lock().await;
-    Ok(client(&session)?.totp_enable().await?)
+    let enrolment = client(&session)?.totp_enable().await?;
+    let qr = qr::encode(&enrolment.otpauth_url)?;
+    Ok(TotpEnrolmentView {
+        secret: enrolment.secret,
+        otpauth_url: enrolment.otpauth_url,
+        qr,
+    })
 }
 
 #[tauri::command]
@@ -442,7 +476,7 @@ async fn change_password(
     // Refuse a weak password before asking the instance for anything.
     let me = client.me().await?;
     if let Err(issue) = password::check(&new_password, &[&me.handle, &me.display_name]) {
-        return Err(tavern_client_core::ClientError::WeakPassword(issue).into());
+        return Err(ClientError::WeakPassword(issue).into());
     }
     let code = totp_code
         .as_deref()

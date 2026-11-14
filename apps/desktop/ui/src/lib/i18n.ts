@@ -26,6 +26,8 @@ const en = {
   "instance.checking": "Checking…",
   "instance.unhealthy": "The instance answered, but reports a problem. Try again later.",
   "instance.change": "Use another instance",
+  "instance.outdated":
+    "This instance runs an older version of Tavern than this app. Some features will not work until its administrator updates it.",
 
   "auth.tab.login": "Sign in",
   "auth.tab.register": "Create an account",
@@ -108,7 +110,8 @@ const en = {
   "security.totp.enable": "Enable",
   "security.totp.disable": "Disable",
   "security.totp.setup":
-    "Add this secret to your authenticator app (manual entry), then enter the code it shows.",
+    "Scan this QR code with your authenticator app, or enter the secret by hand. Then enter the code the app shows.",
+  "security.totp.qr": "QR code to scan with your authenticator app",
   "security.totp.secret": "Secret",
   "security.totp.url": "Setup link",
   "security.totp.confirm": "Confirm",
@@ -178,7 +181,15 @@ const en = {
   "error.insecure_url":
     "The instance must be reached over HTTPS. Plain HTTP only works for localhost.",
   "error.unreachable": "The instance cannot be reached. Check the address and your connection.",
-  "error.not_an_instance": "A server answered, but it is not a Tavern instance.",
+  "error.not_an_instance": "A server answered at this address, but it is not a Tavern instance.",
+  "error.incompatible_server":
+    "This instance is too old for this feature. Ask its administrator to update the server.",
+  "error.client_too_old":
+    "This instance requires a newer version of the app. Update Tavern, then try again.",
+  "error.server_error":
+    "The instance reported an error. Try again in a moment; if it persists, tell its administrator.",
+  "error.unknown_endpoint":
+    "This instance is too old for this feature. Ask its administrator to update the server.",
   "error.invalid_credentials": "Wrong handle or password.",
   "error.invalid_invite": "This invitation code is not valid, or it has expired or been used.",
   "error.handle_taken": "This handle is already taken.",
@@ -244,6 +255,8 @@ const fr: Catalogue = {
   "instance.checking": "Vérification…",
   "instance.unhealthy": "L'instance a répondu, mais signale un problème. Réessayez plus tard.",
   "instance.change": "Utiliser une autre instance",
+  "instance.outdated":
+    "Cette instance utilise une version de Tavern plus ancienne que cette application. Certaines fonctions ne marcheront pas tant que son administrateur ne l'aura pas mise à jour.",
 
   "auth.tab.login": "Connexion",
   "auth.tab.register": "Créer un compte",
@@ -330,7 +343,8 @@ const fr: Catalogue = {
   "security.totp.enable": "Activer",
   "security.totp.disable": "Désactiver",
   "security.totp.setup":
-    "Ajoutez ce secret à votre application d'authentification (saisie manuelle), puis saisissez le code qu'elle affiche.",
+    "Scannez ce QR code avec votre application d'authentification, ou saisissez le secret à la main. Saisissez ensuite le code qu'elle affiche.",
+  "security.totp.qr": "QR code à scanner avec votre application d'authentification",
   "security.totp.secret": "Secret",
   "security.totp.url": "Lien de configuration",
   "security.totp.confirm": "Confirmer",
@@ -403,7 +417,16 @@ const fr: Catalogue = {
   "error.insecure_url":
     "L'instance doit être jointe en HTTPS. Le HTTP en clair ne fonctionne que pour localhost.",
   "error.unreachable": "L'instance est injoignable. Vérifiez l'adresse et votre connexion.",
-  "error.not_an_instance": "Un serveur a répondu, mais ce n'est pas une instance Tavern.",
+  "error.not_an_instance":
+    "Un serveur a répondu à cette adresse, mais ce n'est pas une instance Tavern.",
+  "error.incompatible_server":
+    "Cette instance est trop ancienne pour cette fonction. Demandez à son administrateur de mettre le serveur à jour.",
+  "error.client_too_old":
+    "Cette instance demande une version plus récente de l'application. Mettez Tavern à jour, puis réessayez.",
+  "error.server_error":
+    "L'instance a signalé une erreur. Réessayez dans un instant ; si cela persiste, prévenez son administrateur.",
+  "error.unknown_endpoint":
+    "Cette instance est trop ancienne pour cette fonction. Demandez à son administrateur de mettre le serveur à jour.",
   "error.invalid_credentials": "Identifiant ou mot de passe incorrect.",
   "error.invalid_invite": "Ce code d'invitation n'est pas valide, a expiré ou a déjà été utilisé.",
   "error.handle_taken": "Cet identifiant est déjà pris.",

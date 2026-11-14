@@ -5,7 +5,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use tavern_protocol::rest::HealthResponse;
+use tavern_protocol::rest::{HealthResponse, VersionResponse};
 use url::{Host, Url};
 
 use crate::error::ClientError;
@@ -83,9 +83,7 @@ impl InstanceUrl {
     }
 
     pub(crate) fn endpoint(&self, path: &str) -> Result<Url, ClientError> {
-        self.0
-            .join(path)
-            .map_err(|_| ClientError::UnexpectedResponse)
+        self.0.join(path).map_err(|_| ClientError::ServerError)
     }
 
     /// The gateway WebSocket URL of this instance: `wss` for `https`, and
@@ -94,7 +92,7 @@ impl InstanceUrl {
         let mut url = self.endpoint(tavern_protocol::GATEWAY_PATH.trim_start_matches('/'))?;
         let scheme = if url.scheme() == "http" { "ws" } else { "wss" };
         url.set_scheme(scheme)
-            .map_err(|()| ClientError::UnexpectedResponse)?;
+            .map_err(|()| ClientError::ServerError)?;
         Ok(url)
     }
 }
@@ -110,7 +108,8 @@ fn is_loopback(host: &Host<&str>) -> bool {
 /// Queries `GET /health` on the instance.
 ///
 /// A 503 answer with a well-formed body is returned as `Ok`: the instance
-/// exists and reports that it is unhealthy.
+/// exists and reports that it is unhealthy. Anything that does not look like
+/// Tavern's health answer is [`ClientError::NotTavern`].
 pub async fn fetch_health(instance: &InstanceUrl) -> Result<HealthResponse, ClientError> {
     let response = http_client()?
         .get(instance.endpoint("health")?)
@@ -120,12 +119,61 @@ pub async fn fetch_health(instance: &InstanceUrl) -> Result<HealthResponse, Clie
 
     let status = response.status().as_u16();
     if status != 200 && status != 503 {
-        return Err(ClientError::UnexpectedResponse);
+        return Err(ClientError::NotTavern);
     }
     response
         .json::<HealthResponse>()
         .await
-        .map_err(|_| ClientError::UnexpectedResponse)
+        .map_err(|_| ClientError::NotTavern)
+}
+
+/// Queries `GET /version` on the instance.
+pub async fn fetch_version(instance: &InstanceUrl) -> Result<VersionResponse, ClientError> {
+    let response = http_client()?
+        .get(instance.endpoint("version")?)
+        .send()
+        .await
+        .map_err(ClientError::Unreachable)?;
+    if !response.status().is_success() {
+        return Err(ClientError::NotTavern);
+    }
+    response
+        .json::<VersionResponse>()
+        .await
+        .map_err(|_| ClientError::NotTavern)
+}
+
+/// How the instance's protocol versions compare with this client's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compatibility {
+    /// The instance serves everything this client uses.
+    Compatible,
+    /// The instance is older than this client: some features will fail
+    /// until its administrator updates it.
+    ServerOlder,
+    /// The instance speaks a newer major version: this client must be updated.
+    ServerNewer,
+}
+
+/// Compares the versions announced by `GET /version` with the ones this
+/// client was built for.
+///
+/// Within a major version additions are compatible, so a server with a higher
+/// minor version is fine; a lower one lacks routes this client calls.
+pub fn compatibility(version: &VersionResponse) -> Compatibility {
+    use tavern_protocol::{GATEWAY_MAJOR_VERSION, REST_MAJOR_VERSION, REST_MINOR_VERSION};
+
+    if version.rest.major > REST_MAJOR_VERSION || version.gateway.min_major > GATEWAY_MAJOR_VERSION
+    {
+        Compatibility::ServerNewer
+    } else if version.rest.major < REST_MAJOR_VERSION
+        || version.rest.minor < REST_MINOR_VERSION
+        || version.gateway.max_major < GATEWAY_MAJOR_VERSION
+    {
+        Compatibility::ServerOlder
+    } else {
+        Compatibility::Compatible
+    }
 }
 
 /// Builds the HTTP client used for every request to an instance: rustls,
@@ -299,7 +347,86 @@ mod tests {
 
         let error = fetch_health(&instance).await.unwrap_err();
 
-        assert!(matches!(error, ClientError::UnexpectedResponse));
+        assert!(matches!(error, ClientError::NotTavern));
+    }
+
+    fn version(rest: (u32, u32), gateway: (u32, u32)) -> VersionResponse {
+        use tavern_protocol::rest::{B64, GatewayVersions, RestVersion};
+        VersionResponse {
+            name: "tavern".to_owned(),
+            version: "0.0.1".to_owned(),
+            rest: RestVersion {
+                major: rest.0,
+                minor: rest.1,
+            },
+            gateway: GatewayVersions {
+                min_major: gateway.0,
+                max_major: gateway.1,
+                minor: 0,
+            },
+            mls_external_sender_key: B64(vec![0; 32]),
+            source_url: None,
+        }
+    }
+
+    #[test]
+    fn versions_are_compared_with_what_this_client_needs() {
+        use tavern_protocol::{REST_MAJOR_VERSION as MAJOR, REST_MINOR_VERSION as MINOR};
+
+        assert_eq!(
+            compatibility(&version((MAJOR, MINOR), (1, 1))),
+            Compatibility::Compatible
+        );
+        // Additions within a major version do not break this client.
+        assert_eq!(
+            compatibility(&version((MAJOR, MINOR + 5), (1, 2))),
+            Compatibility::Compatible
+        );
+        // A server before REST 1.1 does not announce a REST version at all.
+        assert_eq!(
+            compatibility(&version((0, 0), (1, 1))),
+            Compatibility::ServerOlder
+        );
+        assert_eq!(
+            compatibility(&version((MAJOR, MINOR - 1), (1, 1))),
+            Compatibility::ServerOlder
+        );
+        assert_eq!(
+            compatibility(&version((MAJOR, MINOR), (0, 0))),
+            Compatibility::ServerOlder
+        );
+        assert_eq!(
+            compatibility(&version((MAJOR + 1, 0), (1, 1))),
+            Compatibility::ServerNewer
+        );
+        assert_eq!(
+            compatibility(&version((MAJOR, MINOR), (2, 3))),
+            Compatibility::ServerNewer
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_server_is_recognised_from_its_version_answer() {
+        // The exact answer of the stale server that caused the M1 confusion.
+        let instance = serve_once(
+            "HTTP/1.1 200 OK",
+            r#"{"name":"tavern","version":"0.0.1","gateway":{"min_major":1,"max_major":1,"minor":0},"mls_external_sender_key":"1k65qNtRtDfVes98E4fa8SL7iixlNwmTYLH7HCzMEgY"}"#,
+        )
+        .await;
+
+        let version = fetch_version(&instance).await.unwrap();
+
+        assert_eq!(compatibility(&version), Compatibility::ServerOlder);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_version_answer_is_not_tavern() {
+        let instance = serve_once("HTTP/1.1 200 OK", r#"{"version":"nginx"}"#).await;
+
+        assert!(matches!(
+            fetch_version(&instance).await.unwrap_err(),
+            ClientError::NotTavern
+        ));
     }
 
     #[tokio::test]

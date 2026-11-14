@@ -20,6 +20,8 @@ export const session = $state({
   screen: "instance" as Screen,
   instanceUrl: "",
   rememberedHandle: null as string | null,
+  /** The instance is older than this client. */
+  serverOutdated: false,
   account: null as Account | null,
   /** Set between registration and the first sign-in. */
   registration: null as PendingRegistration | null,

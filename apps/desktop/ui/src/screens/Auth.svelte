@@ -152,6 +152,9 @@
       <button class="link" type="button" onclick={changeInstance}>{t("instance.change")}</button>
     </p>
 
+    {#if session.serverOutdated}
+      <p class="alert warn" role="status">{t("instance.outdated")}</p>
+    {/if}
     {#if session.endedMessage !== null}
       <p class="alert warn" role="status">{t(session.endedMessage)}</p>
     {/if}

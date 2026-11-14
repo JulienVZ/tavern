@@ -159,7 +159,7 @@ impl PendingTotp {
             .await?;
         match outcome {
             LoginOutcome::Ok(grant) => self.instance.complete_login(grant, &self.export_key).await,
-            LoginOutcome::TotpRequired => Err(ClientError::UnexpectedResponse),
+            LoginOutcome::TotpRequired => Err(ClientError::ServerError),
         }
     }
 }
@@ -395,7 +395,7 @@ impl InstanceClient {
             .session_nonce
             .as_slice()
             .try_into()
-            .map_err(|_| ClientError::UnexpectedResponse)?;
+            .map_err(|_| ClientError::ServerError)?;
         let proof = DeviceKey::from_seed(seed).sign_session_proof(&SessionChallenge {
             nonce: &nonce,
             user_id: grant.user_id.as_bytes(),
@@ -456,7 +456,7 @@ impl InstanceClient {
             )
             .await?;
         if session.device_id != device_id {
-            return Err(ClientError::UnexpectedResponse);
+            return Err(ClientError::ServerError);
         }
         Ok((session, device_key.seed()))
     }
@@ -505,7 +505,7 @@ impl InstanceClient {
             .challenge
             .as_slice()
             .try_into()
-            .map_err(|_| ClientError::UnexpectedResponse)?;
+            .map_err(|_| ClientError::ServerError)?;
 
         let finish_handle = handle.clone();
         let registration_response = start.registration_response;
@@ -699,8 +699,7 @@ impl Client {
         totp_code: Option<&str>,
     ) -> Result<Reauthenticated, ClientError> {
         let me = self.me().await?;
-        let handle =
-            Handle::canonicalize(&me.handle).map_err(|_| ClientError::UnexpectedResponse)?;
+        let handle = Handle::canonicalize(&me.handle).map_err(|_| ClientError::ServerError)?;
         let password = Password::new(password);
 
         let (state, request) = Login::start(&password)?;
@@ -748,7 +747,7 @@ impl Client {
             .challenge
             .as_slice()
             .try_into()
-            .map_err(|_| ClientError::UnexpectedResponse)?;
+            .map_err(|_| ClientError::ServerError)?;
         Ok(Reauthenticated {
             handle,
             display_name: me.display_name,

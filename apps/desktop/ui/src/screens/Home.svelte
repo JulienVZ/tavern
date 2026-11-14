@@ -46,6 +46,9 @@
     </header>
 
     <div class="stack" aria-live="polite">
+      {#if session.serverOutdated}
+        <p class="alert warn" role="status">{t("instance.outdated")}</p>
+      {/if}
       {#if session.offline}
         <p class="alert warn" role="status">{t("home.connection.offline")}</p>
       {/if}

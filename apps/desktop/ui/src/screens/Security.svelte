@@ -2,6 +2,7 @@
 <script lang="ts">
   import { api, type CommandError, type TotpEnrolment } from "../lib/api";
   import { errorMessage, t } from "../lib/i18n";
+  import QrCode from "../lib/QrCode.svelte";
   import { guarded, session } from "../lib/session.svelte";
 
   type Step = "idle" | "setup" | "codes" | "disable";
@@ -94,13 +95,14 @@
   {:else if step === "setup" && enrolment !== null}
     <form class="stack" onsubmit={confirm} novalidate>
       <p>{t("security.totp.setup")}</p>
+      <QrCode matrix={enrolment.qr} label={t("security.totp.qr")} />
       <div>
         <h3 id="totp-secret-label" class="small muted">{t("security.totp.secret")}</h3>
         <code class="secret" aria-labelledby="totp-secret-label">{enrolment.secret}</code>
       </div>
       <details>
         <summary class="small muted">{t("security.totp.url")}</summary>
-        <code class="secret small">{enrolment.otpauth_url}</code>
+        <code class="secret small">{enrolment.otpauthUrl}</code>
       </details>
       <div class="field">
         <label for="totp-confirm-code">{t("totp.code")}</label>

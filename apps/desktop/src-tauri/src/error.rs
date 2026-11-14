@@ -59,7 +59,10 @@ impl From<ClientError> for CommandError {
     fn from(error: ClientError) -> Self {
         match error {
             ClientError::Unreachable(_) => Self::code("unreachable"),
-            ClientError::UnexpectedResponse => Self::code("not_an_instance"),
+            ClientError::NotTavern => Self::code("not_an_instance"),
+            ClientError::IncompatibleServer => Self::code("incompatible_server"),
+            ClientError::ClientTooOld => Self::code("client_too_old"),
+            ClientError::ServerError => Self::code("server_error"),
             ClientError::Api {
                 code,
                 retry_after_ms,
@@ -148,6 +151,27 @@ mod tests {
         assert!(CommandError::from(InstanceUrlError::InsecureScheme).is("insecure_url"));
         assert!(CommandError::from(InstanceUrlError::Malformed).is("invalid_url"));
         assert!(CommandError::from(InstanceUrlError::HasCredentials).is("invalid_url"));
+    }
+
+    #[test]
+    fn the_four_kinds_of_instance_failure_have_distinct_codes() {
+        let codes = [
+            CommandError::from(ClientError::NotTavern),
+            CommandError::from(ClientError::IncompatibleServer),
+            CommandError::from(ClientError::ServerError),
+            CommandError::from(ClientError::ClientTooOld),
+        ];
+        let names: Vec<&str> = codes.iter().map(|error| error.code.as_str()).collect();
+
+        assert_eq!(
+            names,
+            [
+                "not_an_instance",
+                "incompatible_server",
+                "server_error",
+                "client_too_old"
+            ]
+        );
     }
 
     #[test]
