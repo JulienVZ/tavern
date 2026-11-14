@@ -85,3 +85,95 @@ jobs:
       # with the process's resident memory before and after.
       - name: Measure
         run: cargo run --release --locked --package tavern-crypto --example argon2_memory
+
+  # Experiment, outside the project's crates: does the Argon2id working memory
+  # go back to the system on macOS when it is (a) released by asking the
+  # allocator to give up its caches, or (b) taken from a dedicated mapping
+  # that is unmapped after the computation? Results: docs/adr/0003.
+  macos-release-experiment:
+    name: macOS memory release experiment
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Create the experiment
+        run: |
+          mkdir -p experiment/src && cd experiment
+          cat > Cargo.toml <<'TOML'
+          [package]
+          name = "release-experiment"
+          version = "0.0.0"
+          edition = "2021"
+          publish = false
+          [dependencies]
+          argon2 = "0.5"
+          libc = "0.2"
+          TOML
+          cat > src/main.rs <<'RUST'
+          use argon2::{Algorithm, Argon2, Block, Params, Version};
+          use std::process::Command;
+
+          const MEMORY_KIB: u32 = 128 * 1024;
+
+          extern "C" {
+              fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize) -> usize;
+          }
+
+          fn footprint() -> String {
+              let out = Command::new("vmmap")
+                  .args(["--summary", &std::process::id().to_string()])
+                  .output()
+                  .expect("vmmap runs");
+              String::from_utf8_lossy(&out.stdout)
+                  .lines()
+                  .find(|line| line.starts_with("Physical footprint:"))
+                  .and_then(|line| line.split(':').nth(1))
+                  .map(|value| value.trim().to_owned())
+                  .unwrap_or_else(|| "?".to_owned())
+          }
+
+          fn argon() -> Argon2<'static> {
+              let params = Params::new(MEMORY_KIB, 3, 1, Some(64)).expect("valid parameters");
+              Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+          }
+
+          fn main() {
+              let mut out = [0u8; 64];
+              println!("start                               {}", footprint());
+
+              // (a) Ordinary allocation, then ask the allocator to release its caches.
+              argon().hash_password_into(b"password", b"0123456789abcdef", &mut out).expect("hash");
+              println!("(a) after hashing, heap allocation  {}", footprint());
+              let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+              println!("(a) after pressure relief ({released} bytes) {}", footprint());
+
+              // (b) Dedicated anonymous mapping, unmapped right after the computation.
+              let blocks = MEMORY_KIB as usize;
+              let len = blocks * std::mem::size_of::<Block>();
+              let map = unsafe {
+                  libc::mmap(
+                      std::ptr::null_mut(),
+                      len,
+                      libc::PROT_READ | libc::PROT_WRITE,
+                      libc::MAP_PRIVATE | libc::MAP_ANON,
+                      -1,
+                      0,
+                  )
+              };
+              assert_ne!(map, libc::MAP_FAILED, "mmap failed");
+              assert_eq!(map as usize % std::mem::align_of::<Block>(), 0, "mapping is aligned");
+              // Zero-filled pages are a valid `Block` (an array of u64).
+              let memory = unsafe { std::slice::from_raw_parts_mut(map.cast::<Block>(), blocks) };
+              argon()
+                  .hash_password_into_with_memory(b"password", b"0123456789abcdef", &mut out, memory)
+                  .expect("hash");
+              println!("(b) after hashing, dedicated mapping {}", footprint());
+              assert_eq!(unsafe { libc::munmap(map, len) }, 0, "munmap failed");
+              println!("(b) after munmap                     {}", footprint());
+          }
+          RUST
+      - name: Run
+        working-directory: experiment
+        run: |
+          sw_vers
+          cargo run --release --quiet
+
