@@ -60,9 +60,11 @@ impl Server {
             pool,
             secrets,
             Settings {
-                source_url: None,
-                trust_forwarded_for: false,
-                session_ttl: Duration::from_secs(3600),
+                // Scenarios sign in many times with one account. Rate limiting
+                // itself is covered by the server's own tests.
+                auth_per_ip_per_minute: 10_000,
+                auth_per_handle_per_minute: 10_000,
+                ..Settings::new(None, false, Duration::from_secs(3600))
             },
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

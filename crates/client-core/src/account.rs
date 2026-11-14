@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Method;
 use tavern_crypto::identity::{
-    AccountIdentityKey, DeviceKey, IdentityPublicKey, SessionChallenge, WrappingKey,
+    AccountIdentityKey, CredentialUpdate, CredentialUpdatePurpose, DeviceKey, IdentityPublicKey,
+    SessionChallenge, WrappingKey,
 };
 use tavern_crypto::opaque::client::{Login, Registration};
 use tavern_crypto::opaque::{ExportKey, Password};
@@ -21,8 +22,10 @@ use tavern_protocol::handle::Handle;
 use tavern_protocol::rest::{
     AdminUserList, B64, CreateInviteRequest, CreatedInvite, DeviceList, EnrolDeviceRequest,
     ErrorCode, InviteList, LoginFinishRequest, LoginGrant, LoginOutcome, LoginStartRequest,
-    LoginStartResponse, LoginTotpRequest, Me, Platform, RegisterFinishRequest,
-    RegisterFinishResponse, RegisterStartRequest, RegistrationResponse, ReopenSessionRequest,
+    LoginStartResponse, LoginTotpRequest, Me, PasswordFinishRequest, PasswordStartRequest,
+    Platform, ReauthFinishRequest, ReauthGrant, ReauthStartRequest, RecoverFinishRequest,
+    RecoverStartRequest, RecoverStartResponse, RegisterFinishRequest, RegisterFinishResponse,
+    RegisterStartRequest, RegistrationResponse, ReopenSessionRequest, RotateRecoveryKeyRequest,
     SessionResponse, TotpCodeRequest, TotpEnrolment, TotpRecoveryCodes,
 };
 use uuid::Uuid;
@@ -458,6 +461,88 @@ impl InstanceClient {
         Ok((session, device_key.seed()))
     }
 
+    /// Sets a new password with the recovery key, for a user who forgot
+    /// theirs. Every session of the account ends; TOTP stays as it was.
+    ///
+    /// A malformed key, a key that does not belong to the account and an
+    /// unknown handle all give [`ClientError::InvalidRecoveryKey`].
+    pub async fn recover(
+        &self,
+        handle: &str,
+        recovery_key: &str,
+        new_password: &str,
+    ) -> Result<(), ClientError> {
+        let handle = Handle::canonicalize(handle).map_err(|_| ClientError::InvalidRecoveryKey)?;
+        let recovery_key =
+            RecoveryKey::parse(recovery_key).map_err(|_| ClientError::InvalidRecoveryKey)?;
+        password::check(new_password, &[handle.as_str()]).map_err(ClientError::WeakPassword)?;
+        let password = Password::new(new_password);
+
+        let (state, request) = Registration::start(&password)?;
+        let start: RecoverStartResponse = self
+            .api
+            .call(
+                Method::POST,
+                "v1/auth/recover/start",
+                Auth::None,
+                &RecoverStartRequest {
+                    handle: handle.as_str().to_owned(),
+                    registration_request: B64(request),
+                },
+            )
+            .await?;
+
+        // For an unknown handle the instance returns decoys, which no key opens.
+        let expected = IdentityPublicKey::from_bytes(start.identity_key.as_slice())
+            .map_err(|_| ClientError::InvalidRecoveryKey)?;
+        let identity = AccountIdentityKey::unwrap(
+            start.wrapped_recovery_copy.as_slice(),
+            &WrappingKey::from_recovery_key(&recovery_key)?,
+            &expected,
+        )
+        .map_err(|_| ClientError::InvalidRecoveryKey)?;
+        let challenge: [u8; 32] = start
+            .challenge
+            .as_slice()
+            .try_into()
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+
+        let finish_handle = handle.clone();
+        let registration_response = start.registration_response;
+        let output = blocking(move || {
+            state.finish(&password, registration_response.as_slice(), &finish_handle)
+        })
+        .await??;
+        let wrapped = identity.wrap(&WrappingKey::from_export_key(&output.export_key)?)?;
+        let signature = identity.sign_credential_update(&CredentialUpdate {
+            purpose: CredentialUpdatePurpose::Recovery,
+            challenge: &challenge,
+            handle: &handle,
+            opaque_upload: &output.upload,
+            wrapped_password_copy: &wrapped,
+            wrapped_recovery_copy: &[],
+        });
+        drop(identity);
+
+        self.api
+            .call_empty(
+                Method::POST,
+                "v1/auth/recover/finish",
+                Auth::None,
+                &RecoverFinishRequest {
+                    recovery_id: start.recovery_id,
+                    registration_upload: B64(output.upload),
+                    wrapped_password_copy: B64(wrapped),
+                    signature: B64::from(signature),
+                },
+            )
+            .await
+            .map_err(|error| match error.api_code() {
+                Some(ErrorCode::InvalidProof) => ClientError::InvalidRecoveryKey,
+                _ => error,
+            })
+    }
+
     /// Resumes the session saved on this device, if it is still valid.
     pub async fn resume(&self) -> Result<Option<Client>, ClientError> {
         let Some(mut device) = self.store.load(&self.store_key)? else {
@@ -483,6 +568,22 @@ impl InstanceClient {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Proof of a fresh password check, holding the account identity key in
+/// memory for the one credential change it authorises. Erased when dropped.
+pub struct Reauthenticated {
+    handle: Handle,
+    display_name: String,
+    identity: AccountIdentityKey,
+    challenge: [u8; 32],
+    token: B64,
+}
+
+impl std::fmt::Debug for Reauthenticated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reauthenticated(<redacted>)")
     }
 }
 
@@ -585,6 +686,173 @@ impl Client {
             self.api().instance().gateway_url()?,
             self.session_token.clone(),
         )
+    }
+
+    // --- Credential changes ---
+
+    /// Proves knowledge of the current password again (and of the second
+    /// factor when TOTP is enabled). The result authorises exactly one
+    /// credential change and expires after five minutes.
+    pub async fn reauthenticate(
+        &self,
+        password: &str,
+        totp_code: Option<&str>,
+    ) -> Result<Reauthenticated, ClientError> {
+        let me = self.me().await?;
+        let handle =
+            Handle::canonicalize(&me.handle).map_err(|_| ClientError::UnexpectedResponse)?;
+        let password = Password::new(password);
+
+        let (state, request) = Login::start(&password)?;
+        let start: LoginStartResponse = self
+            .api()
+            .call(
+                Method::POST,
+                "v1/auth/reauth/start",
+                self.auth(),
+                &ReauthStartRequest {
+                    credential_request: B64(request),
+                },
+            )
+            .await?;
+        let finish_handle = handle.clone();
+        let credential_response = start.credential_response;
+        let output = blocking(move || {
+            state.finish(&password, credential_response.as_slice(), &finish_handle)
+        })
+        .await??;
+
+        let grant: ReauthGrant = self
+            .api()
+            .call(
+                Method::POST,
+                "v1/auth/reauth/finish",
+                self.auth(),
+                &ReauthFinishRequest {
+                    login_id: start.login_id,
+                    credential_finalization: B64(output.finalization),
+                    totp_code: totp_code.map(str::to_owned),
+                },
+            )
+            .await?;
+
+        let expected = IdentityPublicKey::from_bytes(me.identity_key.as_slice())
+            .map_err(|_| ClientError::UntrustedKeyMaterial)?;
+        let identity = AccountIdentityKey::unwrap(
+            grant.wrapped_password_copy.as_slice(),
+            &WrappingKey::from_export_key(&output.export_key)?,
+            &expected,
+        )
+        .map_err(|_| ClientError::UntrustedKeyMaterial)?;
+        let challenge = grant
+            .challenge
+            .as_slice()
+            .try_into()
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        Ok(Reauthenticated {
+            handle,
+            display_name: me.display_name,
+            identity,
+            challenge,
+            token: grant.reauth_token,
+        })
+    }
+
+    /// Changes the password. Every other device of the account is signed out
+    /// and must sign in again with the new password; this device stays in.
+    pub async fn change_password(
+        &self,
+        reauth: Reauthenticated,
+        new_password: &str,
+    ) -> Result<(), ClientError> {
+        password::check(
+            new_password,
+            &[reauth.handle.as_str(), &reauth.display_name],
+        )
+        .map_err(ClientError::WeakPassword)?;
+        let password = Password::new(new_password);
+
+        let (state, request) = Registration::start(&password)?;
+        let response: RegistrationResponse = self
+            .api()
+            .call(
+                Method::POST,
+                "v1/account/password/start",
+                self.auth(),
+                &PasswordStartRequest {
+                    reauth_token: reauth.token.clone(),
+                    registration_request: B64(request),
+                },
+            )
+            .await?;
+        let finish_handle = reauth.handle.clone();
+        let output = blocking(move || {
+            state.finish(
+                &password,
+                response.registration_response.as_slice(),
+                &finish_handle,
+            )
+        })
+        .await??;
+
+        // The identity key is wrapped again under the new export key.
+        let wrapped = reauth
+            .identity
+            .wrap(&WrappingKey::from_export_key(&output.export_key)?)?;
+        let signature = reauth.identity.sign_credential_update(&CredentialUpdate {
+            purpose: CredentialUpdatePurpose::PasswordChange,
+            challenge: &reauth.challenge,
+            handle: &reauth.handle,
+            opaque_upload: &output.upload,
+            wrapped_password_copy: &wrapped,
+            wrapped_recovery_copy: &[],
+        });
+        self.api()
+            .call_empty(
+                Method::POST,
+                "v1/account/password/finish",
+                self.auth(),
+                &PasswordFinishRequest {
+                    reauth_token: reauth.token,
+                    registration_upload: B64(output.upload),
+                    wrapped_password_copy: B64(wrapped),
+                    signature: B64::from(signature),
+                },
+            )
+            .await
+    }
+
+    /// Replaces the recovery key. The previous one stops working at once.
+    /// The new key must be shown to the user now: it is stored nowhere.
+    pub async fn rotate_recovery_key(
+        &self,
+        reauth: Reauthenticated,
+    ) -> Result<RecoveryKey, ClientError> {
+        let recovery_key = RecoveryKey::generate();
+        let wrapped = reauth
+            .identity
+            .wrap(&WrappingKey::from_recovery_key(&recovery_key)?)?;
+        let signature = reauth.identity.sign_credential_update(&CredentialUpdate {
+            purpose: CredentialUpdatePurpose::RecoveryKeyRotation,
+            challenge: &reauth.challenge,
+            handle: &reauth.handle,
+            opaque_upload: &[],
+            wrapped_password_copy: &[],
+            wrapped_recovery_copy: &wrapped,
+        });
+        self.api()
+            .call_empty(
+                Method::POST,
+                "v1/account/recovery-key",
+                self.auth(),
+                &RotateRecoveryKeyRequest {
+                    reauth_token: reauth.token,
+                    wrapped_recovery_copy: B64(wrapped),
+                    signature: B64::from(signature),
+                },
+            )
+            .await?;
+        Ok(recovery_key)
     }
 
     // --- TOTP ---
