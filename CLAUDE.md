@@ -358,7 +358,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 7. **Historique sur un nouvel appareil** : ADR 0009 (proposé), transfert d'appareil à appareil au M5b ; sauvegarde chiffrée sous la clé de récupération à évaluer ensuite.
 8. **Identifiant de l'application** : `io.github.julienvz.tavern`, définitif depuis le 2026-11-14 (il nomme les entrées de trousseau et, à partir de M2, le dossier de données local). Ne plus le modifier.
 9. **SQLCipher et OpenSSL** : SQLCipher embarqué exige OpenSSL sous Windows et Linux, ce que `deny.toml` interdit aujourd'hui. ADR à écrire au début de M2.
-10. **Mémoire Argon2id sur macOS** : après une connexion, l'allocateur de macOS peut conserver les 128 Mio (libérés en 2 s sur un Mac, toujours retenus après 10 s sur un runner). Linux les rend immédiatement ; Windows reste à mesurer. Options : accepter, exécuter l'étirement de clé dans un processus auxiliaire éphémère, ou baisser le paramètre mémoire (ADR 0003).
+10. **Mémoire Argon2id sur macOS** : mesurée en empreinte physique (`vmmap --summary`). Linux rend les 128 Mio immédiatement ; macOS 27 en moins de 10 s ; macOS 26 les retient encore après 30 s. `malloc_zone_pressure_relief` ne rend rien ; une zone dédiée (`mmap`) démappée après le calcul rend tout immédiatement, mais demande un bloc `unsafe`, interdit dans `crypto`. À trancher : petite crate dédiée revue à part, acceptation documentée, processus auxiliaire (dernier recours, avec ADR) ou paramètre mémoire réduit. Windows reste à mesurer (ADR 0003).
 
 ---
 
