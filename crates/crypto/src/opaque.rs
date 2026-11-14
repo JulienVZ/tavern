@@ -610,6 +610,72 @@ mod tests {
         assert_eq!(server, Some(Ok(())));
     }
 
+    /// Frozen: the bytes a typed password becomes. They can never change,
+    /// or existing accounts could no longer log in. Unicode guarantees that
+    /// the normalisation of assigned characters is stable across versions;
+    /// this test catches anything else (a different form, trimming, a
+    /// library that deviates).
+    #[test]
+    fn password_normalisation_is_frozen() {
+        let vectors: &[(&str, &str, &[u8])] = &[
+            (
+                "ascii is untouched",
+                "correct horse battery staple",
+                &[
+                    99, 111, 114, 114, 101, 99, 116, 32, 104, 111, 114, 115, 101, 32, 98, 97, 116,
+                    116, 101, 114, 121, 32, 115, 116, 97, 112, 108, 101,
+                ],
+            ),
+            ("precomposed e acute", "caf\u{e9}", &[99, 97, 102, 195, 169]),
+            (
+                "decomposed e acute",
+                "cafe\u{301}",
+                &[99, 97, 102, 195, 169],
+            ),
+            ("fi ligature", "\u{fb01}sh", &[102, 105, 115, 104]),
+            (
+                "full-width letters",
+                "\u{ff21}\u{ff42}\u{ff43}",
+                &[65, 98, 99],
+            ),
+            ("angstrom sign", "\u{212b}", &[195, 133]),
+            ("circled digit", "\u{2460}", &[49]),
+            ("no-break space", "a\u{a0}b", &[97, 32, 98]),
+            (
+                "half-width katakana with voiced mark",
+                "\u{ff76}\u{ff9e}",
+                &[227, 130, 172],
+            ),
+            ("dz digraph", "\u{1c6}", &[100, 197, 190]),
+            (
+                "sharp s is kept",
+                "stra\u{df}e",
+                &[115, 116, 114, 97, 195, 159, 101],
+            ),
+            ("dotted capital i is kept", "\u{130}", &[196, 176]),
+            ("superscript two", "x\u{b2}", &[120, 50]),
+            (
+                "emoji is kept",
+                "\u{1f37a} beer",
+                &[240, 159, 141, 186, 32, 98, 101, 101, 114],
+            ),
+            (
+                "case and spaces are kept",
+                "  MiXed  ",
+                &[32, 32, 77, 105, 88, 101, 100, 32, 32],
+            ),
+        ];
+
+        for (name, typed, expected) in vectors {
+            assert_eq!(Password::new(typed).as_bytes(), *expected, "{name}");
+        }
+        // Two spellings of the same text give the same bytes.
+        assert_eq!(
+            Password::new("caf\u{e9}").as_bytes(),
+            Password::new("cafe\u{301}").as_bytes()
+        );
+    }
+
     #[test]
     fn passwords_are_not_trimmed_or_case_folded() {
         let setup = ServerSetup::generate();

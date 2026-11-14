@@ -29,32 +29,28 @@ fn resident_mib() -> Option<u64> {
     Some(kib / 1024)
 }
 
-/// Physical footprint in MiB as reported by macOS `top`: the figure Activity
-/// Monitor shows. Unlike resident size, it excludes pages the allocator has
-/// already handed back to the system as reusable.
+/// Physical footprint as reported by `vmmap --summary` (macOS only): the
+/// figure the system charges to the process, and what Activity Monitor shows
+/// as "Memory". Unlike resident size, it excludes pages the allocator has
+/// handed back to the system as reusable, so it is the number that tells
+/// whether the Argon2id working memory was really returned.
 fn footprint() -> Option<String> {
-    let output = Command::new("top")
-        .args([
-            "-l",
-            "1",
-            "-pid",
-            &std::process::id().to_string(),
-            "-stats",
-            "mem",
-        ])
+    let output = Command::new("vmmap")
+        .args(["--summary", &std::process::id().to_string()])
         .output()
         .ok()?;
-    let text = String::from_utf8(output.stdout).ok()?;
-    text.lines()
-        .last()
-        .map(|line| line.trim().to_owned())
-        .filter(|line| !line.is_empty())
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find(|line| line.starts_with("Physical footprint:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|value| value.trim().to_owned())
 }
 
 fn show(label: &str) {
     let resident = resident_mib().map_or_else(|| "?".to_owned(), |mib| format!("{mib} MiB"));
     let footprint = footprint().unwrap_or_else(|| "n/a".to_owned());
-    println!("{label:<26} resident {resident:>8}   footprint {footprint:>6}");
+    println!("{label:<26} resident {resident:>8}   physical footprint {footprint:>8}");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         show(&format!("after run {round} ({} ms)", elapsed.as_millis()));
     }
     // Allocators may hand large blocks back to the system with a short delay.
-    for seconds in [2u64, 10] {
+    for seconds in [2u64, 10, 30] {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
         show(&format!("{seconds} s later"));
     }
