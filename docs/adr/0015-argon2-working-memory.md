@@ -14,9 +14,9 @@ With the working memory taken from the general-purpose allocator (`Argon2::hash_
 | Linux, GitHub runner (ubuntu-24.04, glibc) | 2 MiB | 2 MiB | 2 MiB | 2 MiB | — |
 | macOS 27, development machine (Apple M4) | 1.2 MiB | 129.3 MiB | 129.4 MiB | 1.4 MiB | 1.4 MiB |
 | macOS 26.7, GitHub runner (`macos-latest`, arm64) | 1.0 MiB | 129.0 MiB | 129.1 MiB | 129.1 MiB | **129.1 MiB** |
-| Windows, GitHub runner (`windows-latest`) | pending | | | | |
+| Windows, GitHub runner (`windows-latest`, Windows Server) | 0.9 MiB | 0.9 MiB | 0.9 MiB | 0.9 MiB | 0.8 MiB |
 
-Linux returns the block at once. macOS 27 returns it within ten seconds. macOS 26 still holds it after thirty: a client sits about 128 MiB above its idle footprint after a login, for an unknown time. Three runs in a row never used more than one block, so this is the allocator's cache of large blocks, not a leak.
+Linux and Windows return the block at once. macOS 27 returns it within ten seconds. macOS 26 still holds it after thirty: a client sits about 128 MiB above its idle footprint after a login, for an unknown time. Three runs in a row never used more than one block, so this is the allocator's cache of large blocks, not a leak.
 
 An experiment outside the project's crates, on the macOS 26.7.2 runner, compared two ways of giving the memory back:
 
@@ -38,7 +38,7 @@ A separate crate, **`tavern-argon2-memory`** (`crates/argon2-memory`), provides 
 
 - **Scope.** The crate contains the mapping and nothing else: no cryptography, no parameters, no policy. It depends on `argon2` only for the `Block` type, so that the conversion from mapped bytes to blocks happens inside it; on `zeroize`; and on `libc` (Unix).
 - **Unix (Linux, macOS).** `mmap` of a private anonymous region, `munmap` at drop. The `unsafe` code is three calls (`mmap`, the view of the region as a slice of blocks, `munmap`) plus one `munmap` on a path that cannot be reached in practice (a mapping that would not be aligned for a block). Each carries a `// SAFETY:` comment; the layout assumptions (a block is 1024 bytes without padding, aligned to at most a page) are compile-time assertions.
-- **Other systems (Windows).** The blocks come from the global allocator, with no `unsafe` code, and are erased before being freed. Whether Windows needs a native mapping too is decided by the measurement above.
+- **Other systems (Windows).** The blocks come from the global allocator, with no `unsafe` code, and are erased before being freed. Windows was measured with exactly this path and returns the memory at once (table above), so it gets no native mapping: that would add `unsafe` code for no measured benefit.
 - **Erasure.** The blocks are erased with `zeroize` (through `argon2`'s `zeroize` feature) before the memory is released, in the destructor: on normal return, on early return after an error and when a panic unwinds. Release builds of the client use `panic = "abort"`: a panic there ends the process without running destructors, and the system reclaims the pages, which it never hands to another process uncleared. Before this change the working memory was freed without being erased.
 - **Not locked.** The memory is not `mlock`ed: like the rest of the process it can be written to swap during the computation. Locking 128 MiB commonly exceeds `RLIMIT_MEMLOCK`, and the password and derived keys live in ordinary memory anyway.
 - **Allocation failure** is an error of the OPAQUE operation, not an abort.
@@ -54,7 +54,11 @@ Result with the dedicated mapping, same measurement as above:
 | Platform | Before | Right after each run |
 |---|---|---|
 | macOS 27, development machine (Apple M4) | 1.2 MiB | 1.3 – 1.4 MiB |
-| Linux, macOS 26.7 and Windows runners | pending | |
+| macOS 26.7, GitHub runner (`macos-latest`) | 0.9 MiB | 0.9 – 1.0 MiB (1.0 MiB after 30 s) |
+| Linux, GitHub runner (ubuntu-24.04) | 2.1 MiB | 2.2 MiB |
+| Windows, GitHub runner (allocator path) | 0.9 MiB | 0.9 – 1.0 MiB |
+
+The Windows figures come from a server edition of Windows on a hosted runner; no desktop edition was measured. The CI test would catch a regression on the runner only.
 
 ## Alternatives considered
 
