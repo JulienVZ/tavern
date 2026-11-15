@@ -179,7 +179,7 @@ if [ "$need_instance_secrets" = true ]; then
     # When the image is built from this repository, rebuild it first: an image
     # left over from an older version does not know `gen-secrets`. An image
     # named in TAVERN_SERVER_IMAGE is used as it is.
-    if [ -z "$(get_value TAVERN_SERVER_IMAGE)" ] && ! docker compose build --quiet server; then
+    if [ -z "$(get_value TAVERN_SERVER_IMAGE)" ] && ! ./scripts/build.sh --quiet; then
         echo >&2
         echo "NOT READY. The server image could not be built. Check that Docker is running." >&2
         exit 1
