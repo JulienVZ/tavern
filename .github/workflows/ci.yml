@@ -187,6 +187,7 @@ jobs:
           # below run this image instead of building it again.
           load: true
           tags: tavern-server:local
+          build-args: TAVERN_BUILD_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Prepare a local deployment (init.sh --dev)
@@ -231,6 +232,8 @@ jobs:
           curl --silent --insecure --fail https://localhost/version | jq -e '.mls_external_sender_key | length > 0'
           # The development override publishes the server on the loopback interface.
           curl --silent --fail http://localhost:8080/version | jq -e '.rest.minor >= 1'
+          # The running server says which commit it was built from.
+          curl --silent --fail http://localhost:8080/version | jq -e --arg sha "$GITHUB_SHA" '.commit == $sha'
       - name: Create the administrator invitation, back up and restore
         working-directory: deploy
         run: |

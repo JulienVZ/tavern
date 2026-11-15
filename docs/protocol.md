@@ -123,7 +123,7 @@ The authoritative description is the OpenAPI document served at `GET /v1/openapi
 | Method and path | Purpose | Auth |
 |---|---|---|
 | `GET /health` | Liveness and database check | none |
-| `GET /version` | Server version, protocol versions, MLS external sender public key, source link | none |
+| `GET /version` | Server version, protocol versions, MLS external sender public key, source link, build commit (`commit`, when the build recorded it; `-dirty` suffix for uncommitted changes) | none |
 | `GET /v1/openapi.json` | OpenAPI description | none |
 | `POST /v1/auth/register/start` | Invite code, handle, OPAQUE `RegistrationRequest` → `RegistrationResponse`, suite | none |
 | `POST /v1/auth/register/finish` | Invite code, handle, display name, OPAQUE `RegistrationUpload`, AIK public key, two wrapped AIK copies → user id | none |

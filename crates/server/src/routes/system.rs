@@ -57,5 +57,32 @@ pub(crate) async fn version(State(state): State<AppState>) -> Json<VersionRespon
         },
         mls_external_sender_key: B64::from(state.secrets.external_sender.public_bytes()),
         source_url: state.settings.source_url.clone(),
+        commit: build_commit(option_env!("TAVERN_BUILD_COMMIT")),
     })
+}
+
+/// The commit recorded at build time. Unset or blank (a build argument left
+/// empty) means that the build did not record one.
+fn build_commit(recorded: Option<&str>) -> Option<String> {
+    recorded
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_commit;
+
+    #[test]
+    fn an_unset_or_blank_build_commit_is_not_reported() {
+        assert_eq!(build_commit(None), None);
+        assert_eq!(build_commit(Some("")), None);
+        assert_eq!(build_commit(Some("  ")), None);
+        assert_eq!(build_commit(Some("abc123\n")), Some("abc123".to_owned()));
+        assert_eq!(
+            build_commit(Some("abc123-dirty")),
+            Some("abc123-dirty".to_owned())
+        );
+    }
 }

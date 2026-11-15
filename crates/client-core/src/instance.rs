@@ -366,6 +366,7 @@ mod tests {
             },
             mls_external_sender_key: B64(vec![0; 32]),
             source_url: None,
+            commit: None,
         }
     }
 

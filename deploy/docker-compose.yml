@@ -32,6 +32,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        # Set by scripts/build.sh; shown by GET /version.
+        TAVERN_BUILD_COMMIT: ${TAVERN_BUILD_COMMIT:-}
     restart: unless-stopped
     depends_on:
       postgres:

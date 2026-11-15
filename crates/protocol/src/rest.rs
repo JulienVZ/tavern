@@ -50,6 +50,10 @@ pub struct VersionResponse {
     /// Where the source code of this instance can be obtained (AGPL network clause).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    /// Git commit this server was built from, when the build recorded it
+    /// (`TAVERN_BUILD_COMMIT`). A `-dirty` suffix means uncommitted changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// REST API version served by an instance.
@@ -708,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn version_response_omits_missing_source_url() {
+    fn version_response_omits_what_the_instance_does_not_report() {
         let body = VersionResponse {
             name: "tavern".to_owned(),
             version: "0.0.1".to_owned(),
@@ -720,11 +724,13 @@ mod tests {
             },
             mls_external_sender_key: B64(vec![1, 2, 3]),
             source_url: None,
+            commit: None,
         };
 
         let json = serde_json::to_string(&body).unwrap();
 
         assert!(!json.contains("source_url"));
+        assert!(!json.contains("commit"));
         assert_eq!(
             serde_json::from_str::<VersionResponse>(&json).unwrap(),
             body

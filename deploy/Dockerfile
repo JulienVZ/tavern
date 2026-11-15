@@ -12,6 +12,10 @@ ARG RUST_VERSION=1.100
 FROM rust:${RUST_VERSION}-slim-trixie AS build
 WORKDIR /src
 COPY . .
+# Shown by GET /version, to tell which commit a running server was built
+# from. scripts/build.sh and the CI set it; the repository itself is not in
+# the build context.
+ARG TAVERN_BUILD_COMMIT=
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release --locked --package tavern-server \
