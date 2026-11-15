@@ -1,13 +1,42 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 name: CI
 
+# While the repository is private, Actions minutes are limited, and Windows
+# and macOS runners cost two and ten times a Linux one:
+#
+# - every push and pull request: all the checks, desktop build on Linux only;
+# - once a day, and on demand: desktop build on Linux, Windows and macOS. The
+#   daily run is skipped when `main` has not changed since the last one;
+# - a change that touches documentation only runs nothing.
+#
+# Run the three systems on demand before calling a group of tasks or a
+# milestone done:  gh workflow run ci.yml --ref main
+#
+# When the repository becomes public, build the three systems on every pull
+# request again (see CONTRIBUTING.md).
 on:
   pull_request:
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!**/*.md"
+      # Read by the schema test.
+      - "docs/database-schema.md"
   push:
     branches: [main]
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!**/*.md"
+      # Read by the schema test.
+      - "docs/database-schema.md"
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Per event: a push must not cancel the daily or an on-demand run.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -23,8 +52,37 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  # Daily run only: has `main` changed since the three systems were last built?
+  gate:
+    name: Changes since the last three-system build
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          built() {
+            gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --event "$1" --status "$2" --limit 20 --json headSha --jq '.[].headSha'
+          }
+          # A daily run that already looked at this commit, whatever its
+          # result, or an on-demand run that passed on it.
+          if { built schedule completed; built workflow_dispatch success; } | grep --quiet --line-regexp "$GITHUB_SHA"; then
+            echo "The three systems were already built from $GITHUB_SHA: nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   rust:
     name: Rust (fmt, clippy, tests)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -80,6 +138,7 @@ jobs:
 
   deny:
     name: cargo deny
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -90,6 +149,7 @@ jobs:
 
   ui:
     name: UI (check, tests)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -111,14 +171,15 @@ jobs:
 
   desktop:
     name: Desktop build (${{ matrix.os }})
+    needs: gate
+    # `gate` is skipped outside the daily run; `always()` lets this job run then.
+    if: always() && (github.event_name != 'schedule' || needs.gate.outputs.changed == 'true')
     strategy:
       fail-fast: false
       matrix:
-        # While the repository is private, pull requests build on Linux only
-        # and the three systems are built on pushes to main, to save Actions
-        # minutes. When the repository becomes public, build all three on pull
-        # requests too (see CONTRIBUTING.md).
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04", "windows-latest", "macos-latest"]') }}
+        # Linux on pushes and pull requests; the three systems daily and on
+        # demand (see the top of this file).
+        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '["ubuntu-24.04"]' || '["ubuntu-24.04", "windows-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -159,6 +220,7 @@ jobs:
   # Linux and macOS implementations of `mmap` (docs/adr/0015).
   miri:
     name: Miri (argon2-memory)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -174,6 +236,7 @@ jobs:
 
   docker:
     name: Server image and deployment
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

@@ -175,6 +175,7 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Clé de récupération générée à la création du compte (affichée une seule fois) pour restaurer l'identité sur un nouvel appareil.
 - Robustesse du mot de passe imposée **côté client** à l'inscription et au changement (12 caractères minimum, estimation type zxcvbn ≥ 3/4) : il protège aussi la clé d'identité du compte.
 - Chaque enrôlement d'appareil est notifié à tous les appareils existants du compte (avec action de révocation) et affiché à ses contacts dans les conversations partagées.
+- **Notices de sécurité** (ADR 0016) : TOTP désactivé par un admin, mot de passe changé, compte récupéré par clé, appareil révoqué, clé de récupération régénérée. Enregistrées côté serveur (type énuméré et date, aucun texte libre), rejouées à chaque connexion et acquittées appareil par appareil : un appareil hors ligne ou déconnecté est prévenu lui aussi. Tout nouvel événement sensible d'un compte passe par ce mécanisme, jamais par un simple événement gateway.
 - Un nouvel appareil n'a pas d'historique en v1 : l'UI l'explique à l'enrôlement et en tête de chaque conversation (ADR 0006, ADR 0009).
 - Quand le serveur répond `REMOVAL_PENDING` ou `STALE_EPOCH`, le client committe/applique ce qui est en attente puis renvoie le message automatiquement, sans erreur visible.
 - Rate limiting sur toutes les routes d'auth (30/min par adresse, 5/min par handle). Derrière Caddy, l'adresse est la **dernière** entrée de `X-Forwarded-For` ; le serveur ne publie aucun port (vérifié en CI).
@@ -234,7 +235,8 @@ L'expérience d'un admin d'instance est une fonctionnalité à part entière.
 - Les secrets sont générés par un script (`deploy/scripts/init.sh`, qui appelle `tavern-server gen-secrets`) si absents, chacun avec un usage unique : clés LiveKit, setup serveur OPAQUE, clé de signature MLS external sender (dédiée), clé de chiffrement des secrets TOTP, clé de confidentialité des handles (réponses factices).
 - Migrations de base appliquées automatiquement au démarrage du serveur (avec option pour les désactiver).
 - `deploy/scripts/create-admin.sh` pour créer le premier compte admin / le premier code d'invitation.
-- Endpoint `/health` et `/version`.
+- Endpoint `/health` et `/version` (ce dernier indique le commit du build).
+- Logs de requêtes au niveau info : méthode, gabarit de route, code, durée. Jamais d'adresse IP, de handle, de jeton, d'URL brute ni de corps.
 - Scripts de sauvegarde/restauration (dump Postgres + dossier des blobs + secrets d'instance, dont le setup OPAQUE et la clé external sender).
 - Ports LiveKit par défaut : signalisation derrière Caddy (443), un seul port UDP en mux pour le média, 7881/TCP en repli. **TURN désactivé par défaut en v1** ; TURN/TLS sur 5349 avec le volume de certificats de Caddy partagé est une option documentée dans `docs/self-hosting.md`. `network_mode: host` avec plage UDP documenté comme option avancée sous Linux.
 - Le client demande l'URL de l'instance au premier lancement (comme Element ou Mattermost). Architecture prête pour plusieurs instances dans un même client (pas obligatoire en v1).
@@ -262,12 +264,15 @@ L'expérience d'un admin d'instance est une fonctionnalité à part entière.
 - `pnpm` comme gestionnaire de paquets.
 - Composants accessibles (navigation clavier, contrastes, lecteurs d'écran).
 - Thème sombre et clair ; i18n prête dès le début (anglais + français).
+- **Toute API du navigateur utilisée dans l'UI doit être vérifiée comme disponible dans les trois webviews** (WKWebView sur macOS, WebView2 sur Windows, WebKitGTK sur Linux) avant d'être employée. `window.alert`, `confirm` et `prompt` sont interdits (WKWebView et WebKitGTK ne les affichent pas : `confirm` renvoie `false` sans rien montrer) ; utiliser `lib/ConfirmDialog.svelte`. Un test fait échouer la CI s'ils réapparaissent.
+- Aucune action ne doit échouer en silence : chaque bouton aboutit à une confirmation ou à une erreur lisible, y compris quand le rechargement qui suit échoue.
 
 ### Tests
 - Unitaires dans chaque crate.
 - Intégration serveur avec une vraie base PostgreSQL (testcontainers ou service Docker en CI).
 - Test « deux clients » headless dans `client-core` : création de comptes, ajout d'ami, échange de messages chiffrés, vérification que le serveur ne stocke que du chiffré.
 - Tests de propriété (`proptest`) sur la sérialisation et la crypto.
+- Tests de composant de l'UI (`@testing-library/svelte` + `jsdom`) pour chaque écran qui déclenche une action : la commande Tauri attendue est appelée, le succès et l'échec sont affichés.
 - Une fonctionnalité n'est pas terminée sans tests.
 
 ### Git
@@ -300,7 +305,8 @@ curl https://<TAVERN_DOMAIN>/health
 
 # Pile de développement : serveur sur http://localhost:8080, Postgres sur localhost:5432
 # (init.sh --dev écrit COMPOSE_FILE dans .env : toutes les commandes compose incluent alors la surcharge de dév)
-cd deploy && ./scripts/init.sh --dev && docker compose up -d --build
+cd deploy && ./scripts/init.sh --dev && ./scripts/build.sh && docker compose up -d
+curl http://localhost:8080/version    # "commit" doit être le commit courant
 
 # Tests d'intégration et de bout en bout (nécessitent PostgreSQL ; mot de passe dans deploy/.env)
 TAVERN_TEST_DATABASE_URL=postgres://tavern:<mot de passe>@localhost:5432/tavern \
@@ -317,7 +323,10 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 ```
 
 ### CI (GitHub Actions)
-- Sur chaque PR : fmt, clippy, tests, `cargo deny`, `pnpm check`, build Tauri sur Windows, macOS et Linux.
+- Sur chaque push et chaque PR : fmt, clippy, tests, `cargo deny`, `pnpm check`, Miri, image Docker, build Tauri **sur Linux uniquement**.
+- Build Tauri sur Windows, macOS et Linux : **une fois par jour** (seulement si `main` a changé depuis le dernier build des trois OS) et **à la demande** (`gh workflow run ci.yml --ref main`). Décision du 2026-11-15, pour économiser les minutes Actions tant que le dépôt est privé.
+- Un changement qui ne touche que la documentation (`docs/**`, `*.md`, sauf `docs/database-schema.md` lu par un test) ne lance pas la CI.
+- **Quand le dépôt deviendra public : revenir au build des trois OS sur chaque PR.**
 - Sur tag `v*` : builds signés des installeurs (MSI/NSIS, DMG, AppImage + .deb), images Docker sur GHCR, release GitHub avec changelog.
 - Mises à jour automatiques du client via le updater Tauri (signature obligatoire).
 
@@ -344,7 +353,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 | **M5b** | Historique sur un nouvel appareil de l'utilisateur (ADR 0009) : transfert d'appareil à appareil | Un second appareil récupère l'historique du premier sans que le serveur détienne de clé |
 | **M6** | Vocal : LiveKit, E2EE via exporter MLS, channels vocaux, appels DM | Appel à 5 personnes, E2EE actif, rotation à l'arrivée/départ |
 | **M7** | Webcam + partage d'écran 1080p60 sur les 3 OS | 1080p60 stable à 8 Mb/s, avec encodage matériel quand il est disponible |
-| **M8** | Finitions : notifications desktop, paramètres, thèmes, i18n, updater, packaging | Installeurs signés publiés par la CI |
+| **M8** | Finitions : notifications desktop, paramètres, thèmes, i18n, updater, packaging. À étudier : test de fumée qui pilote le vrai webview (`tauri-driver` sur Linux et Windows), les tests de composant ne voyant pas les différences entre webviews | Installeurs signés publiés par la CI |
 | **M9** | Durcissement : revue du threat model, fuzzing, audit des dépendances, guide d'auto-hébergement complet | |
 
 ---
@@ -370,7 +379,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 2. **Un jalon à la fois.** Ne commence pas le suivant sans validation.
 3. **Écris un ADR** (`docs/adr/NNNN-titre.md` : contexte, décision, alternatives, conséquences) pour toute décision structurante.
 4. **Mets à jour la doc dans le même commit** que le code (README, `docs/`, `.env.example`, ce fichier si une décision change).
-5. **Vérifie avant de déclarer terminé** : fmt, clippy, tests, build. Dis clairement ce qui n'a pas pu être testé (ex. capture d'écran sur un OS non disponible). Avant de remettre un serveur ou un client à tester à la main, relance-le depuis le build courant et vérifie que les routes ajoutées répondent : un processus démarré avant les derniers changements fait échouer le test pour une mauvaise raison.
+5. **Vérifie avant de déclarer terminé** : fmt, clippy, tests, build. Dis clairement ce qui n'a pas pu être testé (ex. capture d'écran sur un OS non disponible). Avant de remettre un serveur ou un client à tester à la main, relance-le depuis le build courant et vérifie que les routes ajoutées répondent : un processus démarré avant les derniers changements fait échouer le test pour une mauvaise raison. Pour la pile Docker : `./scripts/build.sh` puis `docker compose up -d`, et `GET /version` doit renvoyer dans `commit` le commit courant (sans suffixe `-dirty`) ; donne ce commit au mainteneur. Avant de déclarer un groupe de tâches ou un jalon terminé, lance le build des trois OS à la demande (`gh workflow run ci.yml --ref main`) et attends qu'il soit vert.
 8. **Version REST** : toute route ajoutée ou retirée incrémente `tavern_protocol::REST_MINOR_VERSION` (un test fige la liste des routes) ; c'est ce qui permet au client d'annoncer qu'une instance est plus ancienne que lui.
 9. **Espace disque** : la machine du mainteneur est presque pleine. Préviens dès que `target/` dépasse 8 Go et avant toute opération qui consomme beaucoup d'espace.
 6. **Signale les risques** : si une demande affaiblit la sécurité ou le budget RAM, dis-le avant de l'implémenter.

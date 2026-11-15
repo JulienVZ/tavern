@@ -97,5 +97,5 @@ TAVERN_PROFILE=second pnpm tauri dev
 - [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `security:`.
 - Small, coherent commits. One topic per pull request.
 - Never commit secrets, `.env` files or real data.
-- CI must pass: formatting, clippy, tests, `cargo deny`, UI checks, and the desktop build. While the repository is private, pull requests build the desktop client on Linux only; Windows and macOS are built on pushes to `main`. **When the repository becomes public, re-enable the three systems on pull requests** (the `desktop` job matrix in `.github/workflows/ci.yml`).
+- CI must pass: formatting, clippy, tests, `cargo deny`, UI checks, and the desktop build. While the repository is private, pushes and pull requests build the desktop client on Linux only; Windows and macOS are built once a day when `main` has changed, and on demand (`gh workflow run ci.yml --ref main`). A change that touches documentation only does not run the CI. Run the three systems on demand before calling a group of tasks or a milestone done. **When the repository becomes public, re-enable the three systems on pull requests** (the triggers and the `desktop` job matrix in `.github/workflows/ci.yml`).
 - Say in the pull request what you could not test (for example a platform you do not have).
