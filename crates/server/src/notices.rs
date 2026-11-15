@@ -50,6 +50,15 @@ impl NoticeKind {
         Self::RecoveryKeyReplaced,
     ];
 
+    /// Kinds also shown to devices enrolled after the event, until one device
+    /// of the account has acknowledged the notice.
+    ///
+    /// These report something the user will observe on any device without an
+    /// explanation: with TOTP disabled, sign-in stops asking for a code, on
+    /// a new computer as well. The other kinds are either acknowledged at
+    /// once by the device that acted, or concern devices that existed then.
+    pub const SHOWN_TO_LATER_DEVICES: [Self; 1] = [Self::TotpDisabledByAdmin];
+
     fn from_db(value: i16) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| *kind as i16 == value)
     }
@@ -167,13 +176,23 @@ pub async fn record(
 }
 
 /// Notices of the account that the device of `session` has not acknowledged,
-/// oldest first. A device is not told about what happened before it was
-/// enrolled.
+/// oldest first.
+///
+/// A device is not told about what happened before it was enrolled, except
+/// for the kinds in [`NoticeKind::SHOWN_TO_LATER_DEVICES`], which it is told
+/// about as long as no device of the account has acknowledged them.
 pub async fn pending(state: &AppState, session: &Session) -> ApiResult<Vec<Notice>> {
+    let later: Vec<i16> = NoticeKind::SHOWN_TO_LATER_DEVICES
+        .iter()
+        .map(|kind| *kind as i16)
+        .collect();
     let rows: Vec<(Uuid, i16, i64)> = sqlx::query_as(
         "SELECT n.id, n.kind, (extract(epoch FROM n.created_at) * 1000)::bigint \
          FROM security_notices n JOIN devices me ON me.id = $2 \
-         WHERE n.user_id = $1 AND n.created_at >= me.created_at \
+         WHERE n.user_id = $1 \
+           AND (n.created_at >= me.created_at \
+                OR (n.kind = ANY($5) AND NOT EXISTS (SELECT 1 FROM security_notice_acks seen \
+                                                     WHERE seen.notice_id = n.id))) \
            AND n.created_at >= now() - make_interval(days => $3) \
            AND NOT EXISTS (SELECT 1 FROM security_notice_acks a \
                            WHERE a.notice_id = n.id AND a.device_id = $2) \
@@ -183,6 +202,7 @@ pub async fn pending(state: &AppState, session: &Session) -> ApiResult<Vec<Notic
     .bind(session.device_id)
     .bind(RETENTION_DAYS)
     .bind(MAX_PENDING)
+    .bind(later)
     .fetch_all(&state.db)
     .await?;
 
@@ -196,6 +216,17 @@ pub async fn pending(state: &AppState, session: &Session) -> ApiResult<Vec<Notic
             })
         })
         .collect())
+}
+
+/// Deletes the notices of one kind for an account, when what they report no
+/// longer holds (TOTP was enabled again). Runs in the caller's transaction.
+pub async fn resolve(db: &mut PgConnection, user_id: Uuid, kind: NoticeKind) -> ApiResult<()> {
+    sqlx::query("DELETE FROM security_notices WHERE user_id = $1 AND kind = $2")
+        .bind(user_id)
+        .bind(kind as i16)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Marks notices as shown on the device of `session`. Identifiers that are

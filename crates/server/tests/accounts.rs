@@ -1180,6 +1180,27 @@ async fn security_notices_are_acknowledged_per_device_and_per_account() {
     assert_eq!(notices::pending(state, &tablet).await.unwrap(), []);
     assert_eq!(notices::pending(state, &laptop).await.unwrap(), [second]);
 
+    // Except what the user would otherwise observe without an explanation:
+    // an administrator disabling TOTP is shown to a later device too, until
+    // one device of the account acknowledges it.
+    let totp = notices::record(state, ann.user_id, NoticeKind::TotpDisabledByAdmin, None)
+        .await
+        .unwrap();
+    let ann_watch = app.enrol(&ann).await;
+    let watch = session_of(&ann, &ann_watch);
+    assert_eq!(notices::pending(state, &watch).await.unwrap(), [totp]);
+    notices::acknowledge(state, &tablet, &[totp.id])
+        .await
+        .unwrap();
+    assert_eq!(notices::pending(state, &watch).await.unwrap(), []);
+    assert_eq!(
+        notices::pending(state, &phone).await.unwrap(),
+        [second, totp]
+    );
+    notices::acknowledge(state, &laptop, &[totp.id])
+        .await
+        .unwrap();
+
     // Past the retention period a notice is no longer listed, and the next
     // one recorded for the account deletes it.
     sqlx::query(

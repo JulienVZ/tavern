@@ -48,6 +48,10 @@
       enrolment = null;
       code = "";
       step = "codes";
+      // The instance drops the notice about an administrator disabling it.
+      session.securityNotices = session.securityNotices.filter(
+        (notice) => notice.kind !== "totp_disabled_by_admin",
+      );
       if (session.account !== null) {
         session.account.totpEnabled = true;
       }

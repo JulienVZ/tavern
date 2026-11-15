@@ -246,3 +246,61 @@ async fn credential_and_device_changes_leave_a_notice_on_the_other_devices() {
         [SecurityNoticeKind::AccountRecovered]
     );
 }
+
+/// Found in manual testing: the user had signed out everywhere when the
+/// administrator disabled TOTP, and signed in next from a computer that had
+/// to be enrolled. Sign-in no longer asked for a code and nothing said why.
+/// A device enrolled after the event is told too, until some device of the
+/// account acknowledges the notice or TOTP is enabled again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL"]
+async fn a_computer_enrolled_after_totp_was_disabled_is_told_too() {
+    let server = Server::spawn().await;
+    let admin_computer = server.new_computer();
+    let admin_account = register(&server, &admin_computer, "boss", true).await;
+    let admin = login(&admin_computer, &admin_account.handle, PASSWORD).await;
+
+    let laptop_computer = server.new_computer();
+    let account = register(&server, &laptop_computer, "ola", false).await;
+    let laptop = login(&laptop_computer, &account.handle, PASSWORD).await;
+    let enrolment = laptop.totp_enable().await.unwrap();
+    laptop
+        .totp_confirm(&totp_code(&enrolment.secret))
+        .await
+        .unwrap();
+    let user_id = laptop.user_id();
+    // Signed out everywhere when it happens.
+    laptop.logout().await.unwrap();
+    admin.disable_user_totp(user_id).await.unwrap();
+
+    // Next sign-in, from a computer enrolled only now: told.
+    let newcomer = login(&server.new_computer(), &account.handle, PASSWORD).await;
+    let listed = pending(&newcomer).await;
+    assert_eq!(kinds(&listed), [SecurityNoticeKind::TotpDisabledByAdmin]);
+    // And again at the next connection, as long as it is not acknowledged.
+    assert_eq!(pending(&newcomer).await, listed);
+
+    // Once a device of the account acknowledged it, computers enrolled later
+    // are no longer told; the laptop, which existed then, still is.
+    let (gateway, mut events) = newcomer.connect_gateway().unwrap();
+    next_event(&mut events).await;
+    gateway
+        .ack_security_notices(&[listed[0].notice_id])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(gateway);
+    assert_eq!(pending(&newcomer).await, []);
+    let latecomer = login(&server.new_computer(), &account.handle, PASSWORD).await;
+    assert_eq!(pending(&latecomer).await, []);
+    let laptop = login(&laptop_computer, &account.handle, PASSWORD).await;
+    assert_eq!(pending(&laptop).await, listed);
+
+    // Enabling TOTP again settles the matter on every device.
+    let enrolment = laptop.totp_enable().await.unwrap();
+    laptop
+        .totp_confirm(&totp_code(&enrolment.secret))
+        .await
+        .unwrap();
+    assert_eq!(pending(&laptop).await, []);
+}

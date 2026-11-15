@@ -26,7 +26,8 @@ A generic mechanism: **security notices**, stored per account and acknowledged p
 - Kinds: TOTP disabled by an administrator (1), password changed (2), account recovered (3), device revoked (4), recovery key replaced (5). Numbers are shared by the database and the protocol and are never reused.
 - Delivery: pushed as a `SecurityNotice` event to connected devices, and listed in `Ready.security_notices` at every connection until the device sends `AckSecurityNotices`. The server subscribes the connection before reading the list, so a notice recorded in between arrives twice rather than not at all; clients identify notices by id.
 - The device that performed the action does not need to be told: the notice is acknowledged for it when recorded. Actions without an acting device of the account (an administrator's action, a recovery) are shown everywhere.
-- A device is told only about what happened after it was enrolled.
+- A device is told only about what happened after it was enrolled, **except for TOTP disabled by an administrator**: that notice is also shown to devices enrolled later, as long as no device of the account has acknowledged it. Without this, a user who was signed out everywhere and signs in from a newly enrolled computer finds that no code is asked any more, with no explanation (found in manual testing on 2026-11-15). Devices that existed at the time still acknowledge each for itself.
+- When TOTP is enabled again, the notices about an administrator disabling it are deleted: what they report no longer holds.
 - Password change and recovery sign devices out; their notices are stored and not pushed, and are read after the next sign-in.
 - The interface shows each notice until the user dismisses it on that device. A kind unknown to an older client is shown as a generic notice.
 - Retention: 90 days. Older notices are not listed, and are deleted when the next notice is recorded for the account. No background job.

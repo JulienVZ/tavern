@@ -11,6 +11,7 @@ use tavern_protocol::rest::{
 };
 
 use crate::error::{ApiError, ApiJson, ApiResult};
+use crate::notices::{self, NoticeKind};
 use crate::session::Session;
 use crate::{AppState, totp};
 
@@ -134,6 +135,8 @@ pub(crate) async fn totp_confirm(
         .bind(session.user_id)
         .execute(&mut *tx)
         .await?;
+    // TOTP is back: a notice saying an administrator disabled it is moot.
+    notices::resolve(&mut tx, session.user_id, NoticeKind::TotpDisabledByAdmin).await?;
     for code in &codes {
         sqlx::query("INSERT INTO totp_recovery_codes (user_id, code_hash) VALUES ($1, $2)")
             .bind(session.user_id)
