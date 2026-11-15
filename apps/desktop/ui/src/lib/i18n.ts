@@ -90,7 +90,18 @@ const en = {
   "newdevice.review": "Review my devices",
 
   "notice.totp_disabled_by_admin":
-    "An administrator disabled two-factor authentication on your account. Enable it again if you did not ask for this.",
+    "An administrator disabled two-factor authentication on your account ({date}). Enable it again if you did not ask for this.",
+  "notice.password_changed":
+    "The password of your account was changed ({date}). If it was not you, recover your account with your recovery key.",
+  "notice.account_recovered":
+    "Your account was recovered with its recovery key ({date}): the password was replaced and every device was signed out. If it was not you, recover it again and create a new recovery key.",
+  "notice.device_revoked":
+    "A device was revoked from your account ({date}). If it was not you, change your password.",
+  "notice.recovery_key_replaced":
+    "The recovery key of your account was replaced ({date}); the previous one no longer works. If it was not you, change your password and create a new recovery key.",
+  "notice.other":
+    "A security-related change was made to your account ({date}). Update Tavern to see the details.",
+  "notice.ack": "OK, noted",
 
   "devices.title": "Devices",
   "devices.intro": "Every computer signed in to your account. Revoke the ones you do not recognise.",
@@ -98,7 +109,9 @@ const en = {
   "devices.added": "Added {date}",
   "devices.last_seen": "last active {date}",
   "devices.revoke": "Revoke",
+  "devices.revoke.title": "Revoke this device",
   "devices.revoke.confirm": "Revoke this device? It will be signed out at once.",
+  "devices.revoke.done": "Device revoked. It has been signed out.",
   "devices.new": "New",
   "platform.windows": "Windows",
   "platform.macos": "macOS",
@@ -120,6 +133,7 @@ const en = {
   "security.totp.codes.body":
     "Each code replaces an authenticator code once. They are shown only now: save them.",
   "security.totp.codes.done": "I have saved them",
+  "security.totp.disabled": "Two-factor authentication is now disabled.",
 
   "admin.title": "Administration",
   "admin.invites.title": "Invitations",
@@ -131,13 +145,18 @@ const en = {
   "admin.invites.revoked": "revoked",
   "admin.invites.grants_admin": "administrator",
   "admin.invites.revoke": "Revoke",
+  "admin.invites.revoked.done": "Invitation revoked.",
   "admin.users.title": "Accounts",
   "admin.users.devices": "{count} device(s)",
   "admin.users.disabled": "disabled",
   "admin.users.totp": "2FA",
   "admin.users.disable": "Disable",
   "admin.users.enable": "Enable",
+  "admin.users.disable.done": "@{handle} is disabled and signed out everywhere.",
+  "admin.users.enable.done": "@{handle} can sign in again.",
   "admin.users.disable_totp": "Disable 2FA",
+  "admin.users.disable_totp.done":
+    "Two-factor authentication is disabled for @{handle}. Their devices are notified.",
   "admin.users.disable_totp.confirm":
     "Disable two-factor authentication for @{handle}? Do this only for someone who lost their authenticator and recovery codes. Their devices will be notified and the action is logged.",
 
@@ -176,6 +195,8 @@ const en = {
   "ended.account_disabled": "Your account was disabled by an administrator.",
   "ended.invalid": "Your session expired. Sign in again.",
   "ended.replaced": "This account is now connected from another window of this device.",
+  "ended.logout_unconfirmed":
+    "You are signed out on this computer, but the instance could not be reached: the session stays valid there until it expires. To end it now, revoke this device from another one.",
 
   "error.invalid_url": "This is not a valid address.",
   "error.insecure_url":
@@ -321,7 +342,18 @@ const fr: Catalogue = {
   "newdevice.review": "Voir mes appareils",
 
   "notice.totp_disabled_by_admin":
-    "Un administrateur a désactivé l'authentification à deux facteurs sur votre compte. Réactivez-la si vous ne l'avez pas demandé.",
+    "Un administrateur a désactivé l'authentification à deux facteurs sur votre compte ({date}). Réactivez-la si vous ne l'avez pas demandé.",
+  "notice.password_changed":
+    "Le mot de passe de votre compte a été changé ({date}). Si ce n'était pas vous, récupérez votre compte avec votre clé de récupération.",
+  "notice.account_recovered":
+    "Votre compte a été récupéré avec sa clé de récupération ({date}) : le mot de passe a été remplacé et tous les appareils ont été déconnectés. Si ce n'était pas vous, récupérez-le de nouveau et créez une nouvelle clé de récupération.",
+  "notice.device_revoked":
+    "Un appareil a été révoqué de votre compte ({date}). Si ce n'était pas vous, changez votre mot de passe.",
+  "notice.recovery_key_replaced":
+    "La clé de récupération de votre compte a été remplacée ({date}) ; l'ancienne ne fonctionne plus. Si ce n'était pas vous, changez votre mot de passe et créez une nouvelle clé de récupération.",
+  "notice.other":
+    "Une modification liée à la sécurité a été faite sur votre compte ({date}). Mettez Tavern à jour pour en voir le détail.",
+  "notice.ack": "J'en prends note",
 
   "devices.title": "Appareils",
   "devices.intro":
@@ -330,7 +362,9 @@ const fr: Catalogue = {
   "devices.added": "Ajouté le {date}",
   "devices.last_seen": "dernière activité le {date}",
   "devices.revoke": "Révoquer",
+  "devices.revoke.title": "Révoquer cet appareil",
   "devices.revoke.confirm": "Révoquer cet appareil ? Il sera déconnecté immédiatement.",
+  "devices.revoke.done": "Appareil révoqué. Il a été déconnecté.",
   "devices.new": "Nouveau",
   "platform.windows": "Windows",
   "platform.macos": "macOS",
@@ -354,6 +388,7 @@ const fr: Catalogue = {
   "security.totp.codes.body":
     "Chaque code remplace une fois un code d'authentification. Ils ne sont affichés que maintenant : conservez-les.",
   "security.totp.codes.done": "Je les ai conservés",
+  "security.totp.disabled": "L'authentification à deux facteurs est maintenant désactivée.",
 
   "admin.title": "Administration",
   "admin.invites.title": "Invitations",
@@ -366,13 +401,18 @@ const fr: Catalogue = {
   "admin.invites.revoked": "révoquée",
   "admin.invites.grants_admin": "administrateur",
   "admin.invites.revoke": "Révoquer",
+  "admin.invites.revoked.done": "Invitation révoquée.",
   "admin.users.title": "Comptes",
   "admin.users.devices": "{count} appareil(s)",
   "admin.users.disabled": "désactivé",
   "admin.users.totp": "2FA",
   "admin.users.disable": "Désactiver",
   "admin.users.enable": "Réactiver",
+  "admin.users.disable.done": "@{handle} est désactivé et déconnecté partout.",
+  "admin.users.enable.done": "@{handle} peut de nouveau se connecter.",
   "admin.users.disable_totp": "Désactiver la 2FA",
+  "admin.users.disable_totp.done":
+    "L'authentification à deux facteurs est désactivée pour @{handle}. Ses appareils sont prévenus.",
   "admin.users.disable_totp.confirm":
     "Désactiver l'authentification à deux facteurs de @{handle} ? À réserver à une personne qui a perdu son application et ses codes de secours. Ses appareils seront prévenus et l'action est journalisée.",
 
@@ -412,6 +452,8 @@ const fr: Catalogue = {
   "ended.account_disabled": "Votre compte a été désactivé par un administrateur.",
   "ended.invalid": "Votre session a expiré. Reconnectez-vous.",
   "ended.replaced": "Ce compte est maintenant connecté depuis une autre fenêtre de cet appareil.",
+  "ended.logout_unconfirmed":
+    "Vous êtes déconnecté sur cet ordinateur, mais l'instance n'a pas pu être jointe : la session y reste valide jusqu'à son expiration. Pour y mettre fin maintenant, révoquez cet appareil depuis un autre.",
 
   "error.invalid_url": "Cette adresse n'est pas valide.",
   "error.insecure_url":

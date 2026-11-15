@@ -3,6 +3,7 @@
   import { onMount } from "svelte";
 
   import { api, type AdminUser, type CommandError, type Invite } from "../lib/api";
+  import ConfirmDialog from "../lib/ConfirmDialog.svelte";
   import { errorMessage, formatDate, t } from "../lib/i18n";
   import { guarded, session } from "../lib/session.svelte";
 
@@ -11,54 +12,78 @@
   let createdCode = $state<string | null>(null);
   let working = $state(false);
   let error = $state<CommandError | null>(null);
+  /** Confirmation of the last action that succeeded. */
+  let done = $state<string | null>(null);
+  /** The account whose TOTP removal awaits confirmation. */
+  let totpTarget = $state<AdminUser | null>(null);
 
-  async function run<T>(action: () => Promise<T>): Promise<T | undefined> {
-    working = true;
-    error = null;
-    const result = await guarded(action);
-    working = false;
-    if (result.ok) {
-      return result.value;
-    }
-    error = result.error;
-    return undefined;
-  }
-
-  async function load(): Promise<void> {
-    const loaded = await run(async () => ({
+  /**
+   * Refreshes both lists. A failure is shown unless an action already
+   * reported one: the outcome of the action must stay on screen.
+   */
+  async function reload(): Promise<void> {
+    const loaded = await guarded(async () => ({
       invites: await api.adminInvites(),
       users: await api.adminUsers(),
     }));
-    if (loaded !== undefined) {
-      invites = loaded.invites;
-      users = loaded.users;
+    if (loaded.ok) {
+      invites = loaded.value.invites;
+      users = loaded.value.users;
+    } else if (error === null) {
+      error = loaded.error;
     }
   }
 
+  /**
+   * Runs an action, then shows either `success` or the error, and refreshes
+   * the lists. Returns the value of the action, or `null` if it failed.
+   */
+  async function act<T>(action: () => Promise<T>, success: string | null): Promise<T | null> {
+    working = true;
+    error = null;
+    done = null;
+    const result = await guarded(action);
+    if (result.ok) {
+      done = success;
+    } else {
+      error = result.error;
+    }
+    await reload();
+    working = false;
+    return result.ok ? result.value : null;
+  }
+
   async function createInvite(): Promise<void> {
-    const created = await run(() => api.adminCreateInvite(null, null));
-    if (created !== undefined) {
+    // The code itself is the confirmation.
+    const created = await act(() => api.adminCreateInvite(null, null), null);
+    if (created !== null) {
       createdCode = created.code;
-      await load();
     }
   }
 
   async function revokeInvite(invite: Invite): Promise<void> {
-    await run(() => api.adminRevokeInvite(invite.invite_id));
-    await load();
+    await act(() => api.adminRevokeInvite(invite.invite_id), t("admin.invites.revoked.done"));
   }
 
   async function setDisabled(user: AdminUser, disabled: boolean): Promise<void> {
-    await run(() => api.adminSetUserDisabled(user.user_id, disabled));
-    await load();
+    await act(
+      () => api.adminSetUserDisabled(user.user_id, disabled),
+      t(disabled ? "admin.users.disable.done" : "admin.users.enable.done", {
+        handle: user.handle,
+      }),
+    );
   }
 
-  async function disableTotp(user: AdminUser): Promise<void> {
-    if (!window.confirm(t("admin.users.disable_totp.confirm", { handle: user.handle }))) {
+  async function disableTotp(): Promise<void> {
+    const user = totpTarget;
+    totpTarget = null;
+    if (user === null) {
       return;
     }
-    await run(() => api.adminDisableUserTotp(user.user_id));
-    await load();
+    await act(
+      () => api.adminDisableUserTotp(user.user_id),
+      t("admin.users.disable_totp.done", { handle: user.handle }),
+    );
   }
 
   function usable(invite: Invite): boolean {
@@ -66,7 +91,7 @@
   }
 
   onMount(() => {
-    void load();
+    void reload();
   });
 </script>
 
@@ -132,7 +157,7 @@
           {#if user.user_id !== session.account?.userId}
             <div class="row">
               {#if user.totp_enabled}
-                <button type="button" disabled={working} onclick={() => disableTotp(user)}>
+                <button type="button" disabled={working} onclick={() => (totpTarget = user)}>
                   {t("admin.users.disable_totp")}
                 </button>
               {/if}
@@ -152,9 +177,24 @@
     </ul>
   </div>
 
+  <div role="status">
+    {#if done !== null}
+      <p class="alert">{done}</p>
+    {/if}
+  </div>
   <div role="alert">
     {#if error !== null}
       <p class="alert error">{errorMessage(error)}</p>
     {/if}
   </div>
 </section>
+
+{#if totpTarget !== null}
+  <ConfirmDialog
+    title={t("admin.users.disable_totp")}
+    message={t("admin.users.disable_totp.confirm", { handle: totpTarget.handle })}
+    confirmLabel={t("admin.users.disable_totp")}
+    onconfirm={disableTotp}
+    oncancel={() => (totpTarget = null)}
+  />
+{/if}

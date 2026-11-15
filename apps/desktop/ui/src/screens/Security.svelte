@@ -13,12 +13,15 @@
   let code = $state("");
   let working = $state(false);
   let error = $state<CommandError | null>(null);
+  /** TOTP was just disabled: confirmation shown until the next action. */
+  let disabled = $state(false);
 
   const enabled = $derived(session.account?.totpEnabled ?? false);
 
   async function run<T>(action: () => Promise<T>): Promise<T | undefined> {
     working = true;
     error = null;
+    disabled = false;
     const result = await guarded(action);
     working = false;
     if (result.ok) {
@@ -37,7 +40,7 @@
     }
   }
 
-  async function confirm(event: SubmitEvent): Promise<void> {
+  async function confirmEnrolment(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     const codes = await run(() => api.totpConfirm(code));
     if (codes !== undefined) {
@@ -45,7 +48,6 @@
       enrolment = null;
       code = "";
       step = "codes";
-      session.totpDisabledByAdmin = false;
       if (session.account !== null) {
         session.account.totpEnabled = true;
       }
@@ -61,6 +63,7 @@
     if (done === true) {
       code = "";
       step = "idle";
+      disabled = true;
       if (session.account !== null) {
         session.account.totpEnabled = false;
       }
@@ -93,7 +96,7 @@
       {/if}
     </div>
   {:else if step === "setup" && enrolment !== null}
-    <form class="stack" onsubmit={confirm} novalidate>
+    <form class="stack" onsubmit={confirmEnrolment} novalidate>
       <p>{t("security.totp.setup")}</p>
       <QrCode matrix={enrolment.qr} label={t("security.totp.qr")} />
       <div>
@@ -158,6 +161,11 @@
     </form>
   {/if}
 
+  <div role="status">
+    {#if disabled}
+      <p class="alert">{t("security.totp.disabled")}</p>
+    {/if}
+  </div>
   <div role="alert">
     {#if error !== null}
       <p class="alert error">{errorMessage(error)}</p>
