@@ -396,7 +396,9 @@ Delivery rules:
 - `SendMessage` is idempotent on (`device`, `client_message_id`): a retry returns the original acknowledgement.
 - The server deletes a stored message once every recipient device has acknowledged it, or after the retention limit (default 30 days), whichever comes first. A welcome is deleted when acknowledged.
 
-### 5.3 Gateway: presence, typing, friends
+### 5.3 Gateway: friends (M2), presence and typing (M3)
+
+`FriendshipChanged` is part of M2. Presence and typing (`SetPresence`, `PresenceChanged`, `SetTyping`, `TypingEvent`) are implemented at the start of M3 (decision of 2026-11-15, to keep M2 on its end criterion); their definitions are kept here because the field numbers are reserved in the envelope.
 
 ```proto
 message SetPresence { Presence presence = 1; }  // ONLINE | IDLE | DO_NOT_DISTURB | INVISIBLE

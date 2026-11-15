@@ -68,6 +68,8 @@ Hors périmètre v1 : fédération entre instances, applications mobiles (mais l
 
 Avant d'ajouter une dépendance, vérifie qu'elle est maintenue, que sa licence est compatible (voir §10) et qu'elle passe `cargo deny`. Toute dépendance crypto ou réseau nouvelle doit faire l'objet d'un ADR.
 
+**Toute nouvelle dépendance passe `cargo deny` avant d'être ajoutée** (essai sur une branche ou une copie du manifeste) ; tout avis de sécurité ou toute licence hors liste est signalé au mainteneur avant de continuer.
+
 **Aucune exception dans `deny.toml` (avis ignoré, licence ou source ajoutée, interdiction levée) sans l'accord préalable du mainteneur.** Si `cargo deny` échoue, arrête-toi, présente l'analyse et attends la décision.
 
 Les versions des crates évoluent : vérifie toujours la version actuelle et la doc à jour (docs.rs, changelogs) au lieu de te fier à ta mémoire, en particulier pour Tauri, OpenMLS, LiveKit et axum.
@@ -157,6 +159,7 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Messages de handshake (proposals, commits) en `PublicMessage` pour que le serveur puisse les valider et les ordonner ; messages applicatifs en `PrivateMessage`.
 - Identité : une clé d'identité de compte (AIK) signe le certificat de chaque appareil ; sa partie privée n'est stockée sur aucun appareil (copies chiffrées côté serveur sous la clé d'export OPAQUE et sous la clé de récupération, voir ADR 0003).
 - Rotation régulière des clés (commit de mise à jour périodique).
+- Un appareil déconnecté reste membre de ses conversations ; les messages l'attendent sur le serveur (30 jours au plus). Un appareil resté sans connexion au-delà d'un délai configurable (**90 jours par défaut**) est retiré des groupes par une proposition `Remove` du serveur ; à son retour il rejoint par external commit, avec un trou dans l'historique que l'UI explique (décision du 2026-11-15, détail dans le plan crypto MLS).
 - Vérification d'identité entre utilisateurs : numéros de sécurité / QR code (comparaison des clés d'identité).
 
 ### Médias
@@ -352,8 +355,8 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 |---|---|---|
 | **M0** | Scaffolding : workspace, crates vides, app Tauri qui démarre, docker compose qui démarre, CI verte, docs squelettes, ADR initiaux | `docker compose up` + `pnpm tauri dev` fonctionnent, CI verte sur les 3 OS |
 | **M1** | Comptes : OPAQUE, sessions, appareils, invitations, admin initial, TOTP | Un utilisateur s'inscrit avec un code d'invitation et se connecte depuis 2 appareils |
-| **M2** | Amis + DM 1:1 chiffrés MLS, store local chiffré, multi-appareil | Deux utilisateurs échangent des messages ; la base serveur ne contient que du chiffré (test automatisé) |
-| **M3** | Groupes privés | Ajout/retrait de membres avec rotation de clés vérifiée |
+| **M2** | Amis + DM 1:1 chiffrés MLS, store local chiffré, multi-appareil, identité d'appareil et déconnexion (ADR 0017). Sans présence ni indicateur de frappe | Deux utilisateurs échangent des messages ; la base serveur ne contient que du chiffré (test automatisé) |
+| **M3** | Présence et indicateur « en train d'écrire » (reportés de M2 le 2026-11-15, à faire en premier), puis groupes privés | Ajout/retrait de membres avec rotation de clés vérifiée |
 | **M4** | Serveurs, channels textuels, catégories, rôles, permissions, modération | Kick/ban retire l'accès cryptographique |
 | **M5** | Pièces jointes chiffrées, avatars, bannières, emojis personnalisés, réactions, recherche locale | |
 | **M5b** | Historique sur un nouvel appareil de l'utilisateur (ADR 0009) : transfert d'appareil à appareil | Un second appareil récupère l'historique du premier sans que le serveur détienne de clé |
@@ -387,6 +390,6 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 4. **Mets à jour la doc dans le même commit** que le code (README, `docs/`, `.env.example`, ce fichier si une décision change).
 5. **Vérifie avant de déclarer terminé** : fmt, clippy, tests, build. Dis clairement ce qui n'a pas pu être testé (ex. capture d'écran sur un OS non disponible). Avant de remettre un serveur ou un client à tester à la main, relance-le depuis le build courant et vérifie que les routes ajoutées répondent : un processus démarré avant les derniers changements fait échouer le test pour une mauvaise raison. Pour la pile Docker : `./scripts/build.sh` puis `docker compose up -d`, et `GET /version` doit renvoyer dans `commit` le commit courant (sans suffixe `-dirty`) ; donne ce commit au mainteneur. Avant de déclarer un groupe de tâches ou un jalon terminé, lance le build des trois OS à la demande (`gh workflow run ci.yml --ref main`) et attends qu'il soit vert.
 8. **Version REST** : toute route ajoutée ou retirée incrémente `tavern_protocol::REST_MINOR_VERSION` (un test fige la liste des routes) ; c'est ce qui permet au client d'annoncer qu'une instance est plus ancienne que lui.
-9. **Espace disque** : la machine du mainteneur est presque pleine. Préviens dès que `target/` dépasse 8 Go et avant toute opération qui consomme beaucoup d'espace.
+9. **Espace disque** : la machine du mainteneur est presque pleine. Préviens dès que `target/` dépasse **10 Go** (seuil relevé pour M2, 8 Go auparavant), dès que l'espace libre passe sous **8 Go**, et avant toute opération qui consomme beaucoup d'espace.
 6. **Signale les risques** : si une demande affaiblit la sécurité ou le budget RAM, dis-le avant de l'implémenter.
 7. Pas de code mort, pas de TODO non suivi : tout TODO référence une issue ou un jalon.
