@@ -63,11 +63,13 @@ docker compose up -d --build
 curl http://localhost:8080/health
 ```
 
-Run the integration and end-to-end tests against that PostgreSQL (use the password from `deploy/.env`):
+Run the integration and end-to-end tests against that PostgreSQL, in a database of their own. `test-db.sh` creates `tavern_test` if needed and prints its URL; the tests refuse a database whose name does not end in `_test`, so the accounts you created by hand in the development instance are never touched:
 
 ```bash
-TAVERN_TEST_DATABASE_URL=postgres://tavern:<password>@localhost:5432/tavern \
+TAVERN_TEST_DATABASE_URL=$(./deploy/scripts/test-db.sh) \
   cargo test --package tavern-server --package tavern-e2e-tests -- --ignored
+
+./deploy/scripts/test-db.sh --reset    # start again from an empty test database
 ```
 
 Create the first administrator invitation, then run the desktop client and enter `http://localhost:8080` as the instance address:
@@ -77,11 +79,18 @@ cd deploy && ./scripts/create-admin.sh
 cd ../apps/desktop && pnpm tauri dev
 ```
 
-To try two devices on one computer, start a second client with its own keychain profile:
+To try several accounts or devices on one computer, keep that first client running and start the others from other terminals, each with its own keychain profile:
 
 ```bash
-TAVERN_PROFILE=second pnpm tauri dev
+cd apps/desktop
+pnpm client bob        # a second client
+pnpm client alice-2    # a third one, and so on
 ```
+
+- `pnpm tauri dev` cannot be started twice (it also serves the interface, on a fixed port). `pnpm client <profile>` reuses that server and the application it built.
+- A profile is a separate keychain entry: one account and one device per profile. Use one profile per account and per device (for two accounts with two devices each: the first client plus three profiles), and reuse the same name to come back to the same device. Signing in to another account in a profile replaces its device record.
+- The window title shows the profile.
+- After a change to the Rust code, `tauri dev` rebuilds and restarts the first client only: close and restart the others. Changes to the interface reach every client at once.
 
 ## Code conventions
 

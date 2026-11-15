@@ -608,11 +608,16 @@ pub fn run() -> std::result::Result<(), tauri::Error> {
     tauri::Builder::default()
         .setup(|app| {
             let identifier = app.config().identifier.clone();
+            let profile = std::env::var("TAVERN_PROFILE")
+                .ok()
+                .filter(|p| !p.trim().is_empty());
+            // Several clients on one computer: say which window is which.
+            if let (Some(profile), Some(window)) = (&profile, app.get_webview_window("main")) {
+                window.set_title(&format!("Tavern ({profile})"))?;
+            }
             app.manage(Shell {
                 store: Arc::new(KeychainStore::new(&identifier)),
-                profile: std::env::var("TAVERN_PROFILE")
-                    .ok()
-                    .filter(|p| !p.trim().is_empty()),
+                profile,
                 session: Mutex::new(Session::default()),
             });
             Ok(())

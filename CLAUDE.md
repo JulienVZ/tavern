@@ -175,7 +175,7 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Clé de récupération générée à la création du compte (affichée une seule fois) pour restaurer l'identité sur un nouvel appareil.
 - Robustesse du mot de passe imposée **côté client** à l'inscription et au changement (12 caractères minimum, estimation type zxcvbn ≥ 3/4) : il protège aussi la clé d'identité du compte.
 - Chaque enrôlement d'appareil est notifié à tous les appareils existants du compte (avec action de révocation) et affiché à ses contacts dans les conversations partagées.
-- **Notices de sécurité** (ADR 0016) : TOTP désactivé par un admin, mot de passe changé, compte récupéré par clé, appareil révoqué, clé de récupération régénérée. Enregistrées côté serveur (type énuméré et date, aucun texte libre), rejouées à chaque connexion et acquittées appareil par appareil : un appareil hors ligne ou déconnecté est prévenu lui aussi. Tout nouvel événement sensible d'un compte passe par ce mécanisme, jamais par un simple événement gateway.
+- **Notices de sécurité** (ADR 0016) : TOTP désactivé par un admin, mot de passe changé, compte récupéré par clé, appareil révoqué, clé de récupération régénérée. Enregistrées côté serveur (type énuméré et date, aucun texte libre), rejouées à chaque connexion et acquittées appareil par appareil : un appareil hors ligne ou déconnecté est prévenu lui aussi. Un appareil n'est pas prévenu de ce qui précède son enrôlement, sauf pour le TOTP désactivé par un admin, signalé aussi aux appareils enrôlés ensuite tant qu'aucun appareil du compte ne l'a acquitté et que le TOTP n'a pas été réactivé. Tout nouvel événement sensible d'un compte passe par ce mécanisme, jamais par un simple événement gateway.
 - Un nouvel appareil n'a pas d'historique en v1 : l'UI l'explique à l'enrôlement et en tête de chaque conversation (ADR 0006, ADR 0009).
 - Quand le serveur répond `REMOVAL_PENDING` ou `STALE_EPOCH`, le client committe/applique ce qui est en attente puis renvoie le message automatiquement, sans erreur visible.
 - Rate limiting sur toutes les routes d'auth (30/min par adresse, 5/min par handle). Derrière Caddy, l'adresse est la **dernière** entrée de `X-Forwarded-For` ; le serveur ne publie aucun port (vérifié en CI).
@@ -236,7 +236,7 @@ L'expérience d'un admin d'instance est une fonctionnalité à part entière.
 - Migrations de base appliquées automatiquement au démarrage du serveur (avec option pour les désactiver).
 - `deploy/scripts/create-admin.sh` pour créer le premier compte admin / le premier code d'invitation.
 - Endpoint `/health` et `/version` (ce dernier indique le commit du build).
-- Logs de requêtes au niveau info : méthode, gabarit de route, code, durée. Jamais d'adresse IP, de handle, de jeton, d'URL brute ni de corps.
+- Logs de requêtes au niveau info (sauf `/health`, au niveau debug) : méthode, gabarit de route, code, durée. Jamais d'adresse IP, de handle, de jeton, d'URL brute ni de corps.
 - Scripts de sauvegarde/restauration (dump Postgres + dossier des blobs + secrets d'instance, dont le setup OPAQUE et la clé external sender).
 - Ports LiveKit par défaut : signalisation derrière Caddy (443), un seul port UDP en mux pour le média, 7881/TCP en repli. **TURN désactivé par défaut en v1** ; TURN/TLS sur 5349 avec le volume de certificats de Caddy partagé est une option documentée dans `docs/self-hosting.md`. `network_mode: host` avec plage UDP documenté comme option avancée sous Linux.
 - Le client demande l'URL de l'instance au premier lancement (comme Element ou Mattermost). Architecture prête pour plusieurs instances dans un même client (pas obligatoire en v1).
@@ -308,12 +308,17 @@ curl https://<TAVERN_DOMAIN>/health
 cd deploy && ./scripts/init.sh --dev && ./scripts/build.sh && docker compose up -d
 curl http://localhost:8080/version    # "commit" doit être le commit courant
 
-# Tests d'intégration et de bout en bout (nécessitent PostgreSQL ; mot de passe dans deploy/.env)
-TAVERN_TEST_DATABASE_URL=postgres://tavern:<mot de passe>@localhost:5432/tavern \
+# Tests d'intégration et de bout en bout : base dédiée tavern_test dans le PostgreSQL de la pile de dév
+# (test-db.sh la crée et affiche son URL ; les tests refusent toute base dont le nom ne finit pas par _test,
+# la base de l'instance et ses comptes de test manuel ne sont donc jamais touchés)
+TAVERN_TEST_DATABASE_URL=$(./deploy/scripts/test-db.sh) \
   cargo test --package tavern-server --package tavern-e2e-tests -- --ignored
+./deploy/scripts/test-db.sh --reset   # repartir d'une base de test vide
 
-# Deux clients sur la même machine (profils de trousseau séparés)
-cd apps/desktop && TAVERN_PROFILE=second pnpm tauri dev
+# Plusieurs clients sur la même machine (un profil de trousseau = un compte et un appareil)
+cd apps/desktop && pnpm tauri dev     # premier client, à laisser tourner
+pnpm client bob                       # chaque client supplémentaire, dans un autre terminal
+pnpm client alice-2                   # (le titre de la fenêtre indique le profil ; à relancer après un changement Rust)
 
 # Mesure Argon2id (durée et mémoire rendue)
 cargo run --release --package tavern-crypto --example argon2_memory
@@ -336,6 +341,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 
 - Projet sous **AGPL-3.0-or-later** : les instances modifiées et exposées en réseau doivent publier leurs modifications.
 - Dépendances autorisées : MIT, Apache-2.0, BSD, ISC, MPL-2.0, Zlib, Unicode, AGPL/GPL compatibles. À configurer dans `deny.toml`.
+- **BlueOak-1.0.0** : acceptée pour les dépendances de développement et de test **uniquement** (décision du 2026-11-15 ; aujourd'hui `lru-cache`, tirée par `jsdom`). Jamais pour une dépendance embarquée dans le client ou le serveur.
 - Ajouter un en-tête SPDX (`// SPDX-License-Identifier: AGPL-3.0-or-later`) dans chaque fichier source.
 
 ---
