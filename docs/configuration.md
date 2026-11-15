@@ -80,7 +80,7 @@ The server refuses to start when one of its four secrets is missing or malformed
 
 ## Request log
 
-At the `info` level the server writes one line per request, with four fields and nothing else:
+At the `info` level the server writes one line per request (except `/health`), with four fields and nothing else:
 
 ```
 INFO tavern_server::telemetry: request method=POST route=/v1/admin/users/{user_id}/totp/disable status=204 duration_ms=7
@@ -88,7 +88,7 @@ INFO tavern_server::telemetry: request method=POST route=/v1/admin/users/{user_i
 
 - `route` is the route template, never the URL: identifiers in the path and query strings are not logged. A request that matches no route is logged as `route=unmatched`.
 - No client address, handle, token, header or body is logged, at any level.
-- The container health check calls `/health` every ten seconds and appears in this log. Set `TAVERN_LOG_LEVEL=warn` to silence request lines.
+- Calls to `/health` are logged at `debug` only: the container health check makes one every ten seconds.
 
 ## Server commands
 

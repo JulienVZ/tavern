@@ -36,8 +36,13 @@ pub fn init(level: &str, format: LogFormat) -> Result<(), ParseError> {
 /// Route name logged for a request that matched no route.
 const UNMATCHED: &str = "unmatched";
 
+/// Route of the liveness check. The container health check calls it every
+/// ten seconds: logged at `debug`, so that it does not drown the rest.
+const HEALTH_ROUTE: &str = "/health";
+
 /// Middleware: one `info` line per request, with the method, the route
-/// template, the status and the duration.
+/// template, the status and the duration. Calls to `/health` are logged at
+/// `debug` instead.
 ///
 /// The template (`/v1/devices/{device_id}`) is logged, never the URL: paths
 /// carry identifiers and query strings can carry anything. A request that
@@ -54,13 +59,13 @@ pub async fn log_request(request: Request, next: Next) -> Response {
 
     let response = next.run(request).await;
 
-    tracing::info!(
-        method = %method,
-        route = %route,
-        status = response.status().as_u16(),
-        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "request"
-    );
+    let status = response.status().as_u16();
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if route == HEALTH_ROUTE {
+        tracing::debug!(%method, %route, status, duration_ms, "request");
+    } else {
+        tracing::info!(%method, %route, status, duration_ms, "request");
+    }
     response
 }
 
@@ -109,12 +114,29 @@ mod tests {
         }
     }
 
+    /// Runs `requests` against the router while capturing what is logged at
+    /// `level` and above.
+    fn capture(level: tracing::Level) -> (Captured, tracing::subscriber::DefaultGuard) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(level)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
     /// Serves a router with the logging middleware and returns its address.
     async fn serve() -> std::net::SocketAddr {
         let app = Router::new()
             .route(
                 "/v1/admin/users/{user_id}/totp/disable",
                 post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                HEALTH_ROUTE,
+                axum::routing::get(|| async { StatusCode::OK }),
             )
             .layer(axum::middleware::from_fn(log_request));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -127,13 +149,7 @@ mod tests {
     // where the capturing subscriber is installed.
     #[tokio::test]
     async fn a_request_is_logged_by_its_route_template_and_nothing_personal() {
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (captured, _guard) = capture(tracing::Level::INFO);
         let addr = serve().await;
         let client = reqwest::Client::new();
 
@@ -182,6 +198,20 @@ mod tests {
             "authorization",
         ] {
             assert!(!log.contains(forbidden), "{forbidden} in {log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_checks_are_logged_at_debug_only() {
+        for (level, expected) in [(tracing::Level::INFO, 0), (tracing::Level::DEBUG, 1)] {
+            let (captured, _guard) = capture(level);
+            let addr = serve().await;
+            let response = reqwest::get(format!("http://{addr}/health")).await.unwrap();
+            assert_eq!(response.status(), 200);
+
+            let log = captured.text();
+            let lines = log.lines().filter(|line| line.contains("route=/health"));
+            assert_eq!(lines.count(), expected, "{level}: {log}");
         }
     }
 }
