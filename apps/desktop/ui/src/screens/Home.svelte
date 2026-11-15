@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <script lang="ts">
-  import { api } from "../lib/api";
-  import { t } from "../lib/i18n";
+  import { api, type CommandError, type SecurityNotice } from "../lib/api";
+  import { errorMessage, formatDate, t } from "../lib/i18n";
   import { guarded, session, signedOut } from "../lib/session.svelte";
   import Admin from "./Admin.svelte";
   import Credentials from "./Credentials.svelte";
@@ -9,17 +9,38 @@
   import Security from "./Security.svelte";
 
   let signingOut = $state(false);
+  /** An acknowledgement that the instance did not receive. */
+  let error = $state<CommandError | null>(null);
 
   async function logout(): Promise<void> {
     signingOut = true;
-    await guarded(() => api.logout());
+    const result = await guarded(() => api.logout());
     signingOut = false;
-    signedOut(null);
+    // The local session is forgotten either way. If the instance was not
+    // told, say so: the session stays valid there until it expires.
+    signedOut(result.ok ? null : "ended.logout_unconfirmed");
   }
 
   async function acknowledgeDevices(): Promise<void> {
-    await guarded(() => api.ackNewDevices());
-    session.newDevices = [];
+    error = null;
+    const result = await guarded(() => api.ackNewDevices());
+    if (result.ok) {
+      session.newDevices = [];
+    } else {
+      error = result.error;
+    }
+  }
+
+  async function acknowledgeNotice(notice: SecurityNotice): Promise<void> {
+    error = null;
+    const result = await guarded(() => api.ackSecurityNotices([notice.noticeId]));
+    if (result.ok) {
+      session.securityNotices = session.securityNotices.filter(
+        (other) => other.noticeId !== notice.noticeId,
+      );
+    } else {
+      error = result.error;
+    }
   }
 
   function reviewDevices(): void {
@@ -70,8 +91,19 @@
         </section>
       {/if}
 
-      {#if session.totpDisabledByAdmin}
-        <p class="alert warn" role="alert">{t("notice.totp_disabled_by_admin")}</p>
+      {#each session.securityNotices as notice (notice.noticeId)}
+        <section class="alert warn stack" role="alert">
+          <p>{t(`notice.${notice.kind}`, { date: formatDate(notice.createdAtMs) })}</p>
+          <div>
+            <button type="button" onclick={() => acknowledgeNotice(notice)}>
+              {t("notice.ack")}
+            </button>
+          </div>
+        </section>
+      {/each}
+
+      {#if error !== null}
+        <p class="alert error" role="alert">{errorMessage(error)}</p>
       {/if}
 
       {#if session.showHistoryNotice}

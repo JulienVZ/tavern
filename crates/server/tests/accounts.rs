@@ -17,11 +17,13 @@ mod common;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::{Account, PASSWORD, TestApp, random_handle, session_proof};
+use common::{Account, Device, PASSWORD, TestApp, random_handle, session_proof};
 use reqwest::{Method, StatusCode};
 use tavern_crypto::identity::{AccountIdentityKey, DeviceKey};
 use tavern_protocol::rest::*;
 use tavern_server::gateway::{Event, RevocationReason};
+use tavern_server::notices::{self, NoticeKind};
+use tavern_server::session::Session;
 use totp_rs::{Algorithm, Builder, Secret as TotpSecret};
 use uuid::Uuid;
 
@@ -938,10 +940,17 @@ async fn an_administrator_can_disable_a_users_totp_with_a_trace() {
     );
 
     // The user's devices are told, the action is logged, and login no longer asks for a code.
-    assert_eq!(
-        connection.events.try_recv().unwrap(),
-        Event::TotpDisabledByAdmin
-    );
+    let Event::SecurityNotice(notice) = connection.events.try_recv().unwrap() else {
+        panic!("expected a security notice");
+    };
+    assert_eq!(notice.kind, NoticeKind::TotpDisabledByAdmin);
+    // It is stored for the devices that were not connected.
+    let stored: i16 = sqlx::query_scalar("SELECT kind FROM security_notices WHERE id = $1")
+        .bind(notice.id)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(stored, NoticeKind::TotpDisabledByAdmin as i16);
     let logged: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM admin_audit_log WHERE actor_id = $1 AND target_id = $2 AND action = 5",
     )
@@ -1117,4 +1126,78 @@ async fn the_database_holds_no_password_token_or_private_key() {
         "recovery key"
     );
     assert!(!contains(invite.as_bytes()), "invitation code");
+}
+
+fn session_of(account: &Account, device: &Device) -> Session {
+    Session {
+        user_id: account.user_id,
+        device_id: device.device_id,
+        is_admin: false,
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn security_notices_are_acknowledged_per_device_and_per_account() {
+    let app = TestApp::spawn().await;
+    let (ann, ann_laptop) = app.account_with_device("ann", false).await;
+    let ann_phone = app.enrol(&ann).await;
+    let (bob, bob_laptop) = app.account_with_device("bob", false).await;
+    let state = &app.state;
+
+    // The acting device is not told; the other one is.
+    let acting = Some(ann_laptop.device_id);
+    let notice = notices::record(state, ann.user_id, NoticeKind::RecoveryKeyReplaced, acting)
+        .await
+        .unwrap();
+    let laptop = session_of(&ann, &ann_laptop);
+    let phone = session_of(&ann, &ann_phone);
+    assert_eq!(notices::pending(state, &laptop).await.unwrap(), []);
+    assert_eq!(notices::pending(state, &phone).await.unwrap(), [notice]);
+
+    // Another account neither sees it nor can acknowledge it.
+    let stranger = session_of(&bob, &bob_laptop);
+    assert_eq!(notices::pending(state, &stranger).await.unwrap(), []);
+    notices::acknowledge(state, &stranger, &[notice.id, Uuid::new_v4()])
+        .await
+        .unwrap();
+    assert_eq!(notices::pending(state, &phone).await.unwrap(), [notice]);
+
+    // Acknowledging is idempotent and concerns one device.
+    for _ in 0..2 {
+        notices::acknowledge(state, &phone, &[notice.id])
+            .await
+            .unwrap();
+    }
+    assert_eq!(notices::pending(state, &phone).await.unwrap(), []);
+
+    // A device enrolled later is not told about the past.
+    let second = notices::record(state, ann.user_id, NoticeKind::PasswordChanged, None)
+        .await
+        .unwrap();
+    let ann_tablet = app.enrol(&ann).await;
+    let tablet = session_of(&ann, &ann_tablet);
+    assert_eq!(notices::pending(state, &tablet).await.unwrap(), []);
+    assert_eq!(notices::pending(state, &laptop).await.unwrap(), [second]);
+
+    // Past the retention period a notice is no longer listed, and the next
+    // one recorded for the account deletes it.
+    sqlx::query(
+        "UPDATE security_notices SET created_at = now() - make_interval(days => $2) WHERE id = $1",
+    )
+    .bind(second.id)
+    .bind(notices::RETENTION_DAYS + 1)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(notices::pending(state, &laptop).await.unwrap(), []);
+    notices::record(state, ann.user_id, NoticeKind::DeviceRevoked, None)
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM security_notices WHERE id = $1")
+        .bind(second.id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }

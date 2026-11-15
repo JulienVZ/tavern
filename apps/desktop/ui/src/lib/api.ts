@@ -102,11 +102,27 @@ export type SessionEndReason =
   | "invalid"
   | "replaced";
 
+/** `other` is a kind introduced by an instance newer than this client. */
+export type SecurityNoticeKind =
+  | "totp_disabled_by_admin"
+  | "password_changed"
+  | "account_recovered"
+  | "device_revoked"
+  | "recovery_key_replaced"
+  | "other";
+
+/** Something security-relevant that happened to the account. */
+export interface SecurityNotice {
+  noticeId: string;
+  kind: SecurityNoticeKind;
+  createdAtMs: number;
+}
+
 export type GatewayEvent =
-  | { type: "connected"; newDevices: string[] }
+  | { type: "connected"; newDevices: string[]; securityNotices: SecurityNotice[] }
   | { type: "device_added"; deviceId: string }
   | { type: "device_removed"; deviceId: string }
-  | { type: "totp_disabled_by_admin" }
+  | { type: "security_notice"; notice: SecurityNotice }
   | { type: "disconnected" }
   | { type: "session_ended"; reason: SessionEndReason };
 
@@ -151,6 +167,8 @@ export const api = {
   devices: () => invoke<Device[]>("devices"),
   revokeDevice: (deviceId: string) => invoke<void>("revoke_device", { deviceId }),
   ackNewDevices: () => invoke<void>("ack_new_devices"),
+  ackSecurityNotices: (noticeIds: string[]) =>
+    invoke<void>("ack_security_notices", { noticeIds }),
   totpEnable: () => invoke<TotpEnrolment>("totp_enable"),
   totpConfirm: (code: string) => invoke<string[]>("totp_confirm", { code }),
   totpDisable: (code: string) => invoke<void>("totp_disable", { code }),

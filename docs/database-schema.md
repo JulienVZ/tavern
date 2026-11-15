@@ -112,6 +112,23 @@ CREATE TABLE admin_audit_log (
     created_at  timestamptz NOT NULL DEFAULT now()           -- META
 );
 CREATE INDEX admin_audit_log_created_idx ON admin_audit_log (created_at);
+
+-- Security-relevant events of an account, kept until each device has shown them (ADR 0016).
+CREATE TABLE security_notices (
+    id          uuid PRIMARY KEY DEFAULT uuidv7(),           -- META
+    user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, -- META  the account concerned
+    kind        smallint NOT NULL,                           -- META  enum: TOTP disabled by an admin, password changed, ...
+    created_at  timestamptz NOT NULL DEFAULT now()           -- META
+);
+CREATE INDEX security_notices_user_idx ON security_notices (user_id, created_at);
+
+-- One row per device that dismissed a notice.
+CREATE TABLE security_notice_acks (
+    notice_id   uuid NOT NULL REFERENCES security_notices(id) ON DELETE CASCADE, -- META
+    device_id   uuid NOT NULL REFERENCES devices(id) ON DELETE CASCADE, -- META
+    acked_at    timestamptz NOT NULL DEFAULT now(),          -- META
+    PRIMARY KEY (notice_id, device_id)
+);
 ```
 
 Handles are stored in lower case; the format is enforced by a constraint, so no extension is needed.
@@ -119,6 +136,8 @@ Handles are stored in lower case; the format is enforced by a constraint, so no 
 In-flight OPAQUE state, enrolment tokens, session challenges and rate limiter counters stay in memory and are not persisted. Client IP addresses are never written to the database.
 
 `admin_audit_log` records instance-level actions such as an administrator disabling a user's TOTP. It holds identifiers and an action code only.
+
+`security_notices` holds what each device of an account must tell its user: TOTP disabled by an administrator (1), password changed (2), account recovered with the recovery key (3), device revoked (4), recovery key replaced (5). A row is an account, a kind and a date: no text, no device, no address. `security_notice_acks` records which devices dismissed which notice. Notices are deleted 90 days after the event, when the next one is recorded for the account ([ADR 0016](adr/0016-security-notices.md)).
 
 Profile fields added at M5 (`bio`, `custom_status`, `avatar_blob_id`, `banner_blob_id`) are `META` in v1 and become `E2EE` if [ADR 0008](adr/0008-encrypted-profiles.md) is implemented.
 

@@ -23,7 +23,9 @@ pub use account::{
     Client, InstanceClient, LoginStep, NewAccount, PendingTotp, Registered, SignedIn,
 };
 pub use error::ClientError;
-pub use gateway::{Gateway, GatewayEvent, NewDevice, SessionEnd};
+pub use gateway::{
+    Gateway, GatewayEvent, NewDevice, SecurityNotice, SecurityNoticeKind, SessionEnd,
+};
 pub use instance::{
     Compatibility, InstanceUrl, InstanceUrlError, compatibility, fetch_health, fetch_version,
 };

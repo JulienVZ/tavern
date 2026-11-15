@@ -16,7 +16,8 @@ use tavern_protocol::rest::{
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiJson, ApiResult};
-use crate::gateway::{Event, RevocationReason};
+use crate::gateway::RevocationReason;
+use crate::notices::{self, NoticeKind};
 use crate::session::{self, Session};
 use crate::{AppState, totp};
 
@@ -345,7 +346,8 @@ pub(crate) async fn enable_user(
 /// TOTP is a server-side check, so an administrator removing it does not give
 /// access to anything the server could not already reach: the password is
 /// still required, and the wrapped account key is protected by the password,
-/// not by TOTP. Every device of the user is told, and the action is recorded.
+/// not by TOTP. Every device of the user is told, at once or at its next
+/// connection, and the action is recorded.
 #[utoipa::path(
     post,
     path = "/v1/admin/users/{user_id}/totp/disable",
@@ -369,9 +371,7 @@ pub(crate) async fn disable_user_totp(
         Some(user_id),
     )
     .await?;
-    state
-        .gateway
-        .notify_user(user_id, None, Event::TotpDisabledByAdmin);
+    notices::record(&state, user_id, NoticeKind::TotpDisabledByAdmin, None).await?;
     tracing::warn!(admin = %session.user_id, %user_id, "TOTP disabled by an administrator");
     Ok(StatusCode::NO_CONTENT)
 }

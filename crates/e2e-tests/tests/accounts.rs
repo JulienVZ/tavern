@@ -80,7 +80,8 @@ async fn a_user_registers_with_an_invitation_and_logs_in_from_two_devices() {
     assert_eq!(
         next_event(&mut laptop_events).await,
         GatewayEvent::Connected {
-            new_devices: Vec::new()
+            new_devices: Vec::new(),
+            security_notices: Vec::new(),
         }
     );
 
@@ -155,7 +156,7 @@ async fn a_device_that_was_away_learns_about_new_devices_when_it_reconnects() {
     let (desktop_client, _) = login(&server.new_computer(), &handle).await;
 
     let (gateway, mut events) = laptop_client.connect_gateway().unwrap();
-    let GatewayEvent::Connected { new_devices } = next_event(&mut events).await else {
+    let GatewayEvent::Connected { new_devices, .. } = next_event(&mut events).await else {
         panic!("expected Connected");
     };
     assert_eq!(new_devices.len(), 1);
@@ -171,7 +172,8 @@ async fn a_device_that_was_away_learns_about_new_devices_when_it_reconnects() {
     assert_eq!(
         next_event(&mut events).await,
         GatewayEvent::Connected {
-            new_devices: Vec::new()
+            new_devices: Vec::new(),
+            security_notices: Vec::new(),
         }
     );
 }

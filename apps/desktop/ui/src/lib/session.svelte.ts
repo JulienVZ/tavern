@@ -4,7 +4,14 @@
 // A password is kept here for the few seconds between "create my account"
 // and the first sign-in that follows the recovery key screen, then erased.
 
-import { api, toCommandError, type Account, type GatewayEvent, type LoginResult } from "./api";
+import {
+  api,
+  toCommandError,
+  type Account,
+  type GatewayEvent,
+  type LoginResult,
+  type SecurityNotice,
+} from "./api";
 import type { MessageKey } from "./i18n";
 
 export type Screen = "instance" | "auth" | "recovery" | "totp" | "home";
@@ -31,8 +38,8 @@ export const session = $state({
   newDevices: [] as string[],
   /** The real-time connection is down. */
   offline: false,
-  /** An administrator disabled TOTP on the account. */
-  totpDisabledByAdmin: false,
+  /** Security notices of the account that this device has not acknowledged. */
+  securityNotices: [] as SecurityNotice[],
   /** Why the user is back on the sign-in screen, if the instance ended the session. */
   endedMessage: null as MessageKey | null,
 });
@@ -48,6 +55,7 @@ export function applyLogin(result: LoginResult): void {
   session.registration = null;
   session.endedMessage = null;
   session.newDevices = [];
+  session.securityNotices = [];
   session.offline = false;
   session.screen = "home";
 }
@@ -61,7 +69,7 @@ export function signedOut(reason: MessageKey | null): void {
   session.registration = null;
   session.newDevices = [];
   session.showHistoryNotice = false;
-  session.totpDisabledByAdmin = false;
+  session.securityNotices = [];
   session.offline = false;
   session.endedMessage = reason;
   session.screen = session.instanceUrl === "" ? "instance" : "auth";
@@ -82,6 +90,8 @@ export function handleGatewayEvent(event: GatewayEvent): void {
     case "connected":
       session.offline = false;
       addNewDevices(event.newDevices);
+      // The instance lists everything this device has not acknowledged.
+      session.securityNotices = event.securityNotices;
       break;
     case "device_added":
       addNewDevices([event.deviceId]);
@@ -89,9 +99,11 @@ export function handleGatewayEvent(event: GatewayEvent): void {
     case "device_removed":
       session.newDevices = session.newDevices.filter((id) => id !== event.deviceId);
       break;
-    case "totp_disabled_by_admin":
-      session.totpDisabledByAdmin = true;
-      if (session.account !== null) {
+    case "security_notice":
+      if (!session.securityNotices.some((known) => known.noticeId === event.notice.noticeId)) {
+        session.securityNotices.push(event.notice);
+      }
+      if (event.notice.kind === "totp_disabled_by_admin" && session.account !== null) {
         session.account.totpEnabled = false;
       }
       break;

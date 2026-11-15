@@ -31,6 +31,7 @@ use super::auth::{finish_login, start_login};
 use super::{exchange_id, parse_handle};
 use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::gateway::RevocationReason;
+use crate::notices::{self, NoticeKind};
 use crate::session::{self, Session};
 use crate::{AppState, CLIENT_TOKEN_LEN, CredentialChange, ExchangeId, totp};
 
@@ -240,6 +241,15 @@ pub(crate) async fn password_finish(
         .map_err(|_| malformed())?;
 
     store_password(&state, session.user_id, &record, wrapped).await?;
+    // Not pushed: the other devices are signed out below, and read the
+    // notice when their user signs in again.
+    notices::store(
+        &state,
+        session.user_id,
+        NoticeKind::PasswordChanged,
+        Some(session.device_id),
+    )
+    .await?;
     session::revoke_all(
         &state,
         session.user_id,
@@ -308,6 +318,13 @@ pub(crate) async fn rotate_recovery_key(
         .bind(wrapped)
         .execute(&state.db)
         .await?;
+    notices::record(
+        &state,
+        session.user_id,
+        NoticeKind::RecoveryKeyReplaced,
+        Some(session.device_id),
+    )
+    .await?;
     tracing::info!(user_id = %session.user_id, "recovery key replaced");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -426,6 +443,8 @@ pub(crate) async fn recover_finish(
         .map_err(|_| malformed())?;
 
     store_password(&state, user_id, &record, wrapped).await?;
+    // Not pushed: every device is signed out below.
+    notices::store(&state, user_id, NoticeKind::AccountRecovered, None).await?;
     session::revoke_all(&state, user_id, None, RevocationReason::CredentialsChanged).await?;
     tracing::info!(%user_id, "account recovered with the recovery key");
     Ok(StatusCode::NO_CONTENT)

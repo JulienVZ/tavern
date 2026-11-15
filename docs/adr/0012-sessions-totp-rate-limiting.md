@@ -33,7 +33,7 @@ OPAQUE login state, pending TOTP steps, enrolment tokens and challenges are kept
 - Ten recovery codes (128 random bits each) are issued when TOTP is confirmed, stored as hashes, single use.
 - Five wrong codes close a login; it must be restarted from the password.
 - TOTP is enforced by the server. It protects a stolen password from being used over the network. It does not protect the wrapped account key from someone who controls the server; the threat model says so.
-- **An administrator can disable a user's TOTP** (`POST /v1/admin/users/{id}/totp/disable`) for a user who lost both the authenticator and the recovery codes. Because TOTP is a server-side check, this gives the administrator nothing they could not already obtain by other means. The user's devices are notified and the action is recorded.
+- **An administrator can disable a user's TOTP** (`POST /v1/admin/users/{id}/totp/disable`) for a user who lost both the authenticator and the recovery codes. Because TOTP is a server-side check, this gives the administrator nothing they could not already obtain by other means. The user's devices are notified, including those that are offline at that moment ([ADR 0016](0016-security-notices.md)), and the action is recorded.
 
 ### Rate limiting
 

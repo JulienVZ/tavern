@@ -31,8 +31,15 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 
 /// Minor version of the gateway protocol implemented by this crate.
 ///
-/// Incremented on every additive change within a major version.
-pub const GATEWAY_MINOR_VERSION: u32 = 0;
+/// Incremented on every additive change within a major version. History:
+///
+/// - 0: session, heartbeat, device list (M1);
+/// - 1: persisted security notices, replayed in `Ready` and acknowledged per
+///   device.
+pub const GATEWAY_MINOR_VERSION: u32 = 1;
+
+/// Largest number of notices one `AckSecurityNotices` frame may name.
+pub const MAX_SECURITY_NOTICE_ACKS: usize = 64;
 
 /// Major version of the REST API implemented by this crate (the `/v1` prefix).
 pub const REST_MAJOR_VERSION: u32 = 1;

@@ -7,7 +7,8 @@
 //! 1. the client opens the socket with the `tavern.v1` subprotocol;
 //! 2. it sends `Hello` with its session token within ten seconds;
 //! 3. the server answers `Ready`, which lists the devices enrolled since this
-//!    device last acknowledged the list;
+//!    device last acknowledged the list, and the security notices it has not
+//!    acknowledged;
 //! 4. the client sends `Heartbeat` every thirty seconds; the server checks on
 //!    each one that the session is still valid;
 //! 5. the server pushes events from the [`Registry`](crate::gateway::Registry).
@@ -27,13 +28,15 @@ use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_protocol::{
     DEFAULT_MAX_FRAME_BYTES, GATEWAY_HEARTBEAT_INTERVAL_MS, GATEWAY_HEARTBEAT_TIMEOUT_MS,
-    GATEWAY_HELLO_DEADLINE_MS, GATEWAY_MINOR_VERSION, GATEWAY_SUBPROTOCOL, close_code,
+    GATEWAY_HELLO_DEADLINE_MS, GATEWAY_MINOR_VERSION, GATEWAY_SUBPROTOCOL,
+    MAX_SECURITY_NOTICE_ACKS, close_code,
 };
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::error::ApiResult;
 use crate::gateway::{Event, RevocationReason};
+use crate::notices;
 use crate::session::{self, Session};
 
 /// Largest application message announced to clients (used from milestone M2).
@@ -205,8 +208,16 @@ async fn serve(state: AppState, socket: WebSocket) {
         return;
     };
 
-    // Subscribe before answering, so that no event is lost in between.
+    // Subscribe before reading the pending notices, so that none is lost in
+    // between: one recorded meanwhile arrives twice, and clients go by its id.
     let mut subscription = state.gateway.connect(session.user_id, session.device_id);
+    let Ok(security_notices) = notices::pending(&state, &session).await else {
+        state
+            .gateway
+            .disconnect(session.device_id, subscription.generation);
+        close(socket, close_code::AUTHENTICATION_FAILED).await;
+        return;
+    };
     let ready = proto::Ready {
         user_id: session.user_id.as_bytes().to_vec(),
         device_id: session.device_id.as_bytes().to_vec(),
@@ -221,6 +232,10 @@ async fn serve(state: AppState, socket: WebSocket) {
         mls_external_sender_key: state.secrets.external_sender.public_bytes().to_vec(),
         key_packages_remaining: 0,
         new_devices,
+        security_notices: security_notices
+            .into_iter()
+            .map(notices::Notice::to_proto)
+            .collect(),
     };
 
     let close_with = if socket
@@ -287,6 +302,9 @@ async fn run(
                             ServerPayload::Ack(proto::Ack {})
                         }
                     }
+                    Some(ClientPayload::AckSecurityNotices(ack)) => {
+                        acknowledge_notices(state, session, &ack.notice_ids).await
+                    }
                     // A second Hello makes no sense on an open connection.
                     Some(ClientPayload::Hello(_)) => ServerPayload::Error(proto::Error {
                         code: proto::ErrorCode::InvalidArgument.into(),
@@ -321,6 +339,36 @@ async fn run(
     }
 }
 
+fn error(code: proto::ErrorCode, message: &str) -> ServerPayload {
+    ServerPayload::Error(proto::Error {
+        code: code.into(),
+        message: message.to_owned(),
+        retry_after_ms: 0,
+    })
+}
+
+/// Handles `AckSecurityNotices`: bounded, and every identifier must be a UUID.
+async fn acknowledge_notices(
+    state: &AppState,
+    session: &Session,
+    notice_ids: &[Vec<u8>],
+) -> ServerPayload {
+    if notice_ids.len() > MAX_SECURITY_NOTICE_ACKS {
+        return error(proto::ErrorCode::InvalidArgument, "too many notices");
+    }
+    let ids: Option<Vec<Uuid>> = notice_ids
+        .iter()
+        .map(|bytes| Uuid::from_slice(bytes).ok())
+        .collect();
+    let Some(ids) = ids else {
+        return error(proto::ErrorCode::InvalidArgument, "invalid notice id");
+    };
+    match notices::acknowledge(state, session, &ids).await {
+        Ok(()) => ServerPayload::Ack(proto::Ack {}),
+        Err(_) => error(proto::ErrorCode::Internal, "internal error"),
+    }
+}
+
 /// Whether the session behind a connection still exists and is usable.
 async fn session_is_live(state: &AppState, session: &Session) -> bool {
     let live: Result<bool, sqlx::Error> = sqlx::query_scalar(
@@ -347,12 +395,7 @@ fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
             }),
             None,
         ),
-        Event::TotpDisabledByAdmin => (
-            ServerPayload::SecurityNotice(proto::SecurityNotice {
-                kind: proto::SecurityNoticeKind::TotpDisabledByAdmin.into(),
-            }),
-            None,
-        ),
+        Event::SecurityNotice(notice) => (ServerPayload::SecurityNotice(notice.to_proto()), None),
         Event::SessionRevoked(reason) => {
             let (reason, code) = match reason {
                 RevocationReason::Revoked => (
@@ -397,7 +440,12 @@ mod tests {
             .1,
             None
         );
-        assert_eq!(event_payload(Event::TotpDisabledByAdmin).1, None);
+        let notice = notices::Notice {
+            id: Uuid::from_u128(9),
+            kind: notices::NoticeKind::PasswordChanged,
+            created_at_ms: 1,
+        };
+        assert_eq!(event_payload(Event::SecurityNotice(notice)).1, None);
         assert_eq!(
             event_payload(Event::SessionRevoked(RevocationReason::Revoked)).1,
             Some(close_code::SESSION_REVOKED)

@@ -21,6 +21,7 @@ message ClientFrame {
     Hello hello = 10;
     Heartbeat heartbeat = 11;
     AckDeviceList ack_device_list = 12;
+    AckSecurityNotices ack_security_notices = 13;
   }
 }
 
@@ -63,6 +64,10 @@ message Ready {
   // device list. The client shows them to the user, with a way to revoke
   // them, then sends AckDeviceList.
   repeated DeviceSummary new_devices = 8;
+  // Security notices of the account that this device has not acknowledged,
+  // oldest first. The client shows them until the user dismisses them, then
+  // sends AckSecurityNotices. Since minor 1.
+  repeated SecurityNotice security_notices = 9;
 }
 
 message DeviceSummary {
@@ -109,15 +114,37 @@ message DeviceListChanged {
   bool added = 2;
 }
 
-// Something security-relevant happened to the account.
+// Something security-relevant happened to the account. Pushed to the
+// connected devices as an event, and listed again in Ready for every device
+// that has not acknowledged it. It carries a kind and a date, never text.
 message SecurityNotice {
   SecurityNoticeKind kind = 1;
+  // Identifies the notice in AckSecurityNotices. Since minor 1.
+  bytes notice_id = 2;
+  // Since minor 1.
+  uint64 created_at_ms = 3;
 }
 
+// A client shows a kind it does not know as a generic notice.
 enum SecurityNoticeKind {
   SECURITY_NOTICE_KIND_UNSPECIFIED = 0;
   // An administrator disabled TOTP on this account.
   SECURITY_NOTICE_KIND_TOTP_DISABLED_BY_ADMIN = 1;
+  // The password was changed. The other devices were signed out.
+  SECURITY_NOTICE_KIND_PASSWORD_CHANGED = 2;
+  // The account was recovered with the recovery key: new password, every
+  // device signed out.
+  SECURITY_NOTICE_KIND_ACCOUNT_RECOVERED = 3;
+  // A device of the account was revoked.
+  SECURITY_NOTICE_KIND_DEVICE_REVOKED = 4;
+  // The recovery key was replaced; the previous one stopped working.
+  SECURITY_NOTICE_KIND_RECOVERY_KEY_REPLACED = 5;
+}
+
+// The user dismissed these notices on this device. Unknown identifiers are
+// ignored. At most 64 per frame. Since minor 1.
+message AckSecurityNotices {
+  repeated bytes notice_ids = 1;
 }
 
 message Limits {

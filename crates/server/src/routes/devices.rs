@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::error::{ApiError, ApiJson, ApiResult, is_unique_violation};
 use crate::gateway::{Event, RevocationReason};
+use crate::notices::{self, NoticeKind};
 use crate::session::{self, EnrolmentAuth, Session};
 
 /// Active devices allowed per account.
@@ -249,12 +250,19 @@ pub(crate) async fn revoke(
         .bind(device_id)
         .execute(&mut *tx)
         .await?;
+    // The user's other devices are told, including those that are offline.
+    let acting = Some(session.device_id);
+    let notice =
+        notices::insert(&mut tx, session.user_id, NoticeKind::DeviceRevoked, acting).await?;
     tx.commit().await?;
 
     tracing::info!(user_id = %session.user_id, %device_id, "device revoked");
     state
         .gateway
         .notify_device(device_id, Event::SessionRevoked(RevocationReason::Revoked));
+    // After the revocation: the connection of the revoked device is closing,
+    // so the notice reaches the remaining devices only.
+    notices::publish(&state, session.user_id, notice, acting);
     state.gateway.notify_user(
         session.user_id,
         Some(device_id),

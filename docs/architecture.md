@@ -248,6 +248,8 @@ Joining a server gives access to several channels at once. The planned mechanism
 
 Each enrolment of a device is announced: the account's other devices receive `DeviceListChanged` and show a notification with a revoke action, and contacts see a notice in shared conversations.
 
+Other security-relevant changes to an account (TOTP disabled by an administrator, password changed, account recovered, device revoked, recovery key replaced) are stored as security notices and shown on every device of the account until dismissed there, including devices that were offline or signed out ([ADR 0016](adr/0016-security-notices.md)).
+
 ### 3.6 Removing a member (kick, ban, role change, revoked device)
 
 ```mermaid

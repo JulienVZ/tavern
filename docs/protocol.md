@@ -108,7 +108,7 @@ Rules:
 2. It sends `Hello` within 10 seconds, otherwise the server closes with 4001.
 3. The server answers `Ready`, or `Error` followed by a close.
 4. The client sends `Heartbeat` every 30 seconds. The server closes a connection that has been silent for 75 seconds.
-5. On every `Heartbeat` the server checks that the session is still valid, and closes with 4003 when it is not. `Ready` lists the devices enrolled while this device was away; the client shows them, then sends `AckDeviceList`.
+5. On every `Heartbeat` the server checks that the session is still valid, and closes with 4003 when it is not. `Ready` lists the devices enrolled while this device was away; the client shows them, then sends `AckDeviceList`. `Ready` also lists the security notices this device has not acknowledged; the client shows them until the user dismisses them, then sends `AckSecurityNotices`.
 6. From M2: after `Ready`, the client catches up: for each conversation, `FetchMessages` from its last acknowledged sequence number. Pending welcomes are re-sent by the server as `WelcomeEvent` until acknowledged.
 7. On disconnect the client reconnects with exponential backoff and jitter (1 s up to 60 s). It does not reconnect after 4002 or 4003: the session is gone and the user must log in again.
 
@@ -187,6 +187,9 @@ message Ready {
   uint32 key_packages_remaining = 7;
   // Devices enrolled since this device last sent AckDeviceList.
   repeated DeviceSummary new_devices = 8;
+  // Security notices this device has not acknowledged, oldest first, at
+  // most 32. Since minor 1.
+  repeated SecurityNotice security_notices = 9;
 }
 
 message DeviceSummary {
@@ -230,10 +233,40 @@ message DeviceListChanged {
   bool added = 2;
 }
 
-// Something security-relevant happened to the account, e.g. an administrator
-// disabled its TOTP.
-message SecurityNotice { SecurityNoticeKind kind = 1; }
+// Something security-relevant happened to the account. Sent as an event to
+// the connected devices, and listed in Ready for every device that has not
+// acknowledged it. A kind and a date, never text.
+message SecurityNotice {
+  SecurityNoticeKind kind = 1;
+  bytes notice_id = 2;        // since minor 1
+  uint64 created_at_ms = 3;   // since minor 1
+}
+// TOTP_DISABLED_BY_ADMIN | PASSWORD_CHANGED | ACCOUNT_RECOVERED
+// | DEVICE_REVOKED | RECOVERY_KEY_REPLACED
+
+// The user dismissed these notices on this device. At most 64 identifiers;
+// unknown ones are ignored. Answered with Ack. Since minor 1.
+message AckSecurityNotices { repeated bytes notice_ids = 1; }
 ```
+
+#### Security notices
+
+Minor version 1 of the gateway. Each event below is stored for the account and reaches every device that existed when it happened, whether it was connected or not ([ADR 0016](adr/0016-security-notices.md)):
+
+| Kind | Recorded when | Not shown to | Pushed to connected devices |
+|---|---|---|---|
+| `TOTP_DISABLED_BY_ADMIN` | An administrator disables the account's TOTP | nobody | yes |
+| `PASSWORD_CHANGED` | The password is changed | the device that changed it | no: they are signed out, and read it from `Ready` after signing in again |
+| `ACCOUNT_RECOVERED` | The recovery key is used to set a new password | nobody | no: every device is signed out |
+| `DEVICE_REVOKED` | A device of the account is revoked | the device that revoked it | yes |
+| `RECOVERY_KEY_REPLACED` | The recovery key is replaced | the device that replaced it | yes |
+
+- A device acknowledges for itself only: a notice dismissed on one device stays on the others.
+- A device is not told about what happened before it was enrolled.
+- A notice is listed for 90 days at most.
+- A client shows a kind it does not know as a generic notice; it never drops it.
+- A notice without `notice_id` (a server older than minor 1) cannot be acknowledged and is not shown.
+- Enrolments are not notices: they use `Ready.new_devices` and `DeviceListChanged`, which carry the device to revoke.
 
 ## 5. Messages for M2 (friends and encrypted DMs)
 
@@ -503,6 +536,7 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | Pending TOTP step | 5 min, 5 wrong codes |
 | Enrolment token | 5 min |
 | `FetchMessages` page | 200 messages |
+| Security notices | 32 listed in `Ready`, 64 identifiers per `AckSecurityNotices`, kept 90 days |
 | Gateway requests per device | 30 per 10 s sustained, burst 60 |
 | Typing updates | 1 per 3 s per conversation |
 | Auth routes | 30 per minute per client address, 5 per minute per handle |

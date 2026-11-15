@@ -5692,6 +5692,7 @@ name = "tavern-e2e-tests"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "sqlx",
  "tavern-client-core",
  "tavern-crypto",
  "tavern-protocol",

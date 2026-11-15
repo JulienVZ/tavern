@@ -22,7 +22,7 @@ use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_protocol::rest::B64;
 use tavern_protocol::{
     DEFAULT_MAX_FRAME_BYTES, GATEWAY_HEARTBEAT_INTERVAL_MS, GATEWAY_HEARTBEAT_TIMEOUT_MS,
-    GATEWAY_MINOR_VERSION, GATEWAY_SUBPROTOCOL, close_code,
+    GATEWAY_MINOR_VERSION, GATEWAY_SUBPROTOCOL, MAX_SECURITY_NOTICE_ACKS, close_code,
 };
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -67,6 +67,60 @@ pub struct NewDevice {
     pub created_at_ms: u64,
 }
 
+/// What a security notice reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityNoticeKind {
+    /// An administrator disabled TOTP on the account.
+    TotpDisabledByAdmin,
+    /// The password was changed.
+    PasswordChanged,
+    /// The account was recovered with the recovery key.
+    AccountRecovered,
+    /// A device of the account was revoked.
+    DeviceRevoked,
+    /// The recovery key was replaced.
+    RecoveryKeyReplaced,
+    /// A kind introduced by an instance newer than this client. Still shown:
+    /// the user must know that something happened.
+    Other,
+}
+
+/// Something security-relevant that happened to the account. The user must
+/// be told, then [`Gateway::ack_security_notices`] called, on every device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecurityNotice {
+    /// Identifies the notice when acknowledging it.
+    pub notice_id: Uuid,
+    /// What happened.
+    pub kind: SecurityNoticeKind,
+    /// When, in milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+}
+
+impl SecurityNotice {
+    /// `None` for a notice without a usable identifier: it could not be
+    /// acknowledged, so it is not shown.
+    fn from_proto(notice: &proto::SecurityNotice) -> Option<Self> {
+        let kind = match proto::SecurityNoticeKind::try_from(notice.kind) {
+            Ok(proto::SecurityNoticeKind::TotpDisabledByAdmin) => {
+                SecurityNoticeKind::TotpDisabledByAdmin
+            }
+            Ok(proto::SecurityNoticeKind::PasswordChanged) => SecurityNoticeKind::PasswordChanged,
+            Ok(proto::SecurityNoticeKind::AccountRecovered) => SecurityNoticeKind::AccountRecovered,
+            Ok(proto::SecurityNoticeKind::DeviceRevoked) => SecurityNoticeKind::DeviceRevoked,
+            Ok(proto::SecurityNoticeKind::RecoveryKeyReplaced) => {
+                SecurityNoticeKind::RecoveryKeyReplaced
+            }
+            Ok(proto::SecurityNoticeKind::Unspecified) | Err(_) => SecurityNoticeKind::Other,
+        };
+        Some(Self {
+            notice_id: uuid(&notice.notice_id)?,
+            kind,
+            created_at_ms: notice.created_at_ms,
+        })
+    }
+}
+
 /// What the gateway tells the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayEvent {
@@ -76,14 +130,17 @@ pub enum GatewayEvent {
     Connected {
         /// Devices the user has not been told about yet.
         new_devices: Vec<NewDevice>,
+        /// Every security notice this device has not acknowledged, including
+        /// those already announced by [`GatewayEvent::SecurityNotice`].
+        security_notices: Vec<SecurityNotice>,
     },
     /// A device was just enrolled on the account. The user must be notified
     /// and offered to revoke it.
     DeviceAdded(Uuid),
     /// A device of the account was revoked.
     DeviceRemoved(Uuid),
-    /// An administrator disabled TOTP on the account.
-    TotpDisabledByAdmin,
+    /// Something security-relevant just happened to the account.
+    SecurityNotice(SecurityNotice),
     /// The connection dropped; the gateway is reconnecting.
     Disconnected,
     /// The session ended. The gateway stopped; the user must log in again.
@@ -93,6 +150,7 @@ pub enum GatewayEvent {
 #[derive(Debug)]
 enum Command {
     AckDeviceList,
+    AckSecurityNotices(Vec<Uuid>),
 }
 
 /// Handle to the background connection. Dropping it closes the connection.
@@ -130,6 +188,19 @@ impl Gateway {
             .send(Command::AckDeviceList)
             .await
             .map_err(|_| ClientError::Interrupted)
+    }
+
+    /// Tells the instance that the user dismissed these notices on this
+    /// device, so that they are not listed at the next connection.
+    pub async fn ack_security_notices(&self, notice_ids: &[Uuid]) -> Result<(), ClientError> {
+        // One frame names a bounded number of notices.
+        for chunk in notice_ids.chunks(MAX_SECURITY_NOTICE_ACKS) {
+            self.commands
+                .send(Command::AckSecurityNotices(chunk.to_vec()))
+                .await
+                .map_err(|_| ClientError::Interrupted)?;
+        }
+        Ok(())
     }
 }
 
@@ -282,8 +353,16 @@ async fn connection(
             })
         })
         .collect();
+    let security_notices = ready
+        .security_notices
+        .iter()
+        .filter_map(SecurityNotice::from_proto)
+        .collect();
     if events
-        .send(GatewayEvent::Connected { new_devices })
+        .send(GatewayEvent::Connected {
+            new_devices,
+            security_notices,
+        })
         .await
         .is_err()
     {
@@ -311,14 +390,22 @@ async fn connection(
                 }
             }
             command = commands.recv() => {
-                let Some(Command::AckDeviceList) = command else {
-                    let _ = socket.close(None).await;
-                    return Ended::Stopped;
+                let payload = match command {
+                    Some(Command::AckDeviceList) => {
+                        ClientPayload::AckDeviceList(proto::AckDeviceList {})
+                    }
+                    Some(Command::AckSecurityNotices(ids)) => {
+                        ClientPayload::AckSecurityNotices(proto::AckSecurityNotices {
+                            notice_ids: ids.iter().map(|id| id.as_bytes().to_vec()).collect(),
+                        })
+                    }
+                    None => {
+                        let _ = socket.close(None).await;
+                        return Ended::Stopped;
+                    }
                 };
                 request_id += 1;
-                let frame =
-                    encode(request_id, ClientPayload::AckDeviceList(proto::AckDeviceList {}));
-                if socket.send(frame).await.is_err() {
+                if socket.send(encode(request_id, payload)).await.is_err() {
                     return Ended::Dropped;
                 }
             }
@@ -337,9 +424,9 @@ async fn connection(
                             }
                         })
                     }
-                    Some(ServerPayload::SecurityNotice(notice)) => (notice.kind
-                        == i32::from(proto::SecurityNoticeKind::TotpDisabledByAdmin))
-                    .then_some(GatewayEvent::TotpDisabledByAdmin),
+                    Some(ServerPayload::SecurityNotice(notice)) => {
+                        SecurityNotice::from_proto(&notice).map(GatewayEvent::SecurityNotice)
+                    }
                     Some(ServerPayload::SessionRevoked(revoked)) => {
                         return Ended::Session(session_end(revoked.reason));
                     }
@@ -390,6 +477,34 @@ mod tests {
         ] {
             assert_eq!(session_end_for_close(code), None, "{code:?}");
         }
+    }
+
+    #[test]
+    fn notices_of_an_unknown_kind_are_still_shown() {
+        let id = Uuid::from_u128(3);
+        let notice = |kind: i32| proto::SecurityNotice {
+            kind,
+            notice_id: id.as_bytes().to_vec(),
+            created_at_ms: 42,
+        };
+        let kind = |value: i32| SecurityNotice::from_proto(&notice(value)).map(|n| n.kind);
+
+        assert_eq!(kind(1), Some(SecurityNoticeKind::TotpDisabledByAdmin));
+        assert_eq!(kind(2), Some(SecurityNoticeKind::PasswordChanged));
+        assert_eq!(kind(3), Some(SecurityNoticeKind::AccountRecovered));
+        assert_eq!(kind(4), Some(SecurityNoticeKind::DeviceRevoked));
+        assert_eq!(kind(5), Some(SecurityNoticeKind::RecoveryKeyReplaced));
+        assert_eq!(kind(0), Some(SecurityNoticeKind::Other));
+        assert_eq!(kind(99), Some(SecurityNoticeKind::Other));
+
+        // A notice that cannot be acknowledged (an instance older than minor
+        // 1 sends no identifier) is dropped rather than shown for ever.
+        let unidentified = proto::SecurityNotice {
+            kind: 1,
+            notice_id: Vec::new(),
+            created_at_ms: 0,
+        };
+        assert_eq!(SecurityNotice::from_proto(&unidentified), None);
     }
 
     #[test]

@@ -19,8 +19,8 @@ use tavern_client_core::password::{self, PasswordStrength};
 use tavern_client_core::qr::{self, QrMatrix};
 use tavern_client_core::{
     Client, ClientError, Compatibility, Gateway, GatewayEvent, InstanceClient, InstanceUrl,
-    KeychainStore, LoginStep, NewAccount, PendingTotp, SecretStore, SessionEnd, SignedIn,
-    compatibility, fetch_health, fetch_version,
+    KeychainStore, LoginStep, NewAccount, PendingTotp, SecretStore, SecurityNotice,
+    SecurityNoticeKind, SessionEnd, SignedIn, compatibility, fetch_health, fetch_version,
 };
 use tavern_protocol::rest::{
     AdminUser, CreatedInvite, DeviceInfo, HealthResponse, InviteInfo, Platform,
@@ -131,6 +131,32 @@ impl From<DeviceInfo> for DeviceView {
     }
 }
 
+/// A security notice, as sent to the webview.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecurityNoticeView {
+    notice_id: Uuid,
+    kind: &'static str,
+    created_at_ms: u64,
+}
+
+impl From<SecurityNotice> for SecurityNoticeView {
+    fn from(notice: SecurityNotice) -> Self {
+        Self {
+            notice_id: notice.notice_id,
+            kind: match notice.kind {
+                SecurityNoticeKind::TotpDisabledByAdmin => "totp_disabled_by_admin",
+                SecurityNoticeKind::PasswordChanged => "password_changed",
+                SecurityNoticeKind::AccountRecovered => "account_recovered",
+                SecurityNoticeKind::DeviceRevoked => "device_revoked",
+                SecurityNoticeKind::RecoveryKeyReplaced => "recovery_key_replaced",
+                SecurityNoticeKind::Other => "other",
+            },
+            created_at_ms: notice.created_at_ms,
+        }
+    }
+}
+
 /// A gateway notification, as sent to the webview.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -138,6 +164,7 @@ enum GatewayView {
     #[serde(rename_all = "camelCase")]
     Connected {
         new_devices: Vec<Uuid>,
+        security_notices: Vec<SecurityNoticeView>,
     },
     #[serde(rename_all = "camelCase")]
     DeviceAdded {
@@ -147,7 +174,9 @@ enum GatewayView {
     DeviceRemoved {
         device_id: Uuid,
     },
-    TotpDisabledByAdmin,
+    SecurityNotice {
+        notice: SecurityNoticeView,
+    },
     Disconnected,
     SessionEnded {
         reason: &'static str,
@@ -157,15 +186,21 @@ enum GatewayView {
 impl From<GatewayEvent> for GatewayView {
     fn from(event: GatewayEvent) -> Self {
         match event {
-            GatewayEvent::Connected { new_devices } => Self::Connected {
+            GatewayEvent::Connected {
+                new_devices,
+                security_notices,
+            } => Self::Connected {
                 new_devices: new_devices
                     .into_iter()
                     .map(|device| device.device_id)
                     .collect(),
+                security_notices: security_notices.into_iter().map(Into::into).collect(),
             },
             GatewayEvent::DeviceAdded(device_id) => Self::DeviceAdded { device_id },
             GatewayEvent::DeviceRemoved(device_id) => Self::DeviceRemoved { device_id },
-            GatewayEvent::TotpDisabledByAdmin => Self::TotpDisabledByAdmin,
+            GatewayEvent::SecurityNotice(notice) => Self::SecurityNotice {
+                notice: notice.into(),
+            },
             GatewayEvent::Disconnected => Self::Disconnected,
             GatewayEvent::SessionEnded(reason) => Self::SessionEnded {
                 reason: match reason {
@@ -407,6 +442,16 @@ async fn ack_new_devices(shell: State<'_, Shell>) -> Result<()> {
     }
 }
 
+/// The user dismissed these security notices on this device.
+#[tauri::command]
+async fn ack_security_notices(shell: State<'_, Shell>, notice_ids: Vec<Uuid>) -> Result<()> {
+    let session = shell.session.lock().await;
+    match &session.gateway {
+        Some(gateway) => Ok(gateway.ack_security_notices(&notice_ids).await?),
+        None => Err(CommandError::code("not_signed_in")),
+    }
+}
+
 /// What the user needs to add the account to an authenticator app.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -584,6 +629,7 @@ pub fn run() -> std::result::Result<(), tauri::Error> {
             devices,
             revoke_device,
             ack_new_devices,
+            ack_security_notices,
             totp_enable,
             totp_confirm,
             totp_disable,
@@ -623,9 +669,20 @@ mod tests {
         );
         assert_eq!(
             json(GatewayEvent::Connected {
-                new_devices: Vec::new()
+                new_devices: Vec::new(),
+                security_notices: Vec::new(),
             }),
-            r#"{"type":"connected","newDevices":[]}"#
+            r#"{"type":"connected","newDevices":[],"securityNotices":[]}"#
+        );
+        assert_eq!(
+            json(GatewayEvent::SecurityNotice(SecurityNotice {
+                notice_id: id,
+                kind: SecurityNoticeKind::RecoveryKeyReplaced,
+                created_at_ms: 5,
+            })),
+            format!(
+                r#"{{"type":"security_notice","notice":{{"noticeId":"{id}","kind":"recovery_key_replaced","createdAtMs":5}}}}"#
+            )
         );
     }
 

@@ -4,13 +4,16 @@
 //!
 //! The WebSocket endpoint that feeds this registry is in `routes/gateway.rs`.
 //! Events are best effort: a device that is offline learns about missed
-//! enrolments from the `Ready` message at its next connection.
+//! enrolments and security notices from the `Ready` message at its next
+//! connection.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use crate::notices::Notice;
 
 /// Why a session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +40,9 @@ pub enum Event {
     },
     /// The session of the receiving device ended. The connection closes next.
     SessionRevoked(RevocationReason),
-    /// An administrator disabled TOTP on the account.
-    TotpDisabledByAdmin,
+    /// Something security-relevant happened to the account. The notice is
+    /// stored: devices that miss this event get it at their next connection.
+    SecurityNotice(Notice),
 }
 
 /// Events queued per connection before the device is considered too slow.

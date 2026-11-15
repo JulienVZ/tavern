@@ -104,6 +104,7 @@ Includes a malicious admin running modified software and an intruder who took ov
 | Who is in which call, when, for how long, track kinds and bitrates, client IP addresses | LiveKit signalling is TLS only |
 | Invitation codes (hashed), who invited whom | Closed registration |
 | Moderation actions: who kicked or banned whom, and when | Enforced server side |
+| Security notices: that an account's password, recovery key, TOTP or device list changed, when, and which devices dismissed the notice | The server performs these changes; it stores a kind and a date so that offline devices are told ([ADR 0016](adr/0016-security-notices.md)) |
 | IP addresses of connections | Inherent; not written to the database, and not logged at the default log level |
 
 ### Never visible to the server
