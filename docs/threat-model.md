@@ -145,6 +145,7 @@ Rule: a feature that would require the server to read content is redesigned on t
 15. **Dependencies before 1.0** (OpenMLS, LiveKit Rust SDK): no independent audit of Tavern's integration. The M9 milestone reviews this model, adds fuzzing and audits dependencies.
 16. **No TURN by default.** A client on a network that blocks UDP and non-HTTPS TCP cannot join calls unless the admin enables the optional TURN/TLS setup. This is an availability limit, not a confidentiality one.
 17. **Advisory RUSTSEC-2026-0387 accepted with justification.** `crypto-bigint` 0.5, a transitive dependency of `opaque-ke`, has known timing variability and no compatible fix. Its affected arithmetic is not linked into Tavern's binaries (our suite uses ristretto255 through `curve25519-dalek`), which CI verifies on every run. See [ADR 0011](adr/0011-account-identity-and-primitives.md).
+18. **Security notices can be withheld or dismissed.** They are stored and delivered by the server, so a compromised server can suppress them: they protect against someone who obtained credentials, not against the instance. And for the two kinds shown to devices enrolled afterwards (TOTP disabled by an administrator, account recovered), whoever holds a session of the account can acknowledge the notice, which hides it from devices enrolled later. Devices that existed when the event happened keep showing it until dismissed on each of them. See [ADR 0016](adr/0016-security-notices.md).
 
 ## 6. Engineering rules that follow
 

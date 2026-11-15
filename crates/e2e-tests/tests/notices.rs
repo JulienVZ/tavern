@@ -226,25 +226,37 @@ async fn credential_and_device_changes_leave_a_notice_on_the_other_devices() {
     assert_eq!(pending(&desktop).await, []);
 
     // The account is recovered with the recovery key from a computer that
-    // was never enrolled: every existing device is told once signed in
-    // again; the computer that did it, enrolled afterwards, is not.
+    // was never enrolled. No device is known to have done it, so the notice
+    // is shown everywhere, including on computers enrolled afterwards, until
+    // one device of the account acknowledges it.
     let newcomer_computer = server.new_computer();
     newcomer_computer
         .recover(&account.handle, &new_key, PASSWORD)
         .await
         .unwrap();
     let newcomer = login(&newcomer_computer, &account.handle, PASSWORD).await;
-    assert_eq!(pending(&newcomer).await, []);
+    let listed = pending(&newcomer).await;
+    assert_eq!(kinds(&listed), [SecurityNoticeKind::AccountRecovered]);
     let laptop = login(&laptop_computer, &account.handle, PASSWORD).await;
-    assert_eq!(
-        kinds(&pending(&laptop).await),
-        [SecurityNoticeKind::AccountRecovered]
-    );
+    assert_eq!(pending(&laptop).await, listed);
+
+    // Acknowledged on the laptop: computers enrolled from now on are not
+    // told, the newcomer no longer is, and the desktop, which existed when
+    // it happened, still is.
+    let (gateway, mut events) = laptop.connect_gateway().unwrap();
+    next_event(&mut events).await;
+    gateway
+        .ack_security_notices(&[listed[0].notice_id])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(gateway);
+    assert_eq!(pending(&laptop).await, []);
+    assert_eq!(pending(&newcomer).await, []);
+    let latecomer = login(&server.new_computer(), &account.handle, PASSWORD).await;
+    assert_eq!(pending(&latecomer).await, []);
     let desktop = login(&desktop_computer, &account.handle, PASSWORD).await;
-    assert_eq!(
-        kinds(&pending(&desktop).await),
-        [SecurityNoticeKind::AccountRecovered]
-    );
+    assert_eq!(pending(&desktop).await, listed);
 }
 
 /// Found in manual testing: the user had signed out everywhere when the

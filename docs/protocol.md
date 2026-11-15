@@ -262,7 +262,7 @@ Minor version 1 of the gateway. Each event below is stored for the account and r
 | `RECOVERY_KEY_REPLACED` | The recovery key is replaced | the device that replaced it | yes |
 
 - A device acknowledges for itself only: a notice dismissed on one device stays on the others.
-- A device is not told about what happened before it was enrolled. Exception: `TOTP_DISABLED_BY_ADMIN` is also listed for devices enrolled later, until one device of the account acknowledges it.
+- A device is not told about what happened before it was enrolled. Exception: `TOTP_DISABLED_BY_ADMIN` and `ACCOUNT_RECOVERED` are also listed for devices enrolled later, until one device of the account acknowledges them.
 - Enabling TOTP again deletes the `TOTP_DISABLED_BY_ADMIN` notices of the account.
 - A notice is listed for 90 days at most.
 - A client shows a kind it does not know as a generic notice; it never drops it.

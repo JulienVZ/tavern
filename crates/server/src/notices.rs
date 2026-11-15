@@ -53,11 +53,14 @@ impl NoticeKind {
     /// Kinds also shown to devices enrolled after the event, until one device
     /// of the account has acknowledged the notice.
     ///
-    /// These report something the user will observe on any device without an
-    /// explanation: with TOTP disabled, sign-in stops asking for a code, on
-    /// a new computer as well. The other kinds are either acknowledged at
-    /// once by the device that acted, or concern devices that existed then.
-    pub const SHOWN_TO_LATER_DEVICES: [Self; 1] = [Self::TotpDisabledByAdmin];
+    /// These are the kinds that no device of the account is known to have
+    /// done, and that the user meets on any device without an explanation:
+    /// with TOTP disabled, sign-in stops asking for a code; after a recovery
+    /// the password no longer works and every device is signed out, and the
+    /// user may well come back on a new computer. The other kinds are
+    /// acknowledged at once by the device that acted.
+    pub const SHOWN_TO_LATER_DEVICES: [Self; 2] =
+        [Self::TotpDisabledByAdmin, Self::AccountRecovered];
 
     fn from_db(value: i16) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| *kind as i16 == value)
