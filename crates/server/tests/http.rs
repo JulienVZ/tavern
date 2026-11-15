@@ -5,7 +5,7 @@
 //! They are ignored by default because they need a database. Run them with:
 //!
 //! ```sh
-//! TAVERN_TEST_DATABASE_URL=postgres://tavern:tavern@localhost:5432/tavern \
+//! TAVERN_TEST_DATABASE_URL=postgres://tavern:tavern@localhost:5432/tavern_test \
 //!     cargo test -p tavern-server -- --ignored
 //! ```
 
@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{DATABASE_URL_VAR, TestApp};
+use common::{TestApp, database_url};
 use tavern_protocol::rest::{ComponentStatus, HealthResponse, VersionResponse};
 use tavern_server::db;
 
@@ -65,7 +65,7 @@ async fn version_reports_software_and_protocol_versions() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn migrations_can_run_twice() {
-    let database_url = std::env::var(DATABASE_URL_VAR).unwrap();
+    let database_url = database_url();
     let pool = db::connect(&database_url, 1).await.unwrap();
 
     db::migrate(&pool).await.unwrap();
@@ -137,7 +137,7 @@ async fn malformed_bodies_answer_with_a_coded_error() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn wrong_database_password_is_explained() {
-    let mut url = reqwest::Url::parse(&std::env::var(DATABASE_URL_VAR).unwrap()).unwrap();
+    let mut url = reqwest::Url::parse(&database_url()).unwrap();
     url.set_password(Some("not-the-password")).unwrap();
 
     let error = db::connect(url.as_str(), 1).await.unwrap_err();

@@ -16,6 +16,8 @@
     reason = "test helpers panic on set-up failure"
 )]
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use tavern_server::db;
@@ -70,7 +72,7 @@ fn document_parser_finds_the_account_tables() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn every_database_column_is_classified() {
-    let database_url = std::env::var("TAVERN_TEST_DATABASE_URL").unwrap();
+    let database_url = common::database_url();
     let pool = db::connect(&database_url, 1).await.unwrap();
     db::migrate(&pool).await.unwrap();
 

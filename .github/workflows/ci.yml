@@ -90,7 +90,7 @@ jobs:
         env:
           POSTGRES_USER: tavern
           POSTGRES_PASSWORD: tavern
-          POSTGRES_DB: tavern
+          POSTGRES_DB: tavern_test
         ports:
           - 5432:5432
         options: >-
@@ -134,7 +134,7 @@ jobs:
       - name: Integration and end-to-end tests (PostgreSQL)
         run: cargo test --package tavern-server --package tavern-e2e-tests --locked -- --ignored
         env:
-          TAVERN_TEST_DATABASE_URL: postgres://tavern:tavern@localhost:5432/tavern
+          TAVERN_TEST_DATABASE_URL: postgres://tavern:tavern@localhost:5432/tavern_test
 
   deny:
     name: cargo deny

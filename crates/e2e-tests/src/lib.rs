@@ -30,6 +30,28 @@ use tokio::sync::mpsc::Receiver;
 
 /// Environment variable holding the test database URL.
 pub const DATABASE_URL_VAR: &str = "TAVERN_TEST_DATABASE_URL";
+/// The URL of the test database, from `TAVERN_TEST_DATABASE_URL`.
+///
+/// Tests create accounts by the hundred and rewrite rows at will, so they
+/// refuse any database whose name does not end in `_test`: the database of a
+/// development stack, with the accounts used for manual testing, is never
+/// touched. `deploy/scripts/test-db.sh` creates one and prints its URL.
+pub fn database_url() -> String {
+    let url = std::env::var(DATABASE_URL_VAR)
+        .unwrap_or_else(|_| panic!("{DATABASE_URL_VAR} must be set to run this test"));
+    let name = url
+        .rsplit('/')
+        .next()
+        .and_then(|rest| rest.split('?').next())
+        .unwrap_or_default();
+    assert!(
+        name.ends_with("_test"),
+        "{DATABASE_URL_VAR} names the database \"{name}\": tests only run on a database \
+         whose name ends in _test (see deploy/scripts/test-db.sh)"
+    );
+    url
+}
+
 /// A password that meets the strength requirement.
 pub const PASSWORD: &str = "tournesol-vexant-42-brume";
 
@@ -44,8 +66,7 @@ pub struct Server {
 impl Server {
     /// Starts a server with fresh instance secrets.
     pub async fn spawn() -> Self {
-        let database_url = std::env::var(DATABASE_URL_VAR)
-            .unwrap_or_else(|_| panic!("{DATABASE_URL_VAR} must be set to run this test"));
+        let database_url = database_url();
         let pool = db::connect(&database_url, 5)
             .await
             .expect("database must be reachable");
