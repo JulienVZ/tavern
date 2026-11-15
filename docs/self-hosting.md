@@ -130,6 +130,8 @@ docker compose up -d
 curl --insecure https://localhost/health
 ```
 
+To run the server from your checkout instead of a published image, build it with `./scripts/build.sh` before `docker compose up -d`: the script records the commit, and `curl http://localhost:8080/version` then shows it as `commit` (with a `-dirty` suffix if the checkout had uncommitted changes). This is how to make sure a running server matches the code you are looking at.
+
 Caddy uses its own local certificate authority for `localhost`, hence `--insecure`. The desktop client refuses such a certificate. `--dev` therefore also enables `docker-compose.dev.yml` (through `COMPOSE_FILE` in `.env`), which publishes the server on `http://localhost:8080`, on the loopback interface only: enter that address in the client. Never use `--dev` on a real instance.
 
 ## 5. Updating
@@ -195,7 +197,7 @@ Instead of a single multiplexed UDP port, LiveKit can use a range of UDP ports (
 
 - The server stores no message content, only ciphertext and the metadata listed in the [threat model](threat-model.md). As the administrator you can see who talks to whom and when, the names of servers and channels, and user profiles.
 - No telemetry is sent anywhere, and the software contacts no third party. Caddy contacts Let's Encrypt to obtain certificates.
-- The default configuration writes no access log, so client IP addresses are not recorded.
+- Caddy writes no access log in the default configuration, and the server's own request log holds the method, the route template, the status and the duration only: client IP addresses, handles and identifiers are not recorded ([details](configuration.md#request-log)).
 - If you run a modified version for other people, the AGPL requires you to offer them the modified source: set `TAVERN_SOURCE_URL`.
 
 ## 11. Troubleshooting

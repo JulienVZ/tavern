@@ -34,6 +34,7 @@ Read by the `tavern-server` binary. The compose file sets them from the variable
 | `TAVERN_RUN_MIGRATIONS` | no | `true` | Apply database migrations at start-up. Set to `false` to apply them yourself. |
 | `TAVERN_LOG_LEVEL` | no | `info` | `error`, `warn`, `info`, `debug`, `trace`, or a `tracing` directive such as `tavern_server=debug,info`. |
 | `TAVERN_LOG_FORMAT` | no | `text` | `text` or `json`. |
+| `TAVERN_BUILD_COMMIT` | no | empty | **Build time only** (Docker build argument, set by `scripts/build.sh` and by the CI): the commit the server is built from, reported by `GET /version`. Has no effect on a running server. |
 | `TAVERN_SOURCE_URL` | no | empty | URL of this instance's source code, shown by `GET /version`. Set it if you run modified code (AGPL). |
 | `TAVERN_SESSION_TTL_DAYS` | no | `90` | Days an unused session stays valid (1 to 3650). |
 | `TAVERN_TRUST_FORWARDED_FOR` | no | `false` | Use the last `X-Forwarded-For` entry as the client address for rate limiting. The reference compose file sets it to `true` because the server is reachable through Caddy only. Leave it unset if clients can reach the server directly. |
@@ -74,8 +75,20 @@ The server refuses to start when one of its four secrets is missing or malformed
 | Endpoint | Answer |
 |---|---|
 | `GET /health` | `200 {"status":"ok","database":"ok"}`, or `503` when the database is unreachable. |
-| `GET /version` | Server version, supported gateway protocol versions, public key of the MLS external sender, source URL. |
+| `GET /version` | Server version, supported gateway protocol versions, public key of the MLS external sender, source URL, and `commit`: the Git commit the server was built from, when the build recorded it. |
 | `GET /v1/openapi.json` | OpenAPI description of the REST API. |
+
+## Request log
+
+At the `info` level the server writes one line per request, with four fields and nothing else:
+
+```
+INFO tavern_server::telemetry: request method=POST route=/v1/admin/users/{user_id}/totp/disable status=204 duration_ms=7
+```
+
+- `route` is the route template, never the URL: identifiers in the path and query strings are not logged. A request that matches no route is logged as `route=unmatched`.
+- No client address, handle, token, header or body is logged, at any level.
+- The container health check calls `/health` every ten seconds and appears in this log. Set `TAVERN_LOG_LEVEL=warn` to silence request lines.
 
 ## Server commands
 

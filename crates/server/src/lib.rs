@@ -35,7 +35,6 @@ use tavern_crypto::token::{HASH_LEN, TOKEN_LEN};
 use tavern_protocol::DEFAULT_MAX_REST_BODY_BYTES;
 use tavern_protocol::handle::Handle;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::gateway::Registry;
@@ -196,8 +195,7 @@ pub fn app(state: AppState) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        // The default span records method, path and status only: no headers,
-        // no bodies, no client address.
-        .layer(TraceLayer::new_for_http())
+        // Outermost, so that timeouts and refused bodies are logged too.
+        .layer(axum::middleware::from_fn(telemetry::log_request))
         .with_state(state)
 }
