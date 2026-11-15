@@ -35,6 +35,7 @@ use opaque_ke::{
 };
 use rand::rngs::OsRng;
 use sha2::Sha512;
+use tavern_argon2_memory::WorkingMemory;
 use tavern_protocol::handle::Handle;
 use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
@@ -86,9 +87,20 @@ impl Ksf for Stretch {
             .map_err(|_| InternalError::KsfError)?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
+        // The working memory comes from a dedicated mapping that is erased
+        // and returned to the system when this function ends, whatever the
+        // outcome (docs/adr/0015-argon2-working-memory.md).
+        let mut memory = WorkingMemory::new(argon2.params().block_count())
+            .map_err(|_| InternalError::KsfError)?;
+
         let mut output = GenericArray::default();
         argon2
-            .hash_password_into(&input, &[0; argon2::RECOMMENDED_SALT_LEN], &mut output)
+            .hash_password_into_with_memory(
+                &input,
+                &[0; argon2::RECOMMENDED_SALT_LEN],
+                &mut output,
+                &mut memory,
+            )
             .map_err(|_| InternalError::KsfError)?;
         Ok(output)
     }

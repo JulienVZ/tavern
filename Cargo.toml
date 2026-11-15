@@ -4,6 +4,7 @@
 resolver = "3"
 members = [
     "crates/protocol",
+    "crates/argon2-memory",
     "crates/crypto",
     "crates/server",
     "crates/client-core",
@@ -26,6 +27,7 @@ publish = false
 # Internal crates
 tavern-protocol = { path = "crates/protocol" }
 tavern-crypto = { path = "crates/crypto" }
+tavern-argon2-memory = { path = "crates/argon2-memory" }
 tavern-client-core = { path = "crates/client-core" }
 
 # Shared third-party crates
@@ -33,7 +35,7 @@ anyhow = "1.0"
 
 # Cryptography. These follow the RustCrypto generation that opaque-ke 4 is
 # built on (digest 0.10); see docs/adr/0011-account-identity-and-primitives.md.
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["zeroize"] }
 chacha20poly1305 = "0.10"
 data-encoding = "2.11"
 ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
@@ -60,6 +62,7 @@ tauri = { version = "2.12.5", features = [] }
 tauri-build = { version = "2.7.4", features = [] }
 governor = "0.10.4"
 keyring = "4.2.0"
+libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 zxcvbn = { version = "3.1.1", default-features = false }
 thiserror = "2.0"

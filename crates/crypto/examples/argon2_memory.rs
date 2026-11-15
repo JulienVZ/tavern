@@ -1,56 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Measures how long one client-side OPAQUE registration takes and checks
-//! that the Argon2id working memory (128 MiB) is returned afterwards.
+//! Measures how long one client-side OPAQUE registration takes and shows
+//! whether the Argon2id working memory (128 MiB) is returned afterwards.
 //!
 //! ```sh
 //! cargo run --release --package tavern-crypto --example argon2_memory
 //! ```
 //!
-//! Results are recorded in `docs/adr/0003-opaque-authentication.md`.
+//! Results are recorded in `docs/adr/0003-opaque-authentication.md` and
+//! `docs/adr/0015-argon2-working-memory.md`. The automated check is the
+//! `argon2_memory_release` test.
 
 #![allow(clippy::print_stdout, reason = "command-line measurement tool")]
 
-use std::process::Command;
+#[path = "../tests/support/footprint.rs"]
+mod footprint;
+
 use std::time::Instant;
 
+use footprint::{FOOTPRINT_KIND, footprint_bytes, mib};
 use tavern_crypto::opaque::Password;
 use tavern_crypto::opaque::client::Registration;
 use tavern_crypto::opaque::server::ServerSetup;
 use tavern_protocol::handle::Handle;
 
-/// Resident memory of this process in MiB, read from `ps` (Unix only).
-fn resident_mib() -> Option<u64> {
-    let output = Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()?;
-    let kib: u64 = String::from_utf8(output.stdout).ok()?.trim().parse().ok()?;
-    Some(kib / 1024)
-}
-
-/// Physical footprint as reported by `vmmap --summary` (macOS only): the
-/// figure the system charges to the process, and what Activity Monitor shows
-/// as "Memory". Unlike resident size, it excludes pages the allocator has
-/// handed back to the system as reusable, so it is the number that tells
-/// whether the Argon2id working memory was really returned.
-fn footprint() -> Option<String> {
-    let output = Command::new("vmmap")
-        .args(["--summary", &std::process::id().to_string()])
-        .output()
-        .ok()?;
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .find(|line| line.starts_with("Physical footprint:"))
-        .and_then(|line| line.split(':').nth(1))
-        .map(|value| value.trim().to_owned())
-}
-
 fn show(label: &str) {
-    let resident = resident_mib().map_or_else(|| "?".to_owned(), |mib| format!("{mib} MiB"));
-    let footprint = footprint().unwrap_or_else(|| "n/a".to_owned());
-    println!("{label:<26} resident {resident:>8}   physical footprint {footprint:>8}");
+    let footprint = footprint_bytes().map_or_else(|| "n/a".to_owned(), mib);
+    println!("{label:<26} {FOOTPRINT_KIND} {footprint:>10}");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

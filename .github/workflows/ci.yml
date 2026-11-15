@@ -146,6 +146,31 @@ jobs:
       # Compiles the frontend and the application; installers are built by the
       # release workflow only.
       - run: pnpm tauri build --debug --no-bundle
+      # The Linux run of these tests is in the Rust job. macOS is where the
+      # allocator kept the 128 MiB (docs/adr/0015); Windows is checked too.
+      - name: Argon2id working memory is returned to the system
+        if: runner.os != 'Linux'
+        working-directory: ${{ github.workspace }}
+        run: |
+          cargo test --locked --package tavern-argon2-memory
+          cargo test --locked --package tavern-crypto --test argon2_memory_release -- --nocapture
+
+  # The only crate with `unsafe` code of our own, run under Miri for the
+  # Linux and macOS implementations of `mmap` (docs/adr/0015).
+  miri:
+    name: Miri (argon2-memory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri,rust-src
+          rustup target add --toolchain nightly aarch64-apple-darwin
+      - name: Miri (Linux)
+        run: cargo +nightly miri test --locked --package tavern-argon2-memory
+      - name: Miri (macOS target)
+        run: cargo +nightly miri test --locked --package tavern-argon2-memory --target aarch64-apple-darwin
 
   docker:
     name: Server image and deployment

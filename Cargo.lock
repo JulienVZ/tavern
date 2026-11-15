@@ -95,6 +95,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.2.17",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -5616,6 +5617,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tavern-argon2-memory"
+version = "0.0.1"
+dependencies = [
+ "argon2",
+ "libc",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "tavern-client-core"
 version = "0.0.1"
 dependencies = [
@@ -5655,6 +5666,7 @@ dependencies = [
  "rand 0.8.8",
  "sha2 0.10.9",
  "subtle",
+ "tavern-argon2-memory",
  "tavern-protocol",
  "thiserror 2.0.21",
  "unicode-normalization",

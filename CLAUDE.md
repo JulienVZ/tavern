@@ -90,6 +90,7 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 ├── clippy.toml / rustfmt.toml # Lints et formatage
 ├── crates/
 │   ├── protocol/              # Types partagés client/serveur, .proto, versionnage
+│   ├── argon2-memory/         # Zone mémoire dédiée à Argon2id (mmap), effacée puis rendue au système ; seul `unsafe` du projet (ADR 0015)
 │   ├── crypto/                # Wrapper OpenMLS, gestion des clés, dérivation clés média, chiffrement fichiers
 │   ├── server/                # Binaire serveur : API REST, gateway WS, auth, permissions, stockage
 │   ├── client-core/           # Logique client sans UI : réseau, MLS, store local, LiveKit, état
@@ -123,7 +124,8 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 
 Règles de dépendance entre crates :
 - `protocol` ne dépend de rien d'interne.
-- `crypto` dépend de `protocol` uniquement.
+- `argon2-memory` ne dépend de rien d'interne et ne contient que la zone mémoire d'Argon2id.
+- `crypto` dépend de `protocol` et de `argon2-memory` uniquement.
 - `server` dépend de `protocol` (et de `crypto` uniquement pour la vérification de signatures/KeyPackages, le suivi de l'état public des groupes et la signature des propositions Remove, **jamais** pour déchiffrer).
 - `client-core` dépend de `protocol`, `crypto`, `media`.
 - `apps/desktop/src-tauri` dépend de `client-core` et ne contient pas de logique métier.
@@ -179,12 +181,12 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Le **handle** est l'identifiant OPAQUE : non modifiable en v1, forme canonique stricte (ASCII `a–z 0–9 _ .`, 2 à 32 caractères, minuscules), implémentée une seule fois dans `tavern_protocol::handle` pour le client et le serveur.
 - Changements d'identifiants (ADR 0003) : chacun est autorisé par une signature de l'AIK sur un défi à usage unique. Récupération : nouveau mot de passe, toutes les sessions révoquées, TOTP conservé. Changement de mot de passe : les autres sessions sont révoquées. La clé de récupération peut être régénérée (l'ancienne cesse de fonctionner).
 - Un admin peut désactiver le TOTP d'un utilisateur (téléphone et codes perdus) : appareils notifiés, action journalisée (`admin_audit_log`).
-- Argon2id : 128 Mio, t=3, p=1 (mesures dans l'ADR 0003). Dépassement transitoire assumé du budget RAM pendant une connexion ; rétention possible sur macOS (point ouvert n° 10).
+- Argon2id : 128 Mio, t=3, p=1 (mesures dans l'ADR 0003). Dépassement transitoire assumé du budget RAM pendant une connexion ; la mémoire de travail vient d'une zone dédiée, effacée puis rendue au système dès la fin du calcul (ADR 0015, test `argon2_memory_release` en CI).
 - En M1 le client ne stocke qu'une petite fiche par instance dans le trousseau OS (ADR 0014) ; SQLCipher arrive en M2.
 
 ### Règles de code liées à la sécurité
 - **Ne jamais implémenter de primitive cryptographique soi-même.** Utiliser OpenMLS, RustCrypto, `rustls`, `opaque-ke`.
-- Pas de `unsafe` sans commentaire `// SAFETY:` justifié et revue explicite ; `#![forbid(unsafe_code)]` dans `protocol`, `crypto`, `server`.
+- Pas de `unsafe` sans commentaire `// SAFETY:` justifié et revue explicite ; `#![forbid(unsafe_code)]` dans `protocol`, `crypto`, `server`. Le seul `unsafe` du projet est dans `crates/argon2-memory` (ADR 0015), testé sous Miri en CI ; toute modification de cette crate demande une revue explicite.
 - Zéroïser les secrets en mémoire (`zeroize`).
 - Ne jamais logger : secrets, tokens, clés, payloads chiffrés, contenu en clair.
 - Toute entrée réseau est non fiable : validation stricte, tailles maximales, timeouts.
@@ -358,7 +360,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 7. **Historique sur un nouvel appareil** : ADR 0009 (proposé), transfert d'appareil à appareil au M5b ; sauvegarde chiffrée sous la clé de récupération à évaluer ensuite.
 8. **Identifiant de l'application** : `io.github.julienvz.tavern`, définitif depuis le 2026-11-14 (il nomme les entrées de trousseau et, à partir de M2, le dossier de données local). Ne plus le modifier.
 9. **SQLCipher et OpenSSL** : SQLCipher embarqué exige OpenSSL sous Windows et Linux, ce que `deny.toml` interdit aujourd'hui. ADR à écrire au début de M2.
-10. **Mémoire Argon2id sur macOS** : mesurée en empreinte physique (`vmmap --summary`). Linux rend les 128 Mio immédiatement ; macOS 27 en moins de 10 s ; macOS 26 les retient encore après 30 s. `malloc_zone_pressure_relief` ne rend rien ; une zone dédiée (`mmap`) démappée après le calcul rend tout immédiatement, mais demande un bloc `unsafe`, interdit dans `crypto`. À trancher : petite crate dédiée revue à part, acceptation documentée, processus auxiliaire (dernier recours, avec ADR) ou paramètre mémoire réduit. Windows reste à mesurer (ADR 0003).
+10. **Mémoire Argon2id sur macOS** : tranché le 2026-11-15 — crate dédiée `tavern-argon2-memory` (zone `mmap` effacée puis démappée), `unsafe` toujours interdit dans `protocol`, `crypto` et `server` (ADR 0015).
 
 ---
 

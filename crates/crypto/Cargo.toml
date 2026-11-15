@@ -12,6 +12,7 @@ publish.workspace = true
 
 [dependencies]
 tavern-protocol.workspace = true
+tavern-argon2-memory.workspace = true
 
 argon2.workspace = true
 chacha20poly1305.workspace = true

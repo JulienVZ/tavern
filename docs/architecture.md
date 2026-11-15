@@ -60,14 +60,15 @@ Using a single multiplexed UDP port keeps port forwarding simple on a home route
 | Crate | Responsibility | Internal dependencies |
 |---|---|---|
 | `protocol` | `.proto` files and generated types for the gateway and for message content, REST DTOs, error codes, size limits, protocol version constants. No I/O. | none |
-| `crypto` | Wrapper around OpenMLS (group lifecycle, credentials, device certificates, KeyPackages, exporter), OPAQUE client and server helpers, account identity key handling, media key derivation, attachment encryption, public group state validation used by the server. | `protocol` |
+| `crypto` | Wrapper around OpenMLS (group lifecycle, credentials, device certificates, KeyPackages, exporter), OPAQUE client and server helpers, account identity key handling, media key derivation, attachment encryption, public group state validation used by the server. | `protocol`, `argon2-memory` |
+| `argon2-memory` | Working memory for Argon2id in a dedicated mapping, erased and returned to the system on drop. The only crate of the project with `unsafe` code of its own (ADR 0015). | none |
 | `server` | Binary. REST API (axum, OpenAPI), WebSocket gateway, authentication, sessions, invitations, permissions, Delivery Service (ordering, storage and fan-out of MLS messages), KeyPackage directory, blob storage backends, LiveKit token issuance, migrations. | `protocol`, `crypto` (validation only, never decryption) |
 | `media` | Screen, window, camera and audio capture per OS, system audio capture, encoder selection, noise suppression. Built on `libwebrtc` types so that frames flow to LiveKit without copies. | none |
 | `client-core` | All client logic without UI: instance connection, authentication, gateway session, MLS state machine, local encrypted store, sync, LiveKit rooms and E2EE key provisioning, attachments, local search, state exposed to the shell. | `protocol`, `crypto`, `media` |
 | `apps/desktop/src-tauri` | Tauri shell: windows, tray, commands and events mapped one-to-one onto `client-core`. No business logic. | `client-core` |
 | `apps/desktop/ui` | Svelte UI. Renders view models, sends user intents. | — |
 
-`#![forbid(unsafe_code)]` applies to `protocol`, `crypto` and `server`.
+`#![forbid(unsafe_code)]` applies to `protocol`, `crypto` and `server`. The project's own `unsafe` code is confined to `argon2-memory`, which is tested under Miri.
 
 ### Client-side storage
 

@@ -19,7 +19,7 @@ Security problems are **not** reported through issues: see [SECURITY.md](SECURIT
 3. **No telemetry and no third-party service**: no analytics, external CDN or remote fonts.
 4. **Never log** secrets, tokens, keys, ciphertext or plaintext.
 5. **Every network input is untrusted**: validate, bound sizes, set timeouts.
-6. `unsafe` is forbidden in `protocol`, `crypto` and `server`. Elsewhere it needs a `// SAFETY:` comment and explicit review.
+6. `unsafe` is forbidden in `protocol`, `crypto` and `server`. Elsewhere it needs a `// SAFETY:` comment and explicit review. Today the only `unsafe` code of the project is in `crates/argon2-memory` ([ADR 0015](docs/adr/0015-argon2-working-memory.md)); changes there must keep the Miri job green.
 7. New dependencies must be maintained, licence-compatible and pass `cargo deny`. A new cryptographic or network dependency needs an ADR.
 
 ## Prerequisites

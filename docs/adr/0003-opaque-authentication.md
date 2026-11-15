@@ -67,37 +67,7 @@ Chosen: **128 MiB, 3 passes, 1 lane**. The `argon2` crate does not run lanes in 
 
 **Memory budget exception.** The client's idle budget is 150 MB. Argon2id needs 128 MiB for the duration of one registration or login, which exceeds it for a fraction of a second. This is accepted as a transient exception: the computation runs once per login, off the UI thread.
 
-Whether the memory goes back to the system afterwards depends on the platform's allocator. Measured with `cargo run --release -p tavern-crypto --example argon2_memory` (three registrations in a row, then idle). On macOS the figure is the **physical footprint** reported by `vmmap --summary`, which is what the system charges to the process and excludes pages already handed back as reusable; resident size is misleading there.
-
-| Platform | Before | Right after | 2 s later | 10 s later | 30 s later |
-|---|---|---|---|---|---|
-| Linux, GitHub runner (ubuntu-24.04, glibc), resident size | 2 MiB | 2 MiB | 2 MiB | 2 MiB | — |
-| macOS 27, development machine (Apple M4), physical footprint | 1.2 MiB | 129.3 MiB | 129.4 MiB | 1.4 MiB | 1.4 MiB |
-| macOS 26.7, GitHub runner (`macos-latest`, arm64), physical footprint | 1.0 MiB | 129.0 MiB | 129.1 MiB | 129.1 MiB | **129.1 MiB** |
-| Windows | not measured | | | | |
-
-On Linux the block is returned at once. On macOS it depends on the system version: macOS 27 returns it within ten seconds, macOS 26 still holds it after thirty. Three runs in a row never used more than one block: it is the allocator's cache of large blocks, not a leak. But on macOS 26 a client sits about 128 MiB above its idle footprint after a login, for an unknown time.
-
-**Releasing it explicitly.** An experiment outside the project's crates (job "macOS memory release experiment" of `.github/workflows/argon2-bench.yml`, macOS 26.7.2) compared two ways of giving the memory back:
-
-| Step | Physical footprint |
-|---|---|
-| Start | 0.9 MiB |
-| After hashing with the ordinary heap allocation | 129.0 MiB |
-| After `malloc_zone_pressure_relief(NULL, 0)` (reported 0 bytes released) | 129.1 MiB |
-| After a second hash in a dedicated anonymous mapping (`mmap`) | 257.2 MiB |
-| After `munmap` of that mapping | 129.1 MiB |
-
-Asking the allocator to drop its caches does nothing. A dedicated mapping that is unmapped after the computation returns its 128 MiB at once (the 129 MiB that remain in the last line are the cached block of the first step).
-
-**Open point.** The dedicated mapping is the fix, and `argon2` supports it (`hash_password_into_with_memory`). It needs one `unsafe` block: viewing the mapped bytes as Argon2 blocks. `CLAUDE.md` forbids `unsafe` in the `crypto` crate, where the key stretching lives, and requires explicit review of any `unsafe` elsewhere. Options, to be decided with the maintainer:
-
-1. a small separate crate holding only that mapping and its one `unsafe` block, reviewed on its own, used by `crypto`;
-2. accept the retained memory on macOS 26 and earlier, documented;
-3. a short-lived helper process for the key stretching (last resort, with its own ADR);
-4. a lower memory parameter.
-
-Until then the behaviour is the one measured above. Windows remains to be measured.
+Whether that memory goes back to the system afterwards depends on the platform's allocator: Linux returns it at once, macOS 27 within ten seconds, macOS 26 still holds it after thirty. The working memory is therefore taken from a dedicated mapping that is erased and unmapped as soon as the computation ends, in a separate crate, `tavern-argon2-memory`. Measurements, the decision and the alternatives are in [ADR 0015](0015-argon2-working-memory.md).
 
 The server never runs Argon2id.
 

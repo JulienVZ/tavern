@@ -119,6 +119,7 @@ Signed installers for Windows, macOS and Linux will be published with releases.
 |---|---|
 | `crates/protocol` | Wire types shared by client and server |
 | `crates/crypto` | MLS, OPAQUE, key management, file encryption |
+| `crates/argon2-memory` | Argon2id working memory, erased and returned to the system after use |
 | `crates/server` | Instance server |
 | `crates/client-core` | Client logic without UI |
 | `crates/media` | Capture and encoding |
