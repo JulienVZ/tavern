@@ -353,7 +353,9 @@ impl InstanceClient {
             &WrappingKey::from_export_key(export_key)?,
             &expected,
         )
-        .map_err(|_| ClientError::UntrustedKeyMaterial)?;
+        .map_err(|error| {
+            ClientError::from_wrapped_root(error, ClientError::UntrustedKeyMaterial)
+        })?;
 
         let known = self.records.device(grant.user_id)?;
         let (session, device_seed, wrapped, new_device) = match known {
@@ -506,7 +508,9 @@ impl InstanceClient {
     /// theirs. Every session of the account ends; TOTP stays as it was.
     ///
     /// A malformed key, a key that does not belong to the account and an
-    /// unknown handle all give [`ClientError::InvalidRecoveryKey`].
+    /// unknown handle all give [`ClientError::InvalidRecoveryKey`]. An
+    /// account whose keys are in a retired format gives
+    /// [`ClientError::AccountTooOld`].
     pub async fn recover(
         &self,
         handle: &str,
@@ -541,7 +545,7 @@ impl InstanceClient {
             &WrappingKey::from_recovery_key(&recovery_key)?,
             &expected,
         )
-        .map_err(|_| ClientError::InvalidRecoveryKey)?;
+        .map_err(|error| ClientError::from_wrapped_root(error, ClientError::InvalidRecoveryKey))?;
         let challenge: [u8; 32] = start
             .challenge
             .as_slice()
@@ -815,7 +819,9 @@ impl Client {
             &WrappingKey::from_export_key(&output.export_key)?,
             &expected,
         )
-        .map_err(|_| ClientError::UntrustedKeyMaterial)?;
+        .map_err(|error| {
+            ClientError::from_wrapped_root(error, ClientError::UntrustedKeyMaterial)
+        })?;
         let challenge = grant
             .challenge
             .as_slice()

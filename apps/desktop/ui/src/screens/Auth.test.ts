@@ -74,3 +74,40 @@ describe("the accounts known on this computer", () => {
     expect(session.showStoreResetNotice).toBe(false);
   });
 });
+
+describe("a sign-in that the keys of the account stop", () => {
+  async function signInFailingWith(code: string): Promise<string> {
+    onCommand("login", () => {
+      throw { code };
+    });
+    render(Auth);
+    await fireEvent.input(screen.getByLabelText("Password"), {
+      target: { value: "tournesol-vexant-42-brume" },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    let text = "";
+    await vi.waitFor(() => {
+      text = screen.getByRole("alert").textContent ?? "";
+      expect(text.trim()).not.toBe("");
+    });
+    expect(session.screen).toBe("auth");
+    return text;
+  }
+
+  it("says calmly that an account in a retired format is too old", async () => {
+    const text = await signInFailingWith("account_too_old");
+
+    expect(text).toContain("created with a version of Tavern that is too old");
+    expect(text).toContain("Contact the administrator of the instance");
+    expect(text).not.toContain("do not match");
+    expect(text).not.toContain("Do not continue");
+  });
+
+  it("raises the alarm when the keys do not match the account", async () => {
+    const text = await signInFailingWith("untrusted_key_material");
+
+    expect(text).toContain("keys that do not match this account");
+    expect(text).toContain("Do not continue");
+    expect(text).not.toContain("too old");
+  });
+});

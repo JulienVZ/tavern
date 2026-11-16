@@ -58,6 +58,7 @@ describe("error codes produced by the shell", () => {
     "unavailable",
     "keychain_unavailable",
     "untrusted_key_material",
+    "account_too_old",
     "internal",
   ];
 

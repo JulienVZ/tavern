@@ -102,6 +102,7 @@ impl From<ClientError> for CommandError {
             ClientError::SessionEnded => Self::code("session_ended"),
             ClientError::DeviceRevoked => Self::code("device_revoked"),
             ClientError::UntrustedKeyMaterial => Self::code("untrusted_key_material"),
+            ClientError::AccountTooOld => Self::code("account_too_old"),
             ClientError::Store(_) => Self::code("keychain_unavailable"),
             ClientError::Crypto(_) | ClientError::Interrupted => Self::code("internal"),
         }

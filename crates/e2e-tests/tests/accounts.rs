@@ -208,6 +208,109 @@ async fn wrong_passwords_and_unknown_handles_are_indistinguishable() {
     assert!(computer.remembered_handle().unwrap().is_none());
 }
 
+async fn active_devices_of(server: &Server, handle: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM devices d JOIN users u ON u.id = d.user_id \
+         WHERE u.handle = $1 AND d.revoked_at IS NULL",
+    )
+    .bind(handle)
+    .fetch_one(&server.state.db)
+    .await
+    .unwrap()
+}
+
+/// An account whose wrapped keys are in a format this client no longer reads
+/// (version 1, from before ADR 0017) is reported as too old, not as keys
+/// that do not match: nothing points to a misbehaving instance.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL"]
+async fn an_account_in_a_retired_format_is_too_old_not_tampered_with() {
+    let server = Server::spawn().await;
+    let computer = server.new_computer();
+    let invite = server.host_invite(false).await;
+    let registered = computer
+        .register(NewAccount {
+            invite_code: &invite,
+            handle: &random_handle("old"),
+            display_name: "Old Account",
+            password: PASSWORD,
+        })
+        .await
+        .unwrap();
+    let handle = registered.handle.as_str().to_owned();
+    let recovery_key = registered.recovery_key.display().to_string();
+    // What an account created before version 2 looks like: same sizes,
+    // version byte 1.
+    sqlx::query(
+        "UPDATE users SET identity_key_wrapped_pw = set_byte(identity_key_wrapped_pw, 0, 1), \
+         identity_key_wrapped_rk = set_byte(identity_key_wrapped_rk, 0, 1) WHERE handle = $1",
+    )
+    .bind(&handle)
+    .execute(&server.state.db)
+    .await
+    .unwrap();
+
+    let login = computer.login(&handle, PASSWORD).await.unwrap_err();
+    assert!(matches!(login, ClientError::AccountTooOld), "{login:?}");
+    let recovery = computer
+        .recover(&handle, &recovery_key, "a-second-quite-long-passphrase-58")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(recovery, ClientError::AccountTooOld),
+        "{recovery:?}"
+    );
+
+    assert_eq!(active_devices_of(&server, &handle).await, 0);
+    assert!(computer.remembered_handle().unwrap().is_none());
+}
+
+/// Keys that do not belong to the account raise the alarm: the instance
+/// substituted another account's identity key, or altered the wrapped copy.
+/// The computer enrols nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL"]
+async fn keys_that_do_not_match_the_account_raise_the_alarm() {
+    let server = Server::spawn().await;
+    let computer = server.new_computer();
+    let alice = register(&server, &computer, "alice", false).await;
+    let bob = register(&server, &computer, "bob", false).await;
+
+    // Another account's identity key.
+    sqlx::query(
+        "UPDATE users SET identity_key = (SELECT identity_key FROM users WHERE handle = $2) \
+         WHERE handle = $1",
+    )
+    .bind(&alice)
+    .bind(&bob)
+    .execute(&server.state.db)
+    .await
+    .unwrap();
+    let substituted = computer.login(&alice, PASSWORD).await.unwrap_err();
+    assert!(
+        matches!(substituted, ClientError::UntrustedKeyMaterial),
+        "{substituted:?}"
+    );
+
+    // One byte of the ciphertext changed, version byte intact.
+    sqlx::query(
+        "UPDATE users SET identity_key_wrapped_pw = set_byte(identity_key_wrapped_pw, 40, \
+         get_byte(identity_key_wrapped_pw, 40) # 1) WHERE handle = $1",
+    )
+    .bind(&bob)
+    .execute(&server.state.db)
+    .await
+    .unwrap();
+    let altered = computer.login(&bob, PASSWORD).await.unwrap_err();
+    assert!(
+        matches!(altered, ClientError::UntrustedKeyMaterial),
+        "{altered:?}"
+    );
+
+    assert_eq!(active_devices_of(&server, &alice).await, 0);
+    assert_eq!(active_devices_of(&server, &bob).await, 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_weak_password_is_refused_before_anything_is_sent() {
     // Nothing listens there: reaching the network would fail differently.

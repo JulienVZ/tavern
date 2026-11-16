@@ -60,6 +60,11 @@ pub enum ClientError {
     /// data is corrupted or the instance is misbehaving.
     #[error("the instance returned invalid key material")]
     UntrustedKeyMaterial,
+    /// The account's keys are stored in a format that this client no longer
+    /// reads: the account was created by a much older version of Tavern and
+    /// cannot be used any more. Not a sign of tampering.
+    #[error("the account was created by a version of Tavern that is too old")]
+    AccountTooOld,
     /// A cryptographic operation failed.
     #[error("cryptographic failure: {0}")]
     Crypto(CryptoError),
@@ -77,6 +82,20 @@ impl ClientError {
         match self {
             Self::Api { code, .. } => Some(*code),
             _ => None,
+        }
+    }
+}
+
+impl ClientError {
+    /// Why a wrapped copy of the account root secret did not open. A format
+    /// this client does not read is reported as such, never as tampering;
+    /// any other failure becomes `otherwise`.
+    pub(crate) fn from_wrapped_root(error: CryptoError, otherwise: ClientError) -> ClientError {
+        match error {
+            CryptoError::RetiredVersion => Self::AccountTooOld,
+            // Written by a newer client: this one must be updated.
+            CryptoError::UnsupportedVersion => Self::ClientTooOld,
+            _ => otherwise,
         }
     }
 }

@@ -262,6 +262,8 @@ const en = {
     "The system keychain is not available, so this device cannot stay signed in.",
   "error.untrusted_key_material":
     "The instance returned keys that do not match this account. Do not continue; contact the administrator.",
+  "error.account_too_old":
+    "This account was created with a version of Tavern that is too old, and can no longer be used. Contact the administrator of the instance.",
   "error.internal": "Something went wrong.",
 } as const;
 
@@ -534,6 +536,8 @@ const fr: Catalogue = {
     "Le trousseau du système est indisponible : cet appareil ne peut pas rester connecté.",
   "error.untrusted_key_material":
     "L'instance a renvoyé des clés qui ne correspondent pas à ce compte. Ne continuez pas ; contactez l'administrateur.",
+  "error.account_too_old":
+    "Ce compte a été créé avec une version trop ancienne de Tavern et ne peut plus être utilisé. Contactez l'administrateur de l'instance.",
   "error.internal": "Une erreur est survenue.",
 };
 

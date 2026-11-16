@@ -17,9 +17,13 @@ pub enum CryptoError {
     /// A wrapped key could not be opened: wrong key, wrong account or tampering.
     #[error("the wrapped key cannot be opened")]
     InvalidWrappedKey,
-    /// A structure carries a version this build does not understand.
+    /// A structure carries a version this build does not understand: newer
+    /// than this build, or never defined.
     #[error("unsupported format version")]
     UnsupportedVersion,
+    /// A structure carries an older version that this build no longer reads.
+    #[error("retired format version")]
+    RetiredVersion,
     /// A recovery key or code is not correctly formed.
     #[error("malformed key or code")]
     InvalidEncoding,

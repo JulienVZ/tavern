@@ -35,7 +35,9 @@
 //! between accounts or between the two kinds.
 //!
 //! Version 1 wrapped the AIK seed itself. It was used by test accounts only
-//! and is no longer read.
+//! and is no longer read: opening such a copy fails with
+//! [`CryptoError::RetiredVersion`], so that the client can say the account
+//! is too old instead of raising the alarm meant for tampered keys.
 //!
 //! # Signatures
 //!
@@ -329,19 +331,32 @@ impl AccountRootSecret {
     /// Opens a wrapped copy.
     ///
     /// `expected` is the account's public identity key as published by the
-    /// server. Opening fails if the key is wrong, if the copy belongs to
-    /// another account or is of the other kind, or if a byte was altered.
+    /// server. Opening fails with [`CryptoError::InvalidWrappedKey`] if the
+    /// key is wrong, if the copy belongs to another account or is of the
+    /// other kind, or if a byte was altered.
+    ///
+    /// A copy in another format fails before any decryption, with
+    /// [`CryptoError::RetiredVersion`] for a format this build no longer
+    /// reads and [`CryptoError::UnsupportedVersion`] for any other. The
+    /// version byte is not secret: a server that changes it only makes the
+    /// sign-in fail, which it can always do.
     pub fn unwrap(
         wrapped: &[u8],
         key: &WrappingKey,
         expected: &IdentityPublicKey,
     ) -> Result<Self, CryptoError> {
+        let Some((&version, rest)) = wrapped.split_first() else {
+            return Err(CryptoError::InvalidWrappedKey);
+        };
+        if version != WRAPPED_KEY_VERSION {
+            return Err(if (1..WRAPPED_KEY_VERSION).contains(&version) {
+                CryptoError::RetiredVersion
+            } else {
+                CryptoError::UnsupportedVersion
+            });
+        }
         if wrapped.len() != WRAPPED_KEY_LEN {
             return Err(CryptoError::InvalidWrappedKey);
-        }
-        let (version, rest) = wrapped.split_at(1);
-        if version != [WRAPPED_KEY_VERSION] {
-            return Err(CryptoError::UnsupportedVersion);
         }
         let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
 
@@ -790,16 +805,35 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_version_is_reported_as_such() {
+    fn a_retired_version_is_told_apart_from_an_unknown_one_and_from_tampering() {
         let identity = AccountRootSecret::generate();
+        let public = identity.identity_key().unwrap().public();
         let (_, key) = recovery_wrapping_key();
-        let mut wrapped = identity.wrap(&key).unwrap();
-        wrapped[0] = 1;
+        let wrapped = identity.wrap(&key).unwrap();
+        let with_version = |version: u8| {
+            let mut copy = wrapped.clone();
+            copy[0] = version;
+            AccountRootSecret::unwrap(&copy, &key, &public).unwrap_err()
+        };
 
+        // Version 1 (AIK seed wrapped directly) is no longer read.
+        assert_eq!(with_version(1), CryptoError::RetiredVersion);
+        // Never defined, or newer than this build.
+        assert_eq!(with_version(0), CryptoError::UnsupportedVersion);
+        assert_eq!(with_version(3), CryptoError::UnsupportedVersion);
+        assert_eq!(with_version(0xff), CryptoError::UnsupportedVersion);
+        // The version is checked before the length: a format of another
+        // size is still recognised as such.
         assert_eq!(
-            AccountRootSecret::unwrap(&wrapped, &key, &identity.identity_key().unwrap().public())
-                .unwrap_err(),
-            CryptoError::UnsupportedVersion
+            AccountRootSecret::unwrap(&[1, 0, 0], &key, &public).unwrap_err(),
+            CryptoError::RetiredVersion
+        );
+        // A current copy that does not open is tampering, not a version.
+        let mut altered = wrapped.clone();
+        altered[40] ^= 1;
+        assert_eq!(
+            AccountRootSecret::unwrap(&altered, &key, &public).unwrap_err(),
+            CryptoError::InvalidWrappedKey
         );
     }
 
