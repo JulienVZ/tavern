@@ -33,7 +33,8 @@ use openmls_traits::OpenMlsProvider;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
 
 pub use credential::{LeafError, Roster, VerifiedLeaf};
-pub use group::{Commit, Group, Incoming, MembershipChanges};
+pub use group::{Commit, ExpectedGroup, Group, Incoming, Joined, MembershipChanges};
+pub use key_package::ClaimedKeyPackage;
 pub use policy::{Alarm, PolicyError};
 pub use signer::{DeviceSigner, ServerSigner};
 
@@ -81,9 +82,14 @@ pub enum MlsError {
     #[error("malformed or unexpected MLS message")]
     Malformed,
     /// The group is not one of Tavern's: other ciphersuite, other external
-    /// sender, other group id format.
+    /// sender, other required capabilities, other group id format.
     #[error("the group does not follow Tavern's parameters")]
     Parameters,
+    /// Not the group this device expected: another conversation or
+    /// generation (an old Welcome replayed), or not the expected
+    /// participants.
+    #[error("not the expected group")]
+    UnexpectedGroup,
     /// OpenMLS refused or failed. Its errors carry no secret.
     #[error("MLS: {0}")]
     Library(String),
@@ -191,13 +197,16 @@ fn group_context_extensions(
 ) -> Result<Extensions<openmls::prelude::GroupContext>, MlsError> {
     Extensions::from_vec(vec![
         Extension::ExternalSenders(vec![server_external_sender(external_sender)]),
-        Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
-            &[],
-            &[],
-            &[CredentialType::Basic],
-        )),
+        Extension::RequiredCapabilities(required_capabilities()),
     ])
     .map_err(library)
+}
+
+/// What every member of a Tavern group must support: basic credentials.
+/// RFC 9420 forbids listing the default extensions (external senders,
+/// ratchet tree), and the ciphersuite is the group's own.
+pub(crate) fn required_capabilities() -> RequiredCapabilitiesExtension {
+    RequiredCapabilitiesExtension::new(&[], &[], &[CredentialType::Basic])
 }
 
 /// The external sender entry for the instance's key.

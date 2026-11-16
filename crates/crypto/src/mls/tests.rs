@@ -87,10 +87,13 @@ impl Device {
     }
 
     fn key_package(&self) -> KeyPackage {
-        key_package::build(&self.provider, &self.signer(), self.credential(), false)
-            .unwrap()
-            .key_package()
-            .clone()
+        key_package::build(&self.provider, &self.signer(), self.credential(), false).unwrap()
+    }
+
+    /// This device's KeyPackage, claimed and checked by a device that trusts
+    /// `roster`.
+    fn claimed(&self, roster: &impl Roster) -> ClaimedKeyPackage {
+        claim(self, &self.key_package(), roster)
     }
 
     fn leaf(&self) -> VerifiedLeaf {
@@ -123,6 +126,26 @@ impl Roster for Pins {
 }
 
 const CONVERSATION: [u8; ID_LEN] = [0xc0; ID_LEN];
+const ALICE: [u8; ID_LEN] = [1; ID_LEN];
+const BOB: [u8; ID_LEN] = [2; ID_LEN];
+const PARTICIPANTS: [[u8; ID_LEN]; 2] = [ALICE, BOB];
+
+fn expected() -> ExpectedGroup<'static> {
+    ExpectedGroup {
+        identity: identity(),
+        participants: &PARTICIPANTS,
+    }
+}
+
+fn claim(device: &Device, key_package: &KeyPackage, roster: &impl Roster) -> ClaimedKeyPackage {
+    key_package::validate_claimed(
+        device.provider.crypto(),
+        &key_package::to_bytes(key_package).unwrap(),
+        device.leaf(),
+        roster,
+    )
+    .unwrap()
+}
 
 fn identity() -> GroupIdentity {
     GroupIdentity {
@@ -161,14 +184,17 @@ impl Dm {
             bob.device(0xb2),
         ];
         let pins = Pins::of(&[&alice, &bob]);
-        let key_packages: Vec<_> = devices[1..].iter().map(Device::key_package).collect();
+        let key_packages: Vec<_> = devices[1..]
+            .iter()
+            .map(|device| device.claimed(&pins))
+            .collect();
 
         let creator = &devices[0];
         let (mut first, commit) = Group::create(
             &creator.provider,
             &creator.signer(),
             creator.credential(),
-            &identity(),
+            &expected(),
             &server.public_bytes(),
             &key_packages,
             &pins,
@@ -180,10 +206,17 @@ impl Dm {
         let welcome = commit.welcome.unwrap();
         let mut groups = vec![first];
         for device in &devices[1..] {
-            let (group, members) =
-                Group::join(&device.provider, &welcome, &pins, &server.public_bytes()).unwrap();
-            assert_eq!(members.len(), 4);
-            groups.push(group);
+            let joined = Group::join(
+                &device.provider,
+                &welcome,
+                &expected(),
+                &pins,
+                &server.public_bytes(),
+            )
+            .unwrap();
+            assert_eq!(joined.members.len(), 4);
+            assert!(!joined.last_resort_used);
+            groups.push(joined.group);
         }
         Self {
             alice,
@@ -354,7 +387,7 @@ fn a_dm_runs_through_the_wrapper() {
 #[test]
 fn a_key_package_of_another_ciphersuite_is_refused() {
     let alice = Account::new(1);
-    let (creator, other) = (alice.device(1), alice.device(2));
+    let other = alice.device(2);
     let foreign = KeyPackage::builder()
         .build(
             Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519,
@@ -363,17 +396,15 @@ fn a_key_package_of_another_ciphersuite_is_refused() {
             other.credential(),
         )
         .unwrap();
-    let server = ExternalSenderKey::generate();
-    let result = Group::create(
-        &creator.provider,
-        &creator.signer(),
-        creator.credential(),
-        &identity(),
-        &server.public_bytes(),
-        &[foreign.key_package().clone()],
+    // Only a ClaimedKeyPackage can be added to a group, and the claim
+    // refuses it.
+    let result = key_package::validate_claimed(
+        other.provider.crypto(),
+        &bytes(foreign.key_package()),
+        other.leaf(),
         &Pins::of(&[&alice]),
     );
-    assert!(matches!(result, Err(MlsError::Parameters)), "{result:?}");
+    assert_eq!(result.unwrap_err(), KeyPackageError::WrongCiphersuite);
 }
 
 #[test]
@@ -381,21 +412,27 @@ fn a_welcome_with_another_external_sender_is_refused() {
     let alice = Account::new(1);
     let (creator, joiner) = (alice.device(1), alice.device(2));
     let rogue = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice]);
+    let only_alice = ExpectedGroup {
+        identity: identity(),
+        participants: &[ALICE],
+    };
     let (_, commit) = Group::create(
         &creator.provider,
         &creator.signer(),
         creator.credential(),
-        &identity(),
+        &only_alice,
         &rogue.public_bytes(),
-        &[joiner.key_package()],
-        &Pins::of(&[&alice]),
+        &[joiner.claimed(&pins)],
+        &pins,
     )
     .unwrap();
     let instance = ExternalSenderKey::generate();
     let result = Group::join(
         &joiner.provider,
         &commit.welcome.unwrap(),
-        &Pins::of(&[&alice]),
+        &only_alice,
+        &pins,
         &instance.public_bytes(),
     );
     assert!(matches!(result, Err(MlsError::Parameters)), "{result:?}");
@@ -528,14 +565,13 @@ fn key_packages_last_ninety_days_and_say_whether_they_are_last_resort() {
         .unwrap()
         .as_secs();
     for last_resort in [false, true] {
-        let bundle = key_package::build(
+        let package = key_package::build(
             &device.provider,
             &device.signer(),
             device.credential(),
             last_resort,
         )
         .unwrap();
-        let package = bundle.key_package();
         assert_eq!(package.last_resort(), last_resort);
         assert_eq!(package.ciphersuite(), CIPHERSUITE);
         let not_after = package.life_time().not_after();
@@ -556,9 +592,7 @@ fn the_server_accepts_a_device_s_own_valid_key_packages() {
         device.credential(),
         true,
     )
-    .unwrap()
-    .key_package()
-    .clone();
+    .unwrap();
 
     assert!(key_package::validate_upload(crypto, &bytes(&one_time), &who, false).is_ok());
     let result = key_package::validate_upload(crypto, &bytes(&last_resort), &who, true);
@@ -788,6 +822,7 @@ fn join_externally(dm: &mut Dm, joiner: &Device) -> Result<(Group, Commit), MlsE
         &joiner.signer(),
         joiner.credential(),
         &info,
+        &expected(),
         &dm.pins,
         &dm.server.public_bytes(),
     )
@@ -1108,14 +1143,10 @@ fn devices_are_told_apart_by_user_and_device_id() {
     let lookalike = dm.alice.device(bob1.device_id[0]);
     assert_eq!(lookalike.device_id, bob1.device_id);
 
+    let claimed = lookalike.claimed(&dm.pins);
     let device = &dm.devices[0];
     let commit = dm.groups[0]
-        .add(
-            &device.provider,
-            &device.signer(),
-            &[lookalike.key_package()],
-            &dm.pins,
-        )
+        .add(&device.provider, &device.signer(), &[claimed], &dm.pins)
         .unwrap();
     assert!(commit.welcome.is_some(), "not taken for Bob's device");
     let device = &dm.devices[0];
@@ -1366,31 +1397,39 @@ fn a_device_with_an_unpinned_identity_is_never_added() {
     // The server hands out KeyPackages: it could slip in a device that
     // claims to be Bob's, certified by another identity key.
     let mut dm = Dm::new();
-    let impostor = Account::new(2).device(0xb7);
-    let device = &dm.devices[0];
+    let impostor_account = Account::new(2);
+    let impostor = impostor_account.device(0xb7);
     let pins = dm.pins.clone();
-    let result = dm.groups[0].add(
-        &device.provider,
-        &device.signer(),
-        &[impostor.key_package()],
+
+    // The claim refuses it...
+    let result = key_package::validate_claimed(
+        impostor.provider.crypto(),
+        &bytes(&impostor.key_package()),
+        impostor.leaf(),
         &pins,
     );
+    assert_eq!(
+        result.unwrap_err(),
+        KeyPackageError::Leaf(LeafError::Untrusted)
+    );
+    // ...and so does the group, if it was claimed with another roster.
+    let claimed = impostor.claimed(&Pins::of(&[&impostor_account]));
+    let device = &dm.devices[0];
+    let result = dm.groups[0].add(&device.provider, &device.signer(), &[claimed], &pins);
     assert!(
         matches!(result, Err(MlsError::Leaf(LeafError::Untrusted))),
         "{result:?}"
     );
     // Nor twice the same device.
     let twin = dm.bob.device(0xb1);
-    let result = dm.groups[0].add(
-        &device.provider,
-        &device.signer(),
-        &[twin.key_package()],
-        &pins,
-    );
+    let claimed = twin.claimed(&pins);
+    let device = &dm.devices[0];
+    let result = dm.groups[0].add(&device.provider, &device.signer(), &[claimed], &pins);
     assert!(
         matches!(result, Err(MlsError::Leaf(LeafError::DuplicateDevice))),
         "{result:?}"
     );
+    assert!(dm.groups[0].inner_mut().pending_commit().is_none());
 }
 
 #[test]
@@ -1421,6 +1460,311 @@ fn a_commit_adding_a_device_with_an_unpinned_identity_is_not_merged() {
     assert!(result.unwrap_err().is_alarm());
     assert_eq!(dm.groups[1].epoch(), before, "not merged");
     assert_eq!(dm.groups[1].devices().len(), 4);
+}
+
+// --- Claimed KeyPackages, creation, expected groups --------------------------------------
+
+#[test]
+fn a_claimed_key_package_must_be_the_announced_device_of_a_pinned_user() {
+    let dm = Dm::new();
+    let bob3 = dm.bob.device(0xb3);
+    let package = bytes(&bob3.key_package());
+    let crypto = bob3.provider.crypto();
+
+    assert_eq!(
+        key_package::validate_claimed(crypto, &package, bob3.leaf(), &dm.pins)
+            .unwrap()
+            .device(),
+        Some(bob3.leaf())
+    );
+    // The server said it was another device.
+    let other = dm.devices[2].leaf();
+    assert_eq!(
+        key_package::validate_claimed(crypto, &package, other, &dm.pins).unwrap_err(),
+        KeyPackageError::WrongDevice
+    );
+    // A user this device does not know.
+    assert_eq!(
+        key_package::validate_claimed(crypto, &package, bob3.leaf(), &Pins::of(&[&dm.alice]))
+            .unwrap_err(),
+        KeyPackageError::Leaf(LeafError::NotParticipant)
+    );
+}
+
+fn storage_is_empty(device: &Device) -> bool {
+    device.provider.storage.values.read().unwrap().is_empty()
+}
+
+#[test]
+fn creating_a_group_writes_nothing_when_a_device_is_refused() {
+    let alice = Account::new(1);
+    let bob = Account::new(2);
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let bob1 = bob.device(0xb1);
+    assert!(storage_is_empty(&creator));
+    let create = |key_packages: &[ClaimedKeyPackage], expected: &ExpectedGroup<'_>| {
+        Group::create(
+            &creator.provider,
+            &creator.signer(),
+            creator.credential(),
+            expected,
+            &server.public_bytes(),
+            key_packages,
+            &pins,
+        )
+        .map(|_| ())
+    };
+
+    // A device certified by an identity key that is not Bob's pinned one.
+    let impostor_account = Account::new(2);
+    let impostor = impostor_account.device(0xb7);
+    let unpinned = impostor.claimed(&Pins::of(&[&impostor_account]));
+    let result = create(&[bob1.claimed(&pins), unpinned], &expected());
+    assert!(
+        matches!(result, Err(MlsError::Leaf(LeafError::Untrusted))),
+        "{result:?}"
+    );
+    assert!(storage_is_empty(&creator));
+
+    // The same device twice.
+    let result = create(&[bob1.claimed(&pins), bob1.claimed(&pins)], &expected());
+    assert!(
+        matches!(result, Err(MlsError::Leaf(LeafError::DuplicateDevice))),
+        "{result:?}"
+    );
+    assert!(storage_is_empty(&creator));
+
+    // Bob missing.
+    let result = create(&[], &expected());
+    assert!(
+        matches!(result, Err(MlsError::UnexpectedGroup)),
+        "{result:?}"
+    );
+    assert!(storage_is_empty(&creator));
+
+    // And when everything is right, the group is written.
+    create(&[bob1.claimed(&pins)], &expected()).unwrap();
+    assert!(!storage_is_empty(&creator));
+}
+
+#[test]
+fn a_welcome_is_accepted_only_for_the_expected_group() {
+    let alice = Account::new(1);
+    let bob = Account::new(2);
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let joiner = bob.device(0xb1);
+    // OpenMLS consumes a one-time KeyPackage as soon as a Welcome for it is
+    // staged, even if the group is then refused: each attempt needs a new
+    // Welcome.
+    let attempt = |expected: &ExpectedGroup<'_>, roster: &Pins| {
+        let creator = alice.device(0xa1);
+        let (_, commit) = Group::create(
+            &creator.provider,
+            &creator.signer(),
+            creator.credential(),
+            &self::expected(),
+            &server.public_bytes(),
+            &[joiner.claimed(&pins)],
+            &pins,
+        )
+        .unwrap();
+        Group::join(
+            &joiner.provider,
+            &commit.welcome.unwrap(),
+            expected,
+            roster,
+            &server.public_bytes(),
+        )
+        .map(|joined| joined.group.delete(&joiner.provider).unwrap())
+    };
+
+    let next_generation = ExpectedGroup {
+        identity: identity().next().unwrap(),
+        participants: &PARTICIPANTS,
+    };
+    assert!(matches!(
+        attempt(&next_generation, &pins),
+        Err(MlsError::UnexpectedGroup)
+    ));
+    let other_conversation = ExpectedGroup {
+        identity: GroupIdentity {
+            conversation_id: [0xc1; ID_LEN],
+            generation: 0,
+        },
+        participants: &PARTICIPANTS,
+    };
+    assert!(matches!(
+        attempt(&other_conversation, &pins),
+        Err(MlsError::UnexpectedGroup)
+    ));
+    let without_bob = ExpectedGroup {
+        identity: identity(),
+        participants: &[ALICE],
+    };
+    let result = attempt(&without_bob, &pins);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Leaf(LeafError::NotParticipant)))
+        ),
+        "{result:?}"
+    );
+    let with_carol = ExpectedGroup {
+        identity: identity(),
+        participants: &[ALICE, BOB, [3; ID_LEN]],
+    };
+    assert!(matches!(
+        attempt(&with_carol, &pins),
+        Err(MlsError::UnexpectedGroup)
+    ));
+    // A member outside the roster.
+    let result = attempt(&expected(), &Pins::of(&[&bob]));
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Leaf(LeafError::NotParticipant)))
+        ),
+        "{result:?}"
+    );
+    // The right one.
+    attempt(&expected(), &pins).unwrap();
+}
+
+#[test]
+fn a_welcome_without_tavern_s_required_capabilities_is_refused() {
+    let alice = Account::new(1);
+    let bob = Account::new(2);
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let joiner = bob.device(0xb1);
+    // Built with OpenMLS directly: Tavern's external sender, no required
+    // capabilities.
+    let config = openmls::prelude::MlsGroupCreateConfig::builder()
+        .ciphersuite(CIPHERSUITE)
+        .capabilities(capabilities())
+        .use_ratchet_tree_extension(true)
+        .with_group_context_extensions(
+            Extensions::single(Extension::ExternalSenders(vec![server_external_sender(
+                &server.public_bytes(),
+            )]))
+            .unwrap(),
+        )
+        .build();
+    let mut group = openmls::prelude::MlsGroup::new_with_group_id(
+        &creator.provider,
+        &creator.signer(),
+        &config,
+        identity().to_group_id(),
+        creator.credential(),
+    )
+    .unwrap();
+    let (_, welcome, _) = group
+        .add_members(
+            &creator.provider,
+            &creator.signer(),
+            &[joiner.key_package()],
+        )
+        .unwrap();
+    let result = Group::join(
+        &joiner.provider,
+        &welcome.tls_serialize_detached().unwrap(),
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    );
+    assert!(matches!(result, Err(MlsError::Parameters)), "{result:?}");
+}
+
+#[test]
+fn a_used_last_resort_key_package_is_deleted_and_an_old_welcome_cannot_be_replayed() {
+    let alice = Account::new(1);
+    let bob = Account::new(2);
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let joiner = bob.device(0xb1);
+
+    // Generation 0, with Bob's last-resort KeyPackage.
+    let last_resort = key_package::build(
+        &joiner.provider,
+        &joiner.signer(),
+        joiner.credential(),
+        true,
+    )
+    .unwrap();
+    let reference = last_resort.hash_ref(joiner.provider.crypto()).unwrap();
+    let (_, commit) = Group::create(
+        &creator.provider,
+        &creator.signer(),
+        creator.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[claim(&joiner, &last_resort, &pins)],
+        &pins,
+    )
+    .unwrap();
+    let old_welcome = commit.welcome.unwrap();
+    let joined = Group::join(
+        &joiner.provider,
+        &old_welcome,
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    assert!(joined.last_resort_used, "the caller must upload a new one");
+    let kept: Option<openmls::prelude::KeyPackageBundle> =
+        openmls_traits::storage::StorageProvider::key_package(
+            joiner.provider.storage(),
+            &reference,
+        )
+        .unwrap();
+    assert!(kept.is_none(), "the used last-resort package is deleted");
+
+    // The conversation is recreated (generation 1); the old group is gone.
+    let generation_1 = ExpectedGroup {
+        identity: identity().next().unwrap(),
+        participants: &PARTICIPANTS,
+    };
+    let creator_2 = alice.device(0xa1);
+    let (_, commit) = Group::create(
+        &creator_2.provider,
+        &creator_2.signer(),
+        creator_2.credential(),
+        &generation_1,
+        &server.public_bytes(),
+        &[joiner.claimed(&pins)],
+        &pins,
+    )
+    .unwrap();
+    Group::join(
+        &joiner.provider,
+        &commit.welcome.unwrap(),
+        &generation_1,
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    joined.group.delete(&joiner.provider).unwrap();
+
+    // The server replays the Welcome of generation 0.
+    for expecting in [generation_1, expected()] {
+        let result = Group::join(
+            &joiner.provider,
+            &old_welcome,
+            &expecting,
+            &pins,
+            &server.public_bytes(),
+        );
+        assert!(
+            matches!(result, Err(MlsError::UnexpectedGroup)),
+            "{result:?}"
+        );
+    }
 }
 
 // --- Section 17: group ids ------------------------------------------------------------------

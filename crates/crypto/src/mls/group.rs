@@ -14,18 +14,20 @@ use std::collections::HashSet;
 
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
 use openmls::prelude::{
-    CommitMessageBundle, CredentialWithKey, KeyPackage, LeafNodeIndex, MlsGroup, MlsMessageBodyIn,
-    MlsMessageIn, MlsMessageOut, ProcessedMessageContent, ProtocolMessage, ProtocolVersion, Sender,
-    StagedWelcome,
+    CommitMessageBundle, CredentialWithKey, KeyPackageBundle, KeyPackageRef, LeafNodeIndex,
+    MlsGroup, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessageContent,
+    ProtocolMessage, ProtocolVersion, Sender, StagedWelcome, Welcome,
 };
 use openmls_traits::OpenMlsProvider;
+use openmls_traits::storage::StorageProvider as _;
 
 use super::credential::{LeafError, Roster, VerifiedLeaf, name_leaf, verify_leaf, verify_members};
 use super::group_id::GroupIdentity;
+use super::key_package::ClaimedKeyPackage;
 use super::policy::{self, Alarm, PolicyError};
 use super::{
     CIPHERSUITE, DeviceSigner, MlsError, create_config, join_config, library, padding,
-    processing_error, server_external_sender,
+    processing_error, required_capabilities, server_external_sender,
 };
 use crate::identity::{ID_LEN, PUBLIC_KEY_LEN};
 
@@ -78,10 +80,105 @@ pub enum Incoming {
     OwnMessage,
 }
 
+/// The group a device expects to create or join: which conversation and
+/// generation, and which users take part. Anything else is refused, such as
+/// an old Welcome replayed after the group was recreated.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedGroup<'a> {
+    /// The conversation and generation.
+    pub identity: GroupIdentity,
+    /// The users of the conversation; each must have a device in the group,
+    /// and nobody else may.
+    pub participants: &'a [[u8; ID_LEN]],
+}
+
+impl ExpectedGroup<'_> {
+    fn check_members(&self, members: &[VerifiedLeaf]) -> Result<(), MlsError> {
+        let users: HashSet<_> = members.iter().map(|leaf| leaf.user_id).collect();
+        if users.iter().any(|user| !self.participants.contains(user)) {
+            return Err(Alarm::Leaf(LeafError::NotParticipant).into());
+        }
+        if self.participants.iter().any(|user| !users.contains(user)) {
+            return Err(MlsError::UnexpectedGroup);
+        }
+        Ok(())
+    }
+}
+
+/// A group joined by Welcome.
+#[derive(Debug)]
+pub struct Joined {
+    /// The group.
+    pub group: Group,
+    /// Its devices, all verified.
+    pub members: Vec<VerifiedLeaf>,
+    /// The Welcome used this device's last-resort KeyPackage. It has been
+    /// deleted: upload a new one (section 3).
+    pub last_resort_used: bool,
+}
+
 /// A Tavern MLS group.
 #[derive(Debug)]
 pub struct Group {
     inner: MlsGroup,
+}
+
+/// This device's KeyPackage that a Welcome is for, if it has it, and whether
+/// it is the last-resort one.
+fn own_key_package<P: OpenMlsProvider>(
+    provider: &P,
+    welcome: &Welcome,
+) -> Result<Option<(KeyPackageRef, bool)>, MlsError> {
+    for secrets in welcome.secrets() {
+        let reference = secrets.new_member();
+        let bundle: Option<KeyPackageBundle> = provider
+            .storage()
+            .key_package(&reference)
+            .map_err(library)?;
+        if let Some(bundle) = bundle {
+            return Ok(Some((reference, bundle.key_package().last_resort())));
+        }
+    }
+    Ok(None)
+}
+
+/// Checks the parameters of a group to join: ciphersuite, id, the
+/// instance's key as the only external sender, required capabilities.
+fn check_context(
+    ciphersuite: openmls::prelude::Ciphersuite,
+    group_id: &openmls::prelude::GroupId,
+    extensions: &openmls::prelude::Extensions<openmls::prelude::GroupContext>,
+    expected: &ExpectedGroup<'_>,
+    external_sender: &[u8; PUBLIC_KEY_LEN],
+) -> Result<(), MlsError> {
+    if ciphersuite != CIPHERSUITE {
+        return Err(MlsError::Parameters);
+    }
+    if *group_id != expected.identity.to_group_id() {
+        return Err(MlsError::UnexpectedGroup);
+    }
+    let senders = vec![server_external_sender(external_sender)];
+    if extensions.external_senders() != Some(&senders) {
+        return Err(MlsError::Parameters);
+    }
+    if extensions.required_capabilities() != Some(&required_capabilities()) {
+        return Err(MlsError::Parameters);
+    }
+    Ok(())
+}
+
+fn check_group_context(
+    context: &openmls::prelude::GroupContext,
+    expected: &ExpectedGroup<'_>,
+    external_sender: &[u8; PUBLIC_KEY_LEN],
+) -> Result<(), MlsError> {
+    check_context(
+        context.ciphersuite(),
+        context.group_id(),
+        context.extensions(),
+        expected,
+        external_sender,
+    )
 }
 
 fn to_bytes(message: &MlsMessageOut) -> Result<Vec<u8>, MlsError> {
@@ -115,6 +212,27 @@ fn commit_from_bundle(bundle: CommitMessageBundle) -> Result<Commit, MlsError> {
     })
 }
 
+/// Checks claimed KeyPackages before they are added: each passes the roster
+/// again (it may differ from the one used at claim time), and no device
+/// appears twice, among them or with `present`.
+fn check_key_packages(
+    key_packages: &[ClaimedKeyPackage],
+    roster: &impl Roster,
+    present: &[VerifiedLeaf],
+) -> Result<Vec<VerifiedLeaf>, MlsError> {
+    let mut devices: HashSet<_> = present.iter().copied().collect();
+    let mut verified = Vec::with_capacity(key_packages.len());
+    for claimed in key_packages {
+        let leaf = claimed.key_package().leaf_node();
+        let device = verify_leaf(leaf.credential(), leaf.signature_key().as_slice(), roster)?;
+        if !devices.insert(device) {
+            return Err(LeafError::DuplicateDevice.into());
+        }
+        verified.push(device);
+    }
+    Ok(verified)
+}
+
 /// An own commit that fails the checks is a bug of this device, not an
 /// alarm about others.
 fn own_commit_error(alarm: Alarm) -> MlsError {
@@ -128,23 +246,39 @@ fn own_commit_error(alarm: Alarm) -> MlsError {
 impl Group {
     /// Creates the group of a conversation and adds `key_packages` (the
     /// other devices of this user and the peer's devices) in one commit,
-    /// which stays pending. Each package must pass the roster: the server
-    /// hands them out, and could slip in a device of its own.
+    /// which stays pending. Everything is checked before anything is written:
+    /// every device passes the roster (the server hands the packages out,
+    /// and could slip in a device of its own), no device appears twice, and
+    /// the devices are exactly those of the expected participants.
     pub fn create<P: OpenMlsProvider>(
         provider: &P,
         signer: &DeviceSigner<'_>,
         credential: CredentialWithKey,
-        identity: &GroupIdentity,
+        expected: &ExpectedGroup<'_>,
         external_sender: &[u8; PUBLIC_KEY_LEN],
-        key_packages: &[KeyPackage],
+        key_packages: &[ClaimedKeyPackage],
         roster: &impl Roster,
     ) -> Result<(Self, Commit), MlsError> {
+        let own = verify_leaf(
+            &credential.credential,
+            credential.signature_key.as_slice(),
+            roster,
+        )?;
+        let mut members = vec![own];
+        members.extend(check_key_packages(key_packages, roster, &[own])?);
+        expected
+            .check_members(&members)
+            .map_err(|error| match error {
+                MlsError::Alarm(Alarm::Leaf(leaf)) => MlsError::Leaf(leaf),
+                other => other,
+            })?;
+
         let config = create_config(external_sender)?;
         let inner = MlsGroup::new_with_group_id(
             provider,
             signer,
             &config,
-            identity.to_group_id(),
+            expected.identity.to_group_id(),
             credential,
         )
         .map_err(library)?;
@@ -153,32 +287,25 @@ impl Group {
         Ok((group, commit))
     }
 
-    /// Adds devices, in a commit that stays pending. Each package must use
-    /// Tavern's ciphersuite and pass the roster, and no device may end up
-    /// with two leaves.
+    /// Adds devices, in a commit that stays pending. Each package must pass
+    /// the roster, and no device may end up with two leaves.
     pub fn add<P: OpenMlsProvider>(
         &mut self,
         provider: &P,
         signer: &DeviceSigner<'_>,
-        key_packages: &[KeyPackage],
+        key_packages: &[ClaimedKeyPackage],
         roster: &impl Roster,
     ) -> Result<Commit, MlsError> {
-        let mut devices: HashSet<_> = self.devices().into_iter().collect();
-        for key_package in key_packages {
-            if key_package.ciphersuite() != CIPHERSUITE {
-                return Err(MlsError::Parameters);
-            }
-            let leaf = key_package.leaf_node();
-            let verified = verify_leaf(leaf.credential(), leaf.signature_key().as_slice(), roster)?;
-            if !devices.insert(verified) {
-                return Err(LeafError::DuplicateDevice.into());
-            }
-        }
+        check_key_packages(key_packages, roster, &self.devices())?;
         let bundle = self
             .inner
             .commit_builder()
             .consume_proposal_store(false)
-            .propose_adds(key_packages.iter().cloned())
+            .propose_adds(
+                key_packages
+                    .iter()
+                    .map(|claimed| claimed.key_package().clone()),
+            )
             .load_psks(provider.storage())
             .map_err(library)?
             .create_group_info(true)
@@ -212,39 +339,55 @@ impl Group {
         }
     }
 
-    /// Joins a group from a Welcome. Every member must pass the roster, the
-    /// group must use Tavern's ciphersuite, a Tavern group id, and the
-    /// instance's key as its only external sender.
+    /// Joins a group from a Welcome. It must be the expected group (its
+    /// conversation, generation and participants), with Tavern's parameters,
+    /// and every member must pass the roster. A used last-resort KeyPackage
+    /// is deleted (section 3): an old Welcome cannot be replayed with it.
     pub fn join<P: OpenMlsProvider>(
         provider: &P,
         welcome: &[u8],
+        expected: &ExpectedGroup<'_>,
         roster: &impl Roster,
         external_sender: &[u8; PUBLIC_KEY_LEN],
-    ) -> Result<(Self, Vec<VerifiedLeaf>), MlsError> {
+    ) -> Result<Joined, MlsError> {
         let MlsMessageBodyIn::Welcome(welcome) = parse(welcome)?.extract() else {
             return Err(MlsError::Malformed);
         };
+        let own = own_key_package(provider, &welcome)?;
         let staged = StagedWelcome::new_from_welcome(provider, &join_config(), welcome, None)
-            .map_err(library)?;
-        let context = staged.group_context();
-        if context.ciphersuite() != CIPHERSUITE {
-            return Err(MlsError::Parameters);
-        }
-        GroupIdentity::from_group_id(context.group_id())?;
-        let expected = vec![server_external_sender(external_sender)];
-        if context.extensions().external_senders() != Some(&expected) {
-            return Err(MlsError::Parameters);
-        }
+            .map_err(|error| match error {
+                // Not for one of this device's KeyPackages (deleted after
+                // use, or never ours), or for a group it is already in.
+                openmls::prelude::WelcomeError::NoMatchingKeyPackage
+                | openmls::prelude::WelcomeError::GroupAlreadyExists => MlsError::UnexpectedGroup,
+                other => library(other),
+            })?;
+        check_group_context(staged.group_context(), expected, external_sender)?;
         let members: Vec<_> = staged.members().collect();
-        let verified = verify_members(
+        let members = verify_members(
             members
                 .iter()
                 .map(|member| (&member.credential, member.signature_key.as_slice())),
             roster,
         )
         .map_err(Alarm::from)?;
+        expected.check_members(&members)?;
         let inner = staged.into_group(provider).map_err(library)?;
-        Ok((Self { inner }, verified))
+        let last_resort_used = match own {
+            Some((reference, true)) => {
+                provider
+                    .storage()
+                    .delete_key_package(&reference)
+                    .map_err(library)?;
+                true
+            }
+            _ => false,
+        };
+        Ok(Joined {
+            group: Self { inner },
+            members,
+            last_resort_used,
+        })
     }
 
     /// Joins a group by external commit, from the GroupInfo the server keeps
@@ -258,16 +401,14 @@ impl Group {
         signer: &DeviceSigner<'_>,
         credential: CredentialWithKey,
         group_info: &[u8],
+        expected: &ExpectedGroup<'_>,
         roster: &impl Roster,
         external_sender: &[u8; PUBLIC_KEY_LEN],
     ) -> Result<(Self, Commit, Vec<VerifiedLeaf>), MlsError> {
         let MlsMessageBodyIn::GroupInfo(group_info) = parse(group_info)?.extract() else {
             return Err(MlsError::Malformed);
         };
-        if group_info.ciphersuite() != CIPHERSUITE {
-            return Err(MlsError::Parameters);
-        }
-        GroupIdentity::from_group_id(group_info.group_id())?;
+        check_group_context(group_info.group_context(), expected, external_sender)?;
         let (inner, bundle) = MlsGroup::external_commit_builder()
             .with_config(join_config())
             .build_group(provider, group_info, credential)
@@ -282,8 +423,14 @@ impl Group {
             .finalize(provider)
             .map_err(library)?;
         let group = Self { inner };
-        let expected = vec![server_external_sender(external_sender)];
-        let checked = if group.inner.extensions().external_senders() == Some(&expected) {
+        let checked = check_context(
+            group.inner.ciphersuite(),
+            group.inner.group_id(),
+            group.inner.extensions(),
+            expected,
+            external_sender,
+        )
+        .and_then(|()| {
             let members: Vec<_> = group.inner.members().collect();
             verify_members(
                 members
@@ -292,9 +439,8 @@ impl Group {
                 roster,
             )
             .map_err(|error| MlsError::Alarm(error.into()))
-        } else {
-            Err(MlsError::Parameters)
-        };
+        })
+        .and_then(|members| expected.check_members(&members).map(|()| members));
         match checked {
             Ok(verified) => Ok((group, commit_from_bundle(bundle)?, verified)),
             Err(error) => {
