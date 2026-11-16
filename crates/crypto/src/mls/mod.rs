@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! MLS (RFC 9420) through OpenMLS 0.9, as decided in ADR 0002 and ADR 0019.
+//!
+//! The client core and the server use this module, never OpenMLS directly.
+//! It fixes the parameters of every group (section 1 of ADR 0019), checks
+//! every leaf against the device certificates and the identity keys the
+//! caller trusts (section 2), builds and validates KeyPackages (3), applies
+//! the client's policy on incoming handshake messages (6, 11), pads content
+//! (8), and computes safety numbers (10).
+//!
+//! What it does not do: store the group state (the caller's
+//! [`openmls_traits::storage::StorageProvider`], ADR 0019 sections 13 and
+//! 14), order or deliver messages (the server), decide who may join a
+//! conversation (the caller's [`Roster`]).
+
+pub mod credential;
+pub mod group;
+pub mod group_id;
+pub mod key_package;
+pub mod padding;
+mod policy;
+pub mod safety_number;
+mod signer;
+
+use openmls::prelude::{
+    Capabilities, Ciphersuite, CredentialType, Extension, ExtensionType, Extensions,
+    ExternalSender, MlsGroupCreateConfig, MlsGroupJoinConfig, PURE_PLAINTEXT_WIRE_FORMAT_POLICY,
+    RequiredCapabilitiesExtension, SenderRatchetConfiguration,
+};
+use openmls_rust_crypto::RustCrypto;
+use openmls_traits::OpenMlsProvider;
+use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
+
+pub use credential::{LeafError, Roster, VerifiedLeaf};
+pub use group::{Commit, Group, Incoming, MembershipChanges};
+pub use policy::PolicyError;
+pub use signer::{DeviceSigner, ServerSigner};
+
+/// The only ciphersuite of Tavern's groups.
+pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+/// OpenMLS pads the content of a `PrivateMessage` to a multiple of this; the
+/// size buckets of [`padding`] are multiples of it.
+pub const PADDING_SIZE: usize = 256;
+/// Past epochs whose secrets are kept: none. The server accepts application
+/// messages for the current epoch only and every device processes the
+/// sequence in order, so nothing ever needs an older epoch (section 9).
+pub const MAX_PAST_EPOCHS: usize = 0;
+/// Messages of one sender that may arrive out of order within an epoch.
+pub const OUT_OF_ORDER_TOLERANCE: u32 = 16;
+/// How far ahead of the last message of a sender a message may be.
+pub const MAXIMUM_FORWARD_DISTANCE: u32 = 1000;
+/// A device commits an update of its own leaf after this many days...
+pub const UPDATE_INTERVAL_DAYS: u64 = 7;
+/// ...or after sending this many messages in the conversation, whichever
+/// comes first (applied by the client's sync engine).
+pub const UPDATE_AFTER_MESSAGES: u32 = 100;
+
+/// Something MLS-related failed.
+#[derive(Debug, thiserror::Error)]
+pub enum MlsError {
+    /// A member's leaf is not acceptable (section 2). In a commit, the
+    /// conversation must be marked broken (section 11).
+    #[error("a member's certificate is not acceptable: {0}")]
+    Leaf(#[from] LeafError),
+    /// Refused by Tavern's policy on handshake messages (section 6).
+    #[error("refused by the group policy: {0}")]
+    Policy(#[from] PolicyError),
+    /// The padded content is malformed.
+    #[error("malformed padding: {0}")]
+    Padding(#[from] padding::PaddingError),
+    /// The bytes are not a well-formed MLS message of the expected kind.
+    #[error("malformed or unexpected MLS message")]
+    Malformed,
+    /// The group is not one of Tavern's: other ciphersuite, other external
+    /// sender, other group id format.
+    #[error("the group does not follow Tavern's parameters")]
+    Parameters,
+    /// OpenMLS refused or failed. Its errors carry no secret.
+    #[error("MLS: {0}")]
+    Library(String),
+}
+
+pub(crate) fn library(error: impl std::fmt::Display) -> MlsError {
+    MlsError::Library(error.to_string())
+}
+
+/// What OpenMLS needs: RustCrypto for the crypto and the randomness, and the
+/// caller's storage (the encrypted local store on a client).
+#[derive(Debug, Default)]
+pub struct Provider<S> {
+    crypto: RustCrypto,
+    storage: S,
+}
+
+impl<S> Provider<S> {
+    /// A provider over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self {
+            crypto: RustCrypto::default(),
+            storage,
+        }
+    }
+}
+
+impl<S: StorageProvider<CURRENT_VERSION>> OpenMlsProvider for Provider<S> {
+    type CryptoProvider = RustCrypto;
+    type RandProvider = RustCrypto;
+    type StorageProvider = S;
+
+    fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    fn crypto(&self) -> &RustCrypto {
+        &self.crypto
+    }
+
+    fn rand(&self) -> &RustCrypto {
+        &self.crypto
+    }
+}
+
+/// The group context extensions of every Tavern group: the server as the
+/// only external sender, and basic credentials required.
+fn group_context_extensions(
+    external_sender: &[u8; crate::identity::PUBLIC_KEY_LEN],
+) -> Result<Extensions<openmls::prelude::GroupContext>, MlsError> {
+    Extensions::from_vec(vec![
+        Extension::ExternalSenders(vec![server_external_sender(external_sender)]),
+        Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+            &[],
+            &[],
+            &[CredentialType::Basic],
+        )),
+    ])
+    .map_err(library)
+}
+
+/// The external sender entry for the instance's key.
+fn server_external_sender(public_key: &[u8; crate::identity::PUBLIC_KEY_LEN]) -> ExternalSender {
+    ExternalSender::new(
+        public_key.to_vec().into(),
+        openmls::prelude::BasicCredential::new(b"tavern external sender".to_vec()).into(),
+    )
+}
+
+/// The configuration of a group this device creates.
+pub(crate) fn create_config(
+    external_sender: &[u8; crate::identity::PUBLIC_KEY_LEN],
+) -> Result<MlsGroupCreateConfig, MlsError> {
+    Ok(MlsGroupCreateConfig::builder()
+        .ciphersuite(CIPHERSUITE)
+        .capabilities(capabilities())
+        .padding_size(PADDING_SIZE)
+        .max_past_epochs(MAX_PAST_EPOCHS)
+        .sender_ratchet_configuration(sender_ratchet())
+        .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .with_group_context_extensions(group_context_extensions(external_sender)?)
+        .build())
+}
+
+/// The configuration of a group this device joins.
+pub(crate) fn join_config() -> MlsGroupJoinConfig {
+    MlsGroupJoinConfig::builder()
+        .padding_size(PADDING_SIZE)
+        .max_past_epochs(MAX_PAST_EPOCHS)
+        .sender_ratchet_configuration(sender_ratchet())
+        .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .build()
+}
+
+fn sender_ratchet() -> SenderRatchetConfiguration {
+    SenderRatchetConfiguration::new(OUT_OF_ORDER_TOLERANCE, MAXIMUM_FORWARD_DISTANCE)
+}
+
+/// What a Tavern leaf supports: our ciphersuite, basic credentials, and the
+/// last-resort KeyPackage extension (a KeyPackage may carry only extensions
+/// its leaf lists).
+pub(crate) fn capabilities() -> Capabilities {
+    Capabilities::new(
+        None,
+        Some(&[CIPHERSUITE]),
+        Some(&[ExtensionType::LastResort]),
+        None,
+        Some(&[CredentialType::Basic]),
+    )
+}
+
+#[cfg(test)]
+mod tests;

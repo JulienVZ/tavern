@@ -28,6 +28,7 @@ mod error;
 
 pub mod identity;
 pub mod local_store;
+pub mod mls;
 pub mod opaque;
 pub mod recovery;
 pub mod secret;

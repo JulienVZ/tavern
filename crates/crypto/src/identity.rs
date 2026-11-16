@@ -424,6 +424,31 @@ impl AccountIdentityKey {
     pub fn sign_credential_update(&self, update: &CredentialUpdate<'_>) -> [u8; SIGNATURE_LEN] {
         self.0.sign(&update.signing_input()).to_bytes()
     }
+
+    /// A certificate in another format version, for tests of its refusal.
+    #[cfg(test)]
+    pub(crate) fn certify_device_with_version(
+        &self,
+        version: u32,
+        user_id: &[u8; ID_LEN],
+        device_id: &[u8; ID_LEN],
+        device_key: &DevicePublicKey,
+    ) -> Vec<u8> {
+        let payload = proto::DeviceCertificatePayload {
+            version,
+            user_id: user_id.to_vec(),
+            device_id: device_id.to_vec(),
+            signature_key: device_key.to_bytes().to_vec(),
+            issued_at_ms: 0,
+        }
+        .encode_to_vec();
+        let signature = self.0.sign(&signing_input(LABEL_CERTIFICATE, &[&payload]));
+        proto::DeviceCertificate {
+            payload,
+            signature: signature.to_bytes().to_vec(),
+        }
+        .encode_to_vec()
+    }
 }
 
 impl std::fmt::Debug for AccountIdentityKey {
@@ -494,6 +519,12 @@ impl ExternalSenderKey {
     pub fn public_bytes(&self) -> [u8; PUBLIC_KEY_LEN] {
         self.0.verifying_key().to_bytes()
     }
+
+    /// Signs MLS content for [`crate::mls`] only, which prefixes it with
+    /// MLS's own labels (RFC 9420, `SignWithLabel`).
+    pub(crate) fn sign_mls(&self, content: &[u8]) -> [u8; SIGNATURE_LEN] {
+        self.0.sign(content).to_bytes()
+    }
 }
 
 impl std::fmt::Debug for ExternalSenderKey {
@@ -558,6 +589,23 @@ impl CredentialUpdate<'_> {
             ],
         )
     }
+}
+
+/// The account and device a device certificate claims, read **without**
+/// verifying it: only to choose which account identity key to verify it
+/// with ([`IdentityPublicKey::verify_device_certificate`]), or to name a
+/// leaf that was verified when it joined.
+pub fn certificate_claimed_ids(
+    certificate: &[u8],
+) -> Result<([u8; ID_LEN], [u8; ID_LEN]), CryptoError> {
+    let envelope =
+        proto::DeviceCertificate::decode(certificate).map_err(|_| CryptoError::InvalidMessage)?;
+    let payload = proto::DeviceCertificatePayload::decode(envelope.payload.as_slice())
+        .map_err(|_| CryptoError::InvalidMessage)?;
+    let id = |bytes: &[u8]| -> Result<[u8; ID_LEN], CryptoError> {
+        bytes.try_into().map_err(|_| CryptoError::InvalidMessage)
+    };
+    Ok((id(&payload.user_id)?, id(&payload.device_id)?))
 }
 
 /// The content of a verified device certificate.
@@ -651,6 +699,15 @@ impl DeviceKey {
     /// Proves possession of this device key to reopen a session.
     pub fn sign_session_proof(&self, challenge: &SessionChallenge<'_>) -> [u8; SIGNATURE_LEN] {
         self.0.sign(&challenge.signing_input()).to_bytes()
+    }
+
+    /// Signs MLS content for [`crate::mls`] only. The device key is also the
+    /// device's MLS signature key (ADR 0002): MLS signs `SignContent`, which
+    /// starts with the length of its label (below 64), while every other
+    /// signature of this key starts with a `tavern …` label, so neither can
+    /// be taken for the other.
+    pub(crate) fn sign_mls(&self, content: &[u8]) -> [u8; SIGNATURE_LEN] {
+        self.0.sign(content).to_bytes()
     }
 }
 

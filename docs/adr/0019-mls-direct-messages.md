@@ -105,6 +105,8 @@ Not exercised yet, left to task 3's tests: external commits, our own storage pro
 
 The plaintext is padded inside the content, before MLS, to the next size bucket: multiples of 256 bytes up to 1 KiB, then 2, 4, 8, 16, 32 and 64 KiB (the maximum size of a text message). OpenMLS's `padding_size` stays at 256 for its own framing. A typical message then shows the server one of a few sizes. Attachments (M5) are separate encrypted blobs with their own padding.
 
+Format (precision validated 2026-11-16): `length of the content (4 bytes, big-endian) || content (tavern.content.v1) || zero bytes`, the whole being exactly one bucket; the header counts in the bucket, so the largest content is 64 KiB minus 4 bytes. Decoding is strict and refuses a size that is not a bucket, an announced length beyond the data, and a padding byte that is not zero. A larger bucket than needed is accepted.
+
 ### 9. Forward secrecy and message order
 
 - `max_past_epochs = 0`: the secrets of an epoch are deleted as soon as the next commit is merged. This holds because the server accepts application messages only for the current epoch and every device processes the sequence in order: no message of a past epoch ever needs decrypting.
@@ -115,7 +117,7 @@ The plaintext is padded inside the content, before MLS, to the next size bucket:
 ### 10. Safety numbers and key changes
 
 - **What they cover**: the two account identity keys (AIK). Devices are certified by the AIK, so a new device changes nothing; the AIK derives from the root secret, which a password change or a recovery keeps (ADR 0017). An AIK change for a contact therefore means a new account under the same handle, or an attack.
-- **Format**: for each user, `SHA-512` iterated 5,200 times over `"tavern safety number v1" || 0 || AIK || user id`; the first 30 bytes, in six blocks of 5 bytes, each taken modulo 100,000, give 30 digits. The safety number is the two 30-digit halves, in the order of the user ids: 60 digits, shown as 12 groups of 5. The QR code holds a version byte and the two AIKs; scanning it compares the keys themselves.
+- **Format**: for each user, `h = SHA-512("tavern safety number v1" || 0 || AIK || user id)`, then 5,199 more times `h = SHA-512(h || AIK)` (5,200 hashes in all, precision validated 2026-11-16); the first 30 bytes, in six blocks of 5 bytes, each read as a big-endian integer modulo 100,000, give 30 digits. The safety number is the two 30-digit halves, in the order of the user ids: 60 digits, shown as 12 groups of 5. The QR code holds a version byte and the two AIKs; scanning it compares the keys themselves.
 - **Pinning**: the AIK of a contact is pinned in the local store when the friendship is accepted (trust on first use) and can be marked verified after comparison.
 - **On change**: never accepted silently. Every conversation with that contact shows a warning; the user must acknowledge before sending again; a verified contact loses the verified mark and gets the stronger warning. Every device of the user shows it, since each pins on its own.
 
@@ -174,6 +176,19 @@ The server's `PublicGroup` is stored in PostgreSQL (`mls_groups`: public group s
 - **End to end**: two users, two devices each, become friends and exchange messages; both users create the DM at the same time and end up in one group; a device offline catches up; a new device joins by external commit and the others see it; a revoked device is removed, the others see it, and it cannot read what follows; a commit conflict between two devices resolves without visible error; unfriending and blocking make the DM read-only on both sides and refriending reopens it; a key change shows the warning; a broken conversation is recreated; after a restored backup (new instance generation), every device must sign in again with the password (and TOTP) before anything else, a device revoked after the backup cannot act without it, every user sees the restore notice asking to check their devices, and every conversation is recreated.
 - **"Only ciphertext in the database"**: the end-to-end test sends messages containing unique markers, then reads every `text` and `bytea` column of every table (and the server's log output) and fails if a marker appears.
 - **Fuzzing** (`cargo-fuzz`): the server's decoding of `SubmitCommit`, `SendMessage` and KeyPackage uploads.
+
+## Implementation
+
+### Task 3: the wrapper (`crates/crypto/src/mls/`)
+
+- Sections 1 (parameters, `Provider` = RustCrypto + the caller's storage), 2 (`credential`: `Roster`, `verify_leaf`, `verify_members`), 3 (`key_package`: building, and `validate_upload` for the server), 6 on the client side and 11 (`policy`, applied by `Group::process`), 8 (`padding`), 9 (parameters), 10 (`safety_number`, computation and format), 17 (`group_id`). `Group` wraps one conversation's OpenMLS group: create, add, join by Welcome, encrypt, process, update, commit pending proposals, remove, merge or discard a pending commit.
+- OpenMLS crates are pinned to exact versions: an upgrade can change the storage format (section 13).
+- `openmls_memory_storage` is in the dependency graph through `openmls_rust_crypto`; it is used by the tests only, which `crates/crypto/tests/mls_test_storage_only.rs` enforces (no production source names it, no crate depends on it outside `[dev-dependencies]`).
+- Precisions found while coding:
+  - The leaf capabilities list our ciphersuite, basic credentials and the last-resort KeyPackage extension: a KeyPackage may carry only extensions its leaf lists, and OpenMLS's validation refuses the last-resort flag otherwise.
+  - The group's required capabilities list basic credentials only. RFC 9420 forbids listing the default extensions (external senders, ratchet tree), and the ciphersuite is fixed by the group itself, so "our ciphersuite and the extensions we use" (section 4) amounts to that.
+  - `Group::add` and `Group::create` check every KeyPackage with the roster before adding it, as section 2 requires for an Add: the server hands them out and could slip in a device of its own.
+  - An update (by proposal or by the committer's path) must keep the leaf's device: a leaf replaced by another device's certificate is refused (`LeafError::DeviceChanged`). This follows from "one leaf per device" and was not written in section 2; it is submitted for validation.
 
 ## Tasks that follow (M2)
 
