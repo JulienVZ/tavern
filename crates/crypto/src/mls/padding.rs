@@ -12,6 +12,8 @@
 //! is not a bucket, a length beyond the data, or a padding byte that is not
 //! zero are all refused.
 
+use zeroize::Zeroizing;
+
 /// The sizes a padded content can have, in bytes.
 pub const BUCKETS: [usize; 10] = [
     256,
@@ -46,8 +48,9 @@ pub enum PaddingError {
     NonZeroPadding,
 }
 
-/// Pads `content` to the smallest bucket that holds it.
-pub fn pad(content: &[u8]) -> Result<Vec<u8>, PaddingError> {
+/// Pads `content` to the smallest bucket that holds it. The padded copy is
+/// plaintext: it is erased when dropped.
+pub fn pad(content: &[u8]) -> Result<Zeroizing<Vec<u8>>, PaddingError> {
     let needed = content
         .len()
         .checked_add(HEADER)
@@ -57,7 +60,9 @@ pub fn pad(content: &[u8]) -> Result<Vec<u8>, PaddingError> {
         .find(|bucket| **bucket >= needed)
         .ok_or(PaddingError::TooLarge)?;
     let length = u32::try_from(content.len()).map_err(|_| PaddingError::TooLarge)?;
-    let mut out = Vec::with_capacity(size);
+    // Allocated at its final size, so that it never moves (and leaves a
+    // copy behind) while it is filled.
+    let mut out = Zeroizing::new(Vec::with_capacity(size));
     out.extend_from_slice(&length.to_be_bytes());
     out.extend_from_slice(content);
     out.resize(size, 0);

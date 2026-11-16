@@ -33,7 +33,7 @@ use openmls_traits::OpenMlsProvider;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
 
 pub use credential::{LeafError, Roster, VerifiedLeaf};
-pub use group::{Commit, ExpectedGroup, Group, Incoming, Joined, MembershipChanges};
+pub use group::{Commit, ExpectedGroup, Group, Incoming, Joined, MembershipChanges, Plaintext};
 pub use key_package::ClaimedKeyPackage;
 pub use policy::{Alarm, PolicyError};
 pub use signer::{DeviceSigner, ServerSigner};

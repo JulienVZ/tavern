@@ -83,7 +83,7 @@ impl Device {
     }
 
     fn signer(&self) -> DeviceSigner<'_> {
-        DeviceSigner(&self.key)
+        DeviceSigner::new(&self.key)
     }
 
     fn key_package(&self) -> KeyPackage {
@@ -239,14 +239,16 @@ impl Dm {
             if index == from {
                 continue;
             }
-            let incoming = self.deliver(index, &message).unwrap();
-            assert_eq!(
-                incoming,
+            match self.deliver(index, &message).unwrap() {
                 Incoming::Application {
-                    sender: Some(self.devices[from].leaf()),
-                    content: content.to_vec(),
+                    sender,
+                    content: got,
+                } => {
+                    assert_eq!(sender, Some(self.devices[from].leaf()));
+                    assert_eq!(got.expose(), content);
                 }
-            );
+                other => panic!("{other:?}"),
+            }
         }
         message
     }
@@ -345,7 +347,7 @@ fn a_dm_runs_through_the_wrapper() {
         removed,
         dm.groups[0].inner_mut().group_id().clone(),
         dm.groups[0].inner_mut().epoch(),
-        &ServerSigner(&dm.server),
+        &ServerSigner::new(&dm.server),
         SenderExtensionIndex::new(0),
     )
     .unwrap()
@@ -690,7 +692,7 @@ fn the_server_may_propose_removals_only() {
         dm.bob.device(0xb9).key_package(),
         dm.groups[0].inner_mut().group_id().clone(),
         dm.groups[0].inner_mut().epoch(),
-        &ServerSigner(&dm.server),
+        &ServerSigner::new(&dm.server),
         SenderExtensionIndex::new(0),
     )
     .unwrap()
@@ -719,7 +721,7 @@ fn a_proposal_signed_by_an_unknown_external_key_is_refused() {
         removed,
         dm.groups[0].inner_mut().group_id().clone(),
         dm.groups[0].inner_mut().epoch(),
-        &ServerSigner(&rogue),
+        &ServerSigner::new(&rogue),
         SenderExtensionIndex::new(0),
     )
     .unwrap()
@@ -978,7 +980,7 @@ fn server_remove(dm: &mut Dm, removed: openmls::prelude::LeafNodeIndex) -> Vec<u
         removed,
         dm.groups[0].inner_mut().group_id().clone(),
         dm.groups[0].inner_mut().epoch(),
-        &ServerSigner(&dm.server),
+        &ServerSigner::new(&dm.server),
         SenderExtensionIndex::new(0),
     )
     .unwrap()
@@ -1258,6 +1260,19 @@ fn a_tampered_padding_inside_a_message_is_refused_by_the_receiver() {
     );
 }
 
+#[test]
+fn decrypted_content_is_never_printed() {
+    let mut dm = Dm::new();
+    let device = &dm.devices[0];
+    let message = dm.groups[0]
+        .encrypt(&device.provider, &device.signer(), b"secret plans")
+        .unwrap();
+    let incoming = dm.deliver(1, &message).unwrap();
+    let printed = format!("{incoming:?}");
+    assert!(!printed.contains("secret"), "{printed}");
+    assert!(printed.contains("<redacted>"));
+}
+
 // --- Section 9: forward secrecy and message order ------------------------------------------
 
 #[test]
@@ -1298,7 +1313,7 @@ fn messages_of_one_sender_may_arrive_out_of_order() {
         .unwrap();
     for (message, content) in [(&second, b"second".as_slice()), (&first, b"first")] {
         match dm.deliver(2, message).unwrap() {
-            Incoming::Application { content: got, .. } => assert_eq!(got, content),
+            Incoming::Application { content: got, .. } => assert_eq!(got.expose(), content),
             other => panic!("{other:?}"),
         }
     }

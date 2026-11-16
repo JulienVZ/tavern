@@ -20,6 +20,7 @@ use openmls::prelude::{
 };
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::storage::StorageProvider as _;
+use zeroize::Zeroizing;
 
 use super::credential::{LeafError, Roster, VerifiedLeaf, name_leaf, verify_leaf, verify_members};
 use super::group_id::GroupIdentity;
@@ -53,6 +54,23 @@ pub struct Commit {
     pub group_info: Vec<u8>,
 }
 
+/// Decrypted content: erased from memory when dropped, never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Plaintext(Zeroizing<Vec<u8>>);
+
+impl Plaintext {
+    /// The content (`tavern.content.v1`).
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Plaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Plaintext(<redacted>, {} bytes)", self.0.len())
+    }
+}
+
 /// What an incoming message turned out to be, once accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
@@ -60,8 +78,8 @@ pub enum Incoming {
     Application {
         /// The device that sent it.
         sender: Option<VerifiedLeaf>,
-        /// The content (`tavern.content.v1`).
-        content: Vec<u8>,
+        /// The content.
+        content: Plaintext,
     },
     /// One of the server's `Remove` proposals, checked and stored: a commit
     /// will refer to it.
@@ -531,10 +549,11 @@ impl Group {
         let sender_leaf = name_leaf(processed.credential());
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(application) => {
-                let bytes = application.into_bytes();
+                let padded = Zeroizing::new(application.into_bytes());
+                let content = Plaintext(Zeroizing::new(padding::unpad(&padded)?.to_vec()));
                 Ok(Incoming::Application {
                     sender: sender_leaf,
-                    content: padding::unpad(&bytes)?.to_vec(),
+                    content,
                 })
             }
             ProcessedMessageContent::ProposalMessage(queued) => {
