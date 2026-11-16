@@ -28,6 +28,8 @@ export interface InstanceProbe {
   /** The instance is older than this client: some features will not work. */
   serverOutdated: boolean;
   rememberedHandle: string | null;
+  /** Accounts that have a device on this computer for this instance. */
+  knownHandles: string[];
   account: Account | null;
 }
 
@@ -47,7 +49,7 @@ export interface Registered {
 
 export type LoginResult =
   | { status: "totp_required" }
-  | { status: "signed_in"; account: Account; newDevice: boolean };
+  | { status: "signed_in"; account: Account; newDevice: boolean; storeReset: boolean };
 
 export interface Device {
   deviceId: string;
@@ -162,6 +164,7 @@ export const api = {
   login: (handle: string, password: string) => invoke<LoginResult>("login", { handle, password }),
   submitTotp: (code: string) => invoke<LoginResult>("submit_totp", { code }),
   logout: () => invoke<void>("logout"),
+  eraseDevice: () => invoke<void>("erase_device"),
   sessionEnded: () => invoke<void>("session_ended"),
   account: () => invoke<Account>("account"),
   devices: () => invoke<Device[]>("devices"),

@@ -23,6 +23,19 @@ const other: Device = { ...here, deviceId: "00000000-0000-7000-8000-0000000000d2
 beforeEach(() => {
   resetCommands();
   setLocale("en");
+  session.screen = "home";
+  session.instanceUrl = "http://localhost:8080";
+  session.account = {
+    userId: "00000000-0000-7000-8000-000000000001",
+    deviceId: here.deviceId,
+    handle: "ann",
+    displayName: "Ann",
+    isAdmin: false,
+    totpEnabled: false,
+  };
+  session.knownHandles = ["ann", "bob"];
+  session.rememberedHandle = "ann";
+  session.endedMessage = null;
   session.newDevices = [other.deviceId];
   onCommand("devices", () => [here, other]);
 });
@@ -65,5 +78,53 @@ describe("revoking a device", () => {
       expect(screen.getByRole("alert").textContent?.trim()).not.toBe("");
     });
     expect(session.newDevices).toEqual([other.deviceId]);
+  });
+});
+
+describe("erasing this device", () => {
+  async function askToErase(): Promise<HTMLElement> {
+    render(Devices);
+    await fireEvent.click(
+      await screen.findByRole("button", { name: "Sign out and erase this device" }),
+    );
+    return screen.getByRole("alertdialog");
+  }
+
+  it("is offered on this device only, and asks first", async () => {
+    const dialog = await askToErase();
+
+    expect(screen.getAllByRole("button", { name: "Sign out and erase this device" })).toHaveLength(1);
+    expect(dialog.textContent).toContain("cannot be undone");
+    expect(callsTo("erase_device")).toEqual([]);
+    await fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(callsTo("erase_device")).toEqual([]);
+  });
+
+  it("signs out and forgets the account on this computer", async () => {
+    onCommand("erase_device", () => undefined);
+    const dialog = await askToErase();
+    await fireEvent.click(within(dialog).getByRole("button", { name: "Erase this device" }));
+
+    await vi.waitFor(() => {
+      expect(session.screen).toBe("auth");
+    });
+    expect(callsTo("erase_device")).toHaveLength(1);
+    expect(session.endedMessage).toBe("ended.erased");
+    expect(session.account).toBeNull();
+    expect(session.knownHandles).toEqual(["bob"]);
+    expect(session.rememberedHandle).toBeNull();
+  });
+
+  it("keeps the user signed in, with the error, when the instance refuses", async () => {
+    onCommand("erase_device", () => {
+      throw { code: "unreachable" };
+    });
+    const dialog = await askToErase();
+    await fireEvent.click(within(dialog).getByRole("button", { name: "Erase this device" }));
+
+    expect(await screen.findByText(/The instance cannot be reached/)).toBeTruthy();
+    expect(session.screen).toBe("home");
+    expect(session.knownHandles).toEqual(["ann", "bob"]);
   });
 });

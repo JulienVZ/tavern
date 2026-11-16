@@ -37,6 +37,14 @@
   let recoverConfirmation = $state("");
   let recoverPasswordOk = $state(false);
 
+  /** The handle typed is an account this computer is already a device of. */
+  const knownDevice = $derived(session.knownHandles.includes(handle.trim().toLowerCase()));
+
+  function pick(known: string): void {
+    handle = known;
+    document.getElementById("login-password")?.focus();
+  }
+
   const mismatch = $derived(confirmation !== "" && confirmation !== newPassword);
   const canRegister = $derived(
     inviteCode.trim() !== "" &&
@@ -183,6 +191,18 @@
     <div id="panel-{tab}" role="tabpanel" aria-labelledby="tab-{tab}">
       {#if tab === "login"}
         <form onsubmit={login} novalidate>
+          {#if session.knownHandles.length > 0}
+            <div class="field">
+              <h2 id="known-accounts" class="small muted">{t("auth.known.title")}</h2>
+              <div class="row" role="group" aria-labelledby="known-accounts">
+                {#each session.knownHandles as known (known)}
+                  <button type="button" aria-pressed={handle === known} onclick={() => pick(known)}>
+                    @{known}
+                  </button>
+                {/each}
+              </div>
+            </div>
+          {/if}
           <div class="field">
             <label for="login-handle">{t("auth.handle")}</label>
             <input
@@ -191,8 +211,12 @@
               autocomplete="username"
               autocapitalize="off"
               spellcheck="false"
+              aria-describedby="login-handle-hint"
               bind:value={handle}
             />
+            <p id="login-handle-hint" class="hint">
+              {knownDevice ? t("auth.known.hint") : ""}
+            </p>
           </div>
           <div class="field">
             <label for="login-password">{t("auth.password")}</label>

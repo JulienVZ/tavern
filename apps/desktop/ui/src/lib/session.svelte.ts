@@ -27,6 +27,8 @@ export const session = $state({
   screen: "instance" as Screen,
   instanceUrl: "",
   rememberedHandle: null as string | null,
+  /** Accounts that have a device on this computer for this instance. */
+  knownHandles: [] as string[],
   /** The instance is older than this client. */
   serverOutdated: false,
   account: null as Account | null,
@@ -34,6 +36,8 @@ export const session = $state({
   registration: null as PendingRegistration | null,
   /** This sign-in enrolled the device: explain the missing history. */
   showHistoryNotice: false,
+  /** The local store of this device could not be opened and starts empty. */
+  showStoreResetNotice: false,
   /** Devices added to the account that the user has not acknowledged. */
   newDevices: [] as string[],
   /** The real-time connection is down. */
@@ -52,6 +56,10 @@ export function applyLogin(result: LoginResult): void {
   }
   session.account = result.account;
   session.showHistoryNotice = result.newDevice;
+  session.showStoreResetNotice = result.storeReset;
+  if (!session.knownHandles.includes(result.account.handle)) {
+    session.knownHandles.push(result.account.handle);
+  }
   session.registration = null;
   session.endedMessage = null;
   session.newDevices = [];
@@ -69,6 +77,7 @@ export function signedOut(reason: MessageKey | null): void {
   session.registration = null;
   session.newDevices = [];
   session.showHistoryNotice = false;
+  session.showStoreResetNotice = false;
   session.securityNotices = [];
   session.offline = false;
   session.endedMessage = reason;
@@ -81,6 +90,19 @@ function addNewDevices(ids: readonly string[]): void {
     if (id !== own && !session.newDevices.includes(id)) {
       session.newDevices.push(id);
     }
+  }
+}
+
+/**
+ * Returns to the sign-in screen after this device was erased: the account is
+ * no longer known on this computer.
+ */
+export function erased(): void {
+  const handle = session.account?.handle;
+  signedOut("ended.erased");
+  session.knownHandles = session.knownHandles.filter((known) => known !== handle);
+  if (session.rememberedHandle === handle) {
+    session.rememberedHandle = null;
   }
 }
 

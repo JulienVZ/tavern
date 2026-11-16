@@ -32,6 +32,7 @@ beforeEach(() => {
   };
   session.newDevices = [];
   session.securityNotices = [];
+  session.showStoreResetNotice = false;
   session.endedMessage = null;
   onCommand("devices", () => []);
   onCommand("session_ended", () => undefined);
@@ -118,5 +119,16 @@ describe("signing out", () => {
       expect(session.screen).toBe("auth");
     });
     expect(session.endedMessage).toBe("ended.logout_unconfirmed");
+  });
+});
+
+describe("a local store that could not be opened", () => {
+  it("is explained until dismissed", async () => {
+    session.showStoreResetNotice = true;
+    render(Home);
+
+    expect(screen.getByText("The local data of this device could not be opened")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "I understand" }));
+    expect(session.showStoreResetNotice).toBe(false);
   });
 });

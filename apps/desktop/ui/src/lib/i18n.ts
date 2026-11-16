@@ -81,6 +81,14 @@ const en = {
     "Messages are end-to-end encrypted: the instance cannot read them, so it cannot hand them to a new device. This device will only see what is sent from now on. Earlier messages stay on your other devices.",
   "history.dismiss": "I understand",
 
+  "storereset.title": "The local data of this device could not be opened",
+  "storereset.body":
+    "The instance no longer has its part of this device's key, for instance because an old backup was restored. This device starts again without local history. Your other devices keep theirs.",
+
+  "auth.known.title": "Accounts on this computer",
+  "auth.known.hint":
+    "This computer is already a device of this account: signing in finds it again, with its local data.",
+
   "newdevice.title": "A new device signed in to your account",
   "newdevice.body.one":
     "A device was added to your account. If it was not you, revoke it and change your password.",
@@ -112,6 +120,10 @@ const en = {
   "devices.revoke.title": "Revoke this device",
   "devices.revoke.confirm": "Revoke this device? It will be signed out at once.",
   "devices.revoke.done": "Device revoked. It has been signed out.",
+  "devices.erase": "Sign out and erase this device",
+  "devices.erase.submit": "Erase this device",
+  "devices.erase.confirm":
+    "This revokes this device and deletes its keys and local data from this computer, including its message history. It cannot be undone. Signing in here again will enrol a new device, without history. To simply sign out and keep everything, use Sign out instead.",
   "devices.new": "New",
   "platform.windows": "Windows",
   "platform.macos": "macOS",
@@ -195,6 +207,8 @@ const en = {
   "ended.account_disabled": "Your account was disabled by an administrator.",
   "ended.invalid": "Your session expired. Sign in again.",
   "ended.replaced": "This account is now connected from another window of this device.",
+  "ended.erased":
+    "This device was erased. Signing in here again will enrol a new device, without history.",
   "ended.logout_unconfirmed":
     "You are signed out on this computer, but the instance could not be reached: the session stays valid there until it expires. To end it now, revoke this device from another one.",
 
@@ -333,6 +347,14 @@ const fr: Catalogue = {
     "Les messages sont chiffrés de bout en bout : l'instance ne peut pas les lire, elle ne peut donc pas les transmettre à un nouvel appareil. Cet appareil ne verra que ce qui est envoyé à partir de maintenant. Les messages précédents restent sur vos autres appareils.",
   "history.dismiss": "J'ai compris",
 
+  "storereset.title": "Les données locales de cet appareil n'ont pas pu être ouvertes",
+  "storereset.body":
+    "L'instance n'a plus sa part de la clé de cet appareil, par exemple parce qu'une ancienne sauvegarde a été restaurée. Cet appareil repart sans historique local. Vos autres appareils gardent le leur.",
+
+  "auth.known.title": "Comptes sur cet ordinateur",
+  "auth.known.hint":
+    "Cet ordinateur est déjà un appareil de ce compte : la connexion le retrouve, avec ses données locales.",
+
   "newdevice.title": "Un nouvel appareil s'est connecté à votre compte",
   "newdevice.body.one":
     "Un appareil a été ajouté à votre compte. Si ce n'était pas vous, révoquez-le et changez votre mot de passe.",
@@ -365,6 +387,10 @@ const fr: Catalogue = {
   "devices.revoke.title": "Révoquer cet appareil",
   "devices.revoke.confirm": "Révoquer cet appareil ? Il sera déconnecté immédiatement.",
   "devices.revoke.done": "Appareil révoqué. Il a été déconnecté.",
+  "devices.erase": "Se déconnecter et effacer cet appareil",
+  "devices.erase.submit": "Effacer cet appareil",
+  "devices.erase.confirm":
+    "Cet appareil sera révoqué, et ses clés et ses données locales supprimées de cet ordinateur, historique des messages compris. C'est irréversible. Une nouvelle connexion ici enrôlera un nouvel appareil, sans historique. Pour vous déconnecter simplement en gardant tout, utilisez « Se déconnecter ».",
   "devices.new": "Nouveau",
   "platform.windows": "Windows",
   "platform.macos": "macOS",
@@ -452,6 +478,8 @@ const fr: Catalogue = {
   "ended.account_disabled": "Votre compte a été désactivé par un administrateur.",
   "ended.invalid": "Votre session a expiré. Reconnectez-vous.",
   "ended.replaced": "Ce compte est maintenant connecté depuis une autre fenêtre de cet appareil.",
+  "ended.erased":
+    "Cet appareil a été effacé. Une nouvelle connexion ici enrôlera un nouvel appareil, sans historique.",
   "ended.logout_unconfirmed":
     "Vous êtes déconnecté sur cet ordinateur, mais l'instance n'a pas pu être jointe : la session y reste valide jusqu'à son expiration. Pour y mettre fin maintenant, révoquez cet appareil depuis un autre.",
 

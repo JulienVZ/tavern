@@ -3,7 +3,7 @@
   import { api, type CommandError, type Device } from "../lib/api";
   import ConfirmDialog from "../lib/ConfirmDialog.svelte";
   import { errorMessage, formatDate, t } from "../lib/i18n";
-  import { guarded, session } from "../lib/session.svelte";
+  import { erased, guarded, session } from "../lib/session.svelte";
 
   let devices = $state<Device[]>([]);
   let loading = $state(true);
@@ -13,6 +13,23 @@
   let revoked = $state(false);
   /** The device whose revocation awaits confirmation. */
   let target = $state<Device | null>(null);
+  /** Erasing this device awaits confirmation. */
+  let erasing = $state(false);
+
+  async function erase(): Promise<void> {
+    erasing = false;
+    working = true;
+    error = null;
+    revoked = false;
+    const result = await guarded(() => api.eraseDevice());
+    working = false;
+    if (result.ok) {
+      erased();
+    } else {
+      // Nothing was erased: the device is still signed in and can retry.
+      error = result.error;
+    }
+  }
 
   async function load(): Promise<void> {
     const result = await guarded(() => api.devices());
@@ -78,7 +95,11 @@
                 {t("devices.last_seen", { date: formatDate(device.lastSeenAtMs) })}{/if}
             </span>
           </div>
-          {#if !device.current}
+          {#if device.current}
+            <button class="danger" type="button" disabled={working} onclick={() => (erasing = true)}>
+              {t("devices.erase")}
+            </button>
+          {:else}
             <button class="danger" type="button" disabled={working} onclick={() => (target = device)}>
               {t("devices.revoke")}
             </button>
@@ -99,6 +120,16 @@
     {/if}
   </div>
 </section>
+
+{#if erasing}
+  <ConfirmDialog
+    title={t("devices.erase")}
+    message={t("devices.erase.confirm")}
+    confirmLabel={t("devices.erase.submit")}
+    onconfirm={erase}
+    oncancel={() => (erasing = false)}
+  />
+{/if}
 
 {#if target !== null}
   <ConfirmDialog

@@ -25,11 +25,13 @@
       }
       session.instanceUrl = probe.url;
       session.rememberedHandle = probe.rememberedHandle;
+      session.knownHandles = probe.knownHandles;
       session.serverOutdated = probe.serverOutdated;
       session.endedMessage = null;
       if (probe.account !== null) {
         session.account = probe.account;
         session.showHistoryNotice = false;
+        session.showStoreResetNotice = false;
         session.screen = "home";
       } else {
         session.screen = "auth";

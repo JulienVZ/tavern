@@ -106,6 +106,18 @@
         <p class="alert error" role="alert">{errorMessage(error)}</p>
       {/if}
 
+      {#if session.showStoreResetNotice}
+        <section class="alert warn stack" role="alert" aria-labelledby="storereset-title">
+          <h2 id="storereset-title">{t("storereset.title")}</h2>
+          <p>{t("storereset.body")}</p>
+          <div>
+            <button type="button" onclick={() => (session.showStoreResetNotice = false)}>
+              {t("history.dismiss")}
+            </button>
+          </div>
+        </section>
+      {/if}
+
       {#if session.showHistoryNotice}
         <section class="alert stack" aria-labelledby="history-title">
           <h2 id="history-title">{t("history.title")}</h2>

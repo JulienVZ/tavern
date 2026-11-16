@@ -83,6 +83,9 @@ struct InstanceProbe {
     server_outdated: bool,
     /// The handle last used on this computer for this instance.
     remembered_handle: Option<String>,
+    /// Handles of the accounts that have a device on this computer for this
+    /// instance, to offer them at sign-in.
+    known_handles: Vec<String>,
     /// The account, when a saved session is still valid.
     account: Option<AccountView>,
 }
@@ -106,6 +109,9 @@ enum LoginView {
         account: AccountView,
         /// The device was enrolled by this login: explain that it has no history.
         new_device: bool,
+        /// The device was known but its local store could not be opened and
+        /// starts empty: explain that the local history is gone.
+        store_reset: bool,
     },
 }
 
@@ -253,6 +259,7 @@ async fn signed_in(app: &AppHandle, session: &mut Session, done: SignedIn) -> Re
     Ok(LoginView::SignedIn {
         account,
         new_device: done.new_device,
+        store_reset: done.store_reset,
     })
 }
 
@@ -295,6 +302,12 @@ async fn probe_instance(
     let mut session = shell.session.lock().await;
     *session = Session::default();
     let remembered_handle = instance.remembered_handle()?;
+    let known_handles = instance
+        .known_accounts()?
+        .accounts
+        .into_iter()
+        .map(|account| account.handle)
+        .collect();
     let account = match instance.resume().await? {
         Some(resumed) => {
             let view = account_view(&resumed).await?;
@@ -311,6 +324,7 @@ async fn probe_instance(
         server_version: version.version,
         server_outdated,
         remembered_handle,
+        known_handles,
         account,
     })
 }
@@ -397,6 +411,25 @@ async fn logout(shell: State<'_, Shell>) -> Result<()> {
     if let Some(client) = session.client.take() {
         client.logout().await?;
     }
+    Ok(())
+}
+
+/// Signs out and erases this device: it is revoked on the instance and its
+/// keys are deleted from this computer. The next sign-in enrols a new device,
+/// without history.
+#[tauri::command]
+async fn erase_device(shell: State<'_, Shell>) -> Result<()> {
+    let mut session = shell.session.lock().await;
+    let client = session
+        .client
+        .clone()
+        .ok_or(CommandError::code("not_signed_in"))?;
+    // Revoke first: if the instance cannot be reached, nothing is erased and
+    // the user is still signed in, so the action can be retried.
+    client.erase_device().await?;
+    session.gateway = None;
+    session.pending_totp = None;
+    session.client = None;
     Ok(())
 }
 
@@ -629,6 +662,7 @@ pub fn run() -> std::result::Result<(), tauri::Error> {
             login,
             submit_totp,
             logout,
+            erase_device,
             session_ended,
             account,
             devices,
@@ -697,6 +731,23 @@ mod tests {
             serde_json::to_string(&LoginView::TotpRequired).unwrap(),
             r#"{"status":"totp_required"}"#
         );
+        let id = Uuid::from_u128(1);
+        let signed_in = serde_json::to_value(LoginView::SignedIn {
+            account: AccountView {
+                user_id: id,
+                device_id: id,
+                handle: "ann".into(),
+                display_name: "Ann".into(),
+                is_admin: false,
+                totp_enabled: false,
+            },
+            new_device: false,
+            store_reset: true,
+        })
+        .unwrap();
+        assert_eq!(signed_in["status"], "signed_in");
+        assert_eq!(signed_in["newDevice"], false);
+        assert_eq!(signed_in["storeReset"], true);
     }
 
     #[test]
