@@ -58,6 +58,8 @@ Not exercised yet, left to task 3's tests: external commits, our own storage pro
 - A `BasicCredential` whose identity is the protobuf `DeviceCertificate` that already exists (user id, device id, device key, issue date, signed by the AIK). The leaf's signature key is the device key, which also signs session proofs: the two uses cannot be confused, since MLS signs `"MLS 1.0 " + label` content prefixed by a length below 64 and our signatures start with the label `tavern …`.
 - **A client accepts a leaf** (in a Welcome, an Add, an Update or an external commit) only if: the certificate decodes, has version 1, and verifies under the AIK of its user; that AIK equals the AIK pinned for that user in the local store (10); the leaf's signature key equals the certified device key; the certificate's user is a participant of the conversation; no two leaves have the same device id.
 - **The server accepts a leaf** under the same rules, with the AIK taken from `users.identity_key`, and the device must be active (not revoked) and belong to the user.
+- **A device is the pair (user id, device id)**: duplicates and changes are judged on both, so that a participant cannot block or impersonate a device of another user by certifying the same device id.
+- **An update keeps its device** (accepted 2026-11-16): a leaf changed by an update, by proposal or by the committer's path, must stay the same pair; one certified for another device is refused. The same holds for an external commit, which may only replace a leaf of the joining device itself (section 5).
 - A leaf that fails these checks in a commit accepted by the server is an alarm, never ignored: see 11.
 
 ### 3. KeyPackages
@@ -66,13 +68,15 @@ Not exercised yet, left to task 3's tests: external commits, our own storage pro
 - Lifetime: 90 days. The last-resort KeyPackage is replaced every 30 days and whenever it has been used; the server deletes expired ones.
 - **Who may claim**: a user may claim the KeyPackages of another user only if they are friends, and those of their own devices. Anyone else gets `FORBIDDEN`, and nothing is consumed. Otherwise anyone could exhaust a user's 20 one-time packages and force the use of the last-resort one.
 - **How often**: at most 60 claims per hour per requesting user, and 10 per hour per (requester, target) pair; beyond, `RATE_LIMITED`. A DM creation claims each user once; external commits claim nothing.
-- **Which devices**: a claim returns a package for each *active* device of the target: not revoked, and connected within `TAVERN_DEVICE_INACTIVE_DAYS` (15). An inactive device would otherwise be added to new conversations only to be removed from them. The same definition applies wherever this ADR says "active devices".
+- **Which devices**: a claim returns a package for each *active* device of the target: not revoked, and connected within `TAVERN_DEVICE_INACTIVE_DAYS` (30 days by default, never more than the retention; section 15). An inactive device would otherwise be added to new conversations only to be removed from them. The same definition applies wherever this ADR says "active devices".
 - The server validates each upload (signature, ciphersuite, lifetime, credential as in 2, `last_resort` extension consistent with the slot) and serves each one-time package once, deleted in the claiming transaction. The last-resort package is served only when no one-time package is left, and is not deleted.
-- The client keeps the private parts in its store; OpenMLS deletes those of a one-time package when its Welcome is processed.
+- The client keeps the private parts in its store. OpenMLS deletes a one-time package as soon as a Welcome for it is staged, even if the device then refuses the group: a refused Welcome cannot be tried again. **The client deletes a used last-resort package after the join**, and uploads a new one: a Welcome replayed later finds no key for it.
+- A package claimed from the server is checked by the claiming device before it adds anyone: OpenMLS's checks, ciphersuite, lifetime, the certificate under the identity key the device trusts for that user, and the device the server named for it.
 
 ### 4. A DM: creation, sending, receiving, catching up
 
 - **One DM per pair of users**: a uniqueness constraint on the server (the pair, smaller user id first, is the primary key of `dm_pairs`). `POST /v1/conversations` is idempotent for a pair: it returns the existing conversation, with its current epoch, if there is one. Two creations that cross get the same conversation.
+- **Joining by Welcome** (accepted 2026-11-16): a device joins only the group it expects, the conversation, generation and participants it learned from the server, and checks Tavern's parameters (ciphersuite, the instance's key as the only external sender, required capabilities) and every member against its roster. Anything else, an old Welcome replayed after the group was recreated included, is refused.
 - **Creation**: `POST /v1/conversations` with a friend reserves the conversation id. If the conversation has no group yet (epoch 0), the device claims one KeyPackage per active device of the peer and of its own user, creates the group (group id in 17, `external_senders` = the server's key, required capabilities: our ciphersuite and the extensions we use), adds everyone in one commit, and submits it with the Welcome and the GroupInfo (`SubmitCommit`). The server builds the public state from that GroupInfo and checks that the members are exactly the active devices of the two users, and that they are friends and neither blocks the other.
 - **Two devices that create the group at the same time**: the first commit for epoch 0 wins (7). The other device gets `STALE_EPOCH`, drops its own group, and joins through the Welcome it is in; a device the winner did not add (enrolled in the meantime) joins by external commit (5).
 - **Sending**: content (`tavern.content.v1`) is padded (8), encrypted for the current epoch, and sent with a `client_message_id`. The server orders it in the conversation's sequence and fans it out to every other leaf, the sender's own devices included.
@@ -83,15 +87,18 @@ Not exercised yet, left to task 3's tests: external commits, our own storage pro
 
 - A new device fetches each conversation's latest GroupInfo (with the ratchet tree) and joins with an external commit carrying its certificate.
 - The server accepts it only from an active device of a participant user, and only if the commit adds that one leaf, removing at most an earlier leaf of the same device (resync).
+- **Members check the same** (accepted 2026-11-16): an external commit may carry only its `ExternalInit` and at most one `Remove`, of a leaf of the same pair (user id, device id) as the joining device; any other `Remove` or any other proposal is refused, with the alarm of section 11. OpenMLS adds that `Remove` itself when the group holds a leaf with the joiner's signature key; since a certificate binds that key to one device of one user, an honest joiner can only remove its own earlier leaf.
+- The joining device checks the group like a Welcome (section 4): the expected conversation, generation and participants, Tavern's parameters, every member against its roster.
 - Members check the certificate as in 2. The conversation shows "Bob added a new device" ([ADR 0006](0006-no-prior-history-v1.md) and `CLAUDE.md` §5); the new device shows that it has no earlier history.
 - Since a joiner has to know the GroupInfo, every commit is submitted with the GroupInfo of its new epoch, and the server keeps only the latest one.
 
 ### 6. Removing a device
 
-- At revocation, or when it has not connected for `TAVERN_DEVICE_INACTIVE_DAYS` (15), the server stops delivering to the device, stores and sends a `Remove` proposal signed with the external sender key in each of its groups, and refuses new application messages there (`REMOVAL_PENDING`) until the removal is committed.
+- At revocation, or when it has not connected for `TAVERN_DEVICE_INACTIVE_DAYS` (30 days by default; section 15), the server stops delivering to the device, stores and sends a `Remove` proposal signed with the external sender key in each of its groups, and refuses new application messages there (`REMOVAL_PENDING`) until the removal is committed.
 - The first online member device commits pending removals at once, without user action, before sending anything.
 - **Clients reject every proposal from an external sender other than `Remove`**, and every external proposal signed by a key that is not in the group's `external_senders`. They also refuse an Add or a group context change that alters `external_senders`.
-- Members may themselves remove only leaves of their own user (a device they replace) or leaves the server has asked to remove; the server refuses other removals in a DM.
+- Members may themselves remove only leaves of their own user (a device they replace) or leaves the server has asked to remove; the server refuses other removals in a DM, and so do clients (accepted 2026-11-16): a client never makes such a commit, and refuses one from another member with the alarm of section 11.
+- **Members never send proposals on their own** (accepted 2026-11-16): a proposal received alone is stored only if it is the server's `Remove`; any other is refused and dropped. A device's own commits carry only the proposals chosen for them (the server's removals, or this commit's own adds or removals), never whatever OpenMLS has stored, and pass the same checks as other devices' commits before they are submitted. In any commit, `Update`, `PreSharedKey`, `ReInit` and custom proposals are refused; so is a commit that refers to a proposal the device refused or never received.
 - **The removal of a device is shown in the conversation**, like an addition: "Bob removed a device" (or "one of your devices was removed"), whatever the cause (revocation, erasure, inactivity).
 
 ### 7. Commit ordering and conflicts
@@ -105,7 +112,7 @@ Not exercised yet, left to task 3's tests: external commits, our own storage pro
 
 The plaintext is padded inside the content, before MLS, to the next size bucket: multiples of 256 bytes up to 1 KiB, then 2, 4, 8, 16, 32 and 64 KiB (the maximum size of a text message). OpenMLS's `padding_size` stays at 256 for its own framing. A typical message then shows the server one of a few sizes. Attachments (M5) are separate encrypted blobs with their own padding.
 
-Format (precision validated 2026-11-16): `length of the content (4 bytes, big-endian) || content (tavern.content.v1) || zero bytes`, the whole being exactly one bucket; the header counts in the bucket, so the largest content is 64 KiB minus 4 bytes. Decoding is strict and refuses a size that is not a bucket, an announced length beyond the data, and a padding byte that is not zero. A larger bucket than needed is accepted.
+Format (precision validated 2026-11-16): `length of the content (4 bytes, big-endian) || content (tavern.content.v1) || zero bytes`, the whole being exactly one bucket; the header counts in the bucket, so the largest content is 64 KiB minus 4 bytes. Decoding is strict and refuses a size that is not a bucket, an announced length beyond the data, and a padding byte that is not zero. A larger bucket than needed is accepted (decided 2026-11-16): it leaves room for deliberate extra padding later, without a change of format.
 
 ### 9. Forward secrecy and message order
 
@@ -187,8 +194,25 @@ The server's `PublicGroup` is stored in PostgreSQL (`mls_groups`: public group s
 - Precisions found while coding:
   - The leaf capabilities list our ciphersuite, basic credentials and the last-resort KeyPackage extension: a KeyPackage may carry only extensions its leaf lists, and OpenMLS's validation refuses the last-resort flag otherwise.
   - The group's required capabilities list basic credentials only. RFC 9420 forbids listing the default extensions (external senders, ratchet tree), and the ciphersuite is fixed by the group itself, so "our ciphersuite and the extensions we use" (section 4) amounts to that.
-  - `Group::add` and `Group::create` check every KeyPackage with the roster before adding it, as section 2 requires for an Add: the server hands them out and could slip in a device of its own.
-  - An update (by proposal or by the committer's path) must keep the leaf's device: a leaf replaced by another device's certificate is refused (`LeafError::DeviceChanged`). This follows from "one leaf per device" and was not written in section 2; it is submitted for validation.
+  - An update must keep the leaf's device (`LeafError::DeviceChanged`). Accepted on 2026-11-16, for the pair (user id, device id) and for external commits (section 2).
+
+### Corrections after the independent review of task 3
+
+Findings of the review, all corrected (commits from `46b90a3`):
+
+1. External commits carry only their `ExternalInit` and at most one `Remove` of the joining device's own earlier leaf (section 5). Tests: a new device, a resync, and the refusal of a `Remove` of another device of the same user and of a device of another user.
+2. Proposals received alone are stored only if they are the server's `Remove`; own commits carry only chosen proposals and pass `check_commit`; `Update`, `PreSharedKey`, `ReInit` and custom proposals are refused (section 6). `ReInit` cannot be built through OpenMLS's public API; it takes the same branch as `PreSharedKey`, which is tested.
+3. `Group::join` and `join_by_external_commit` take the expected group (conversation, generation, participants) and check the required capabilities; a used last-resort KeyPackage is deleted (sections 3, 4). Test: an old Welcome replayed after recreation.
+4. The external commit path is tested (see 1).
+5. `DeviceSigner` and `ServerSigner` sign MLS `SignContent` only.
+6. `key_package::validate_claimed` checks a claimed package; only a `ClaimedKeyPackage` can be added, so `client-core` never calls OpenMLS for it.
+7. Plaintext and padding buffers are erased (`Zeroizing`, `Plaintext` printed as `<redacted>`); `key_package::build` returns the public package only.
+8. `Group::create` checks every device before it writes anything; a test checks that the storage stays empty.
+9. `MlsError::Alarm` and `is_alarm` mark what raises the alarm of section 11: a leaf that is not a verified device, a policy violation in a commit, a commit that refers to a refused or unknown proposal. OpenMLS's refusals are typed (`Refusal`: past epoch, later epoch, already read...).
+10. A member may remove only devices of its own user, or leaves the server asked to remove; `Group::remove` and receivers refuse anything else (section 6).
+11. Devices are compared on the pair (user id, device id) everywhere.
+12. The guard on `openmls_memory_storage` reads the dependency graph (`cargo metadata`, renames included), and CI checks that none of its symbols is linked into the server or the client (it is re-exported by `openmls_rust_crypto`, which the graph alone does not see).
+13. and 14. Tests check exact errors, the groups' actual parameters, positive witnesses, the STALE_EPOCH path, `OwnPendingCommit`, and serialization round trips by property.
 
 ## Tasks that follow (M2)
 
