@@ -71,6 +71,9 @@ pub enum ClientError {
     /// The operating system's credential store failed.
     #[error("the system keychain is unavailable: {0}")]
     Store(String),
+    /// The local store of the account could not be opened or used.
+    #[error("local store: {0}")]
+    LocalStore(#[from] crate::local::LocalStoreError),
     /// A background task was cancelled.
     #[error("the operation was interrupted")]
     Interrupted,

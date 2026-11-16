@@ -57,6 +57,8 @@ describe("error codes produced by the shell", () => {
     "not_found",
     "unavailable",
     "keychain_unavailable",
+    "local_store_unavailable",
+    "local_store_too_new",
     "untrusted_key_material",
     "account_too_old",
     "internal",

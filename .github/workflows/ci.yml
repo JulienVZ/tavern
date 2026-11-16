@@ -118,6 +118,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      # OpenSSL is allowed in one place: inside SQLCipher, the client's local
+      # store (docs/adr/0018). deny.toml limits who may depend on it; this
+      # keeps the server free of it, and of SQLite. The image is checked too.
+      - name: The server depends on no OpenSSL and no SQLite
+        run: |
+          found=$(cargo tree --locked --package tavern-server --target all --edges normal,build --prefix none \
+            | grep -E '^(openssl|openssl-sys|openssl-src|native-tls|libsqlite3-sys|rusqlite|sqlcipher-src) ' || true)
+          if [ -n "$found" ]; then echo "$found" | sort -u; exit 1; fi
       # deny.toml ignores RUSTSEC-2026-0387 on the grounds that no crypto-bigint
       # code is linked (docs/adr/0011). This keeps that claim true.
       - name: crypto-bigint is not linked
@@ -207,6 +215,31 @@ jobs:
       # Compiles the frontend and the application; installers are built by the
       # release workflow only.
       - run: pnpm tauri build --debug --no-bundle
+      # SQLCipher must use the OpenSSL compiled into the client, never the
+      # system's (docs/adr/0018): the binary must not link libssl or
+      # libcrypto, and must carry the version that openssl-src compiles.
+      - name: The client uses its own OpenSSL, not the system's
+        if: runner.os == 'Linux'
+        working-directory: ${{ github.workspace }}
+        run: |
+          binary=target/debug/tavern-desktop
+          readelf --dynamic "$binary" | grep NEEDED
+          if readelf --dynamic "$binary" | grep -E 'lib(ssl|crypto)\.so'; then
+            echo "the client links the system's OpenSSL"; exit 1
+          fi
+          vendored=$(grep -A1 '^name = "openssl-src"$' Cargo.lock | sed -n 's/^version = ".*+\(.*\)"$/\1/p')
+          echo "OpenSSL compiled into the client: $vendored"
+          test -n "$vendored"
+          grep -aq "OpenSSL $vendored" "$binary"
+          echo "Loaded at run time (informative):"
+          ldd "$binary" | grep -E 'lib(ssl|crypto)' || echo "  no libssl or libcrypto"
+      # The local store's tests (docs/adr/0018) on the systems that the Rust
+      # job does not cover: CommonCrypto on macOS, OpenSSL on Windows, the
+      # same file format everywhere.
+      - name: Local store (SQLCipher) on this system
+        if: runner.os != 'Linux'
+        working-directory: ${{ github.workspace }}
+        run: cargo test --locked --package tavern-client-core
       # The Linux run of these tests is in the Rust job. macOS is where the
       # allocator kept the 128 MiB (docs/adr/0015); Windows is checked too.
       - name: Argon2id working memory is returned to the system
@@ -253,6 +286,15 @@ jobs:
           build-args: TAVERN_BUILD_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: The server binary contains no OpenSSL
+        run: |
+          container=$(docker create tavern-server:local)
+          docker cp "$container:/usr/local/bin/tavern-server" "$RUNNER_TEMP/tavern-server"
+          docker rm "$container"
+          readelf --dynamic "$RUNNER_TEMP/tavern-server" | grep NEEDED
+          if readelf --dynamic "$RUNNER_TEMP/tavern-server" | grep -E 'lib(ssl|crypto)\.so'; then exit 1; fi
+          # A statically linked OpenSSL carries its version text.
+          if grep -aq 'OpenSSL 3\.' "$RUNNER_TEMP/tavern-server"; then exit 1; fi
       - name: Prepare a local deployment (init.sh --dev)
         working-directory: deploy
         run: |

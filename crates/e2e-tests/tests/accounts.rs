@@ -132,7 +132,8 @@ async fn a_known_computer_reopens_its_session_instead_of_enrolling_again() {
         .await
         .unwrap()
         .expect("the session is still valid");
-    assert_eq!(resumed.device_id(), device_id);
+    assert!(!resumed.new_device && !resumed.store_reset);
+    assert_eq!(resumed.client.device_id(), device_id);
 
     // After signing out there is nothing to resume, but the device is remembered.
     client.logout().await.unwrap();
@@ -315,8 +316,14 @@ async fn keys_that_do_not_match_the_account_raise_the_alarm() {
 async fn a_weak_password_is_refused_before_anything_is_sent() {
     // Nothing listens there: reaching the network would fail differently.
     let nowhere = InstanceUrl::parse("http://127.0.0.1:1").unwrap();
-    let computer =
-        InstanceClient::new(nowhere, std::sync::Arc::new(MemoryStore::default()), None).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let computer = InstanceClient::new(
+        nowhere,
+        std::sync::Arc::new(MemoryStore::default()),
+        data.path(),
+        None,
+    )
+    .unwrap();
 
     for password in ["short", "passwordpassword", "alice_wonder_2026"] {
         let error = computer

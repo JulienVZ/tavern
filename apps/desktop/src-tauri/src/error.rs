@@ -4,6 +4,7 @@
 //! maps to a localised message. No detail that could contain a secret.
 
 use serde::Serialize;
+use tavern_client_core::local::LocalStoreError;
 use tavern_client_core::password::PasswordIssue;
 use tavern_client_core::{ClientError, InstanceUrlError};
 use tavern_protocol::handle::HandleError;
@@ -104,6 +105,10 @@ impl From<ClientError> for CommandError {
             ClientError::UntrustedKeyMaterial => Self::code("untrusted_key_material"),
             ClientError::AccountTooOld => Self::code("account_too_old"),
             ClientError::Store(_) => Self::code("keychain_unavailable"),
+            ClientError::LocalStore(LocalStoreError::TooNew { .. }) => {
+                Self::code("local_store_too_new")
+            }
+            ClientError::LocalStore(_) => Self::code("local_store_unavailable"),
             ClientError::Crypto(_) | ClientError::Interrupted => Self::code("internal"),
         }
     }

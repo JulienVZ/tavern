@@ -11,6 +11,7 @@
 
 mod error;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -48,6 +49,8 @@ struct Session {
 
 struct Shell {
     store: Arc<dyn SecretStore>,
+    /// The application's local data directory: the accounts' local stores.
+    local_data: PathBuf,
     /// Separates several accounts on one computer (`TAVERN_PROFILE`), for
     /// development: two clients can then run side by side.
     profile: Option<String>,
@@ -88,6 +91,8 @@ struct InstanceProbe {
     known_handles: Vec<String>,
     /// The account, when a saved session is still valid.
     account: Option<AccountView>,
+    /// With `account`: its local store could not be opened and starts empty.
+    store_reset: bool,
 }
 
 /// A new account. `recovery_key` is displayed once and never stored.
@@ -296,20 +301,24 @@ async fn probe_instance(
         // Nothing would work reliably: refuse now, with a clear reason.
         Compatibility::ServerNewer => return Err(ClientError::ClientTooOld.into()),
     };
-    let instance =
-        InstanceClient::new(instance_url, shell.store.clone(), shell.profile.as_deref())?;
+    let instance = InstanceClient::new(
+        instance_url,
+        shell.store.clone(),
+        &shell.local_data,
+        shell.profile.as_deref(),
+    )?;
 
     let mut session = shell.session.lock().await;
     *session = Session::default();
     let remembered_handle = instance.remembered_handle()?;
     let known_handles = known_handles(&instance)?;
-    let account = match instance.resume().await? {
+    let (account, store_reset) = match instance.resume().await? {
         Some(resumed) => {
-            let view = account_view(&resumed).await?;
-            attach(&app, &mut session, resumed)?;
-            Some(view)
+            let view = account_view(&resumed.client).await?;
+            attach(&app, &mut session, resumed.client)?;
+            (Some(view), resumed.store_reset)
         }
-        None => None,
+        None => (None, false),
     };
     let url = instance.instance().as_str().to_owned();
     session.instance = Some(instance);
@@ -321,6 +330,7 @@ async fn probe_instance(
         remembered_handle,
         known_handles,
         account,
+        store_reset,
     })
 }
 
@@ -660,8 +670,12 @@ pub fn run() -> std::result::Result<(), tauri::Error> {
             if let (Some(profile), Some(window)) = (&profile, app.get_webview_window("main")) {
                 window.set_title(&format!("Tavern ({profile})"))?;
             }
+            // Local, not roaming, on Windows: the store is useless on any other
+            // computer, its key being this device's.
+            let local_data = app.path().app_local_data_dir()?;
             app.manage(Shell {
                 store: Arc::new(KeychainStore::new(&identifier)),
+                local_data,
                 profile,
                 session: Mutex::new(Session::default()),
             });

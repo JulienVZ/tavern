@@ -31,7 +31,7 @@
       if (probe.account !== null) {
         session.account = probe.account;
         session.showHistoryNotice = false;
-        session.showStoreResetNotice = false;
+        session.showStoreResetNotice = probe.storeReset;
         session.screen = "home";
       } else {
         session.screen = "auth";

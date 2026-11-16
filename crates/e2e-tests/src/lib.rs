@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,9 @@ pub struct Server {
     pub addr: SocketAddr,
     /// Its state, for assertions on the database.
     pub state: AppState,
+    /// The local data directories of the simulated computers, deleted with
+    /// the server.
+    data: tempfile::TempDir,
 }
 
 impl Server {
@@ -99,7 +103,8 @@ impl Server {
             .await
             .unwrap();
         });
-        Self { addr, state }
+        let data = tempfile::tempdir().expect("a temporary directory");
+        Self { addr, state, data }
     }
 
     /// A client on a computer that has never been used: empty secret store.
@@ -115,10 +120,18 @@ impl Server {
     }
 
     /// Another client on a computer whose secret store is `store`, under
-    /// `profile`.
+    /// `profile`. A computer is its secret store: the same store always comes
+    /// with the same local data directory.
     pub fn computer(&self, store: &Arc<MemoryStore>, profile: Option<&str>) -> InstanceClient {
         let url = InstanceUrl::parse(&format!("http://{}", self.addr)).unwrap();
-        InstanceClient::new(url, store.clone(), profile).unwrap()
+        InstanceClient::new(url, store.clone(), &self.local_data(store), profile).unwrap()
+    }
+
+    /// The local data directory of the computer whose secret store is `store`.
+    pub fn local_data(&self, store: &Arc<MemoryStore>) -> PathBuf {
+        self.data
+            .path()
+            .join(format!("computer-{:p}", Arc::as_ptr(store)))
     }
 
     /// Creates an invitation on the host, as `create-admin.sh` does.

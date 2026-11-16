@@ -31,7 +31,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use sha2::Sha512;
+use sha2::{Digest, Sha256, Sha512};
 use zeroize::Zeroizing;
 
 use crate::CryptoError;
@@ -49,6 +49,7 @@ const TAG_LEN: usize = 16;
 const VERSION: u8 = 1;
 const LABEL_WRAP: &[u8] = b"tavern local store wrap v1";
 const LABEL_AAD: &[u8] = b"tavern local store wrapped v1";
+const LABEL_DIRECTORY: &[u8] = b"tavern local store directory v1";
 
 /// The two parts needed to open a wrapped store key, and what they are for.
 #[derive(Debug)]
@@ -133,6 +134,24 @@ impl StoreKeyParts<'_> {
         );
         Secret::from_slice(&opened).ok_or(CryptoError::InvalidWrappedKey)
     }
+}
+
+/// Name of the directory that holds an account's local store on this
+/// computer: the first 16 bytes of `SHA-256(label || 0x00 || user id ||
+/// scope)`, in lowercase hexadecimal. `scope` names the instance and the
+/// profile (the key of the keychain index).
+///
+/// A directory listing then shows neither the instance nor the account. The
+/// name is not a secret: whoever knows both can recompute it, as they can
+/// read the names of the keychain entries.
+pub fn directory_name(scope: &str, user_id: &[u8; ID_LEN]) -> String {
+    let digest = Sha256::new()
+        .chain_update(LABEL_DIRECTORY)
+        .chain_update([0])
+        .chain_update(user_id)
+        .chain_update(scope.as_bytes())
+        .finalize();
+    data_encoding::HEXLOWER.encode(&digest[..16])
 }
 
 #[cfg(test)]
@@ -233,5 +252,25 @@ mod tests {
         let hex: String = wrapped.iter().map(|byte| format!("{byte:02x}")).collect();
 
         assert_eq!(hex, WRAPPED);
+    }
+
+    #[test]
+    fn directory_names_are_stable_and_reveal_nothing() {
+        let user = [7u8; ID_LEN];
+        let name = directory_name("https://chat.example.org", &user);
+
+        assert_eq!(name, directory_name("https://chat.example.org", &user));
+        assert_eq!(name.len(), 32);
+        assert!(name.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(
+            name,
+            directory_name("https://chat.example.org#second", &user)
+        );
+        assert_ne!(
+            name,
+            directory_name("https://chat.example.org", &[8u8; ID_LEN])
+        );
+        // Frozen: another value would orphan every store on every computer.
+        assert_eq!(name, "2a451ae186bd5746f6c3f4ae13cdccb6");
     }
 }

@@ -15,6 +15,7 @@ mod api;
 pub mod error;
 pub mod gateway;
 pub mod instance;
+pub mod local;
 pub mod password;
 pub mod qr;
 pub mod store;

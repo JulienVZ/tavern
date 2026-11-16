@@ -260,6 +260,10 @@ const en = {
   "error.unavailable": "The instance is busy. Try again in a moment.",
   "error.keychain_unavailable":
     "The system keychain is not available, so this device cannot stay signed in.",
+  "error.local_store_unavailable":
+    "This account's data on this computer cannot be opened (disk full or not writable?). Free some space or check the permissions, then try again.",
+  "error.local_store_too_new":
+    "This account's data on this computer was written by a newer version of Tavern. Update Tavern, then try again.",
   "error.untrusted_key_material":
     "The instance returned keys that do not match this account. Do not continue; contact the administrator.",
   "error.account_too_old":
@@ -534,6 +538,10 @@ const fr: Catalogue = {
   "error.unavailable": "L'instance est occupée. Réessayez dans un instant.",
   "error.keychain_unavailable":
     "Le trousseau du système est indisponible : cet appareil ne peut pas rester connecté.",
+  "error.local_store_unavailable":
+    "Les données de ce compte sur cet ordinateur ne peuvent pas être ouvertes (disque plein ou protégé en écriture ?). Libérez de la place ou vérifiez les droits, puis réessayez.",
+  "error.local_store_too_new":
+    "Les données de ce compte sur cet ordinateur ont été écrites par une version plus récente de Tavern. Mettez Tavern à jour, puis réessayez.",
   "error.untrusted_key_material":
     "L'instance a renvoyé des clés qui ne correspondent pas à ce compte. Ne continuez pas ; contactez l'administrateur.",
   "error.account_too_old":

@@ -31,6 +31,8 @@ export interface InstanceProbe {
   /** Accounts that have a device on this computer for this instance. */
   knownHandles: string[];
   account: Account | null;
+  /** With `account`: its local store could not be opened and starts empty. */
+  storeReset: boolean;
 }
 
 export type PasswordIssue = "too_short" | "too_long" | "too_guessable";

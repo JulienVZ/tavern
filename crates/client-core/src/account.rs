@@ -10,6 +10,7 @@
 //! One computer keeps one device per account (ADR 0017): signing out keeps
 //! the device, so signing in again finds it and its local store.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,7 @@ use tavern_crypto::identity::{
     AccountRootSecret, CredentialUpdate, CredentialUpdatePurpose, DeviceKey, IdentityPublicKey,
     SessionChallenge, WrappingKey,
 };
-use tavern_crypto::local_store::StoreKeyParts;
+use tavern_crypto::local_store::{self, StoreKeyParts};
 use tavern_crypto::opaque::client::{Login, Registration};
 use tavern_crypto::opaque::{ExportKey, Password};
 use tavern_crypto::recovery::RecoveryKey;
@@ -39,6 +40,7 @@ use crate::api::{Api, Auth};
 use crate::error::ClientError;
 use crate::gateway::Gateway;
 use crate::instance::InstanceUrl;
+use crate::local::{AccountDirectory, Binding, LocalStore};
 use crate::password;
 use crate::store::{KnownAccounts, Records, SecretStore, StoredDevice};
 
@@ -76,6 +78,8 @@ fn now_ms() -> u64 {
 pub struct InstanceClient {
     api: Api,
     records: Records,
+    /// Where the local stores of this computer live.
+    local_root: Arc<PathBuf>,
 }
 
 impl std::fmt::Debug for InstanceClient {
@@ -131,9 +135,10 @@ pub struct SignedIn {
     /// explain that a new device starts without message history.
     pub new_device: bool,
     /// `true` when the device was known but its local store could no longer
-    /// be opened (the instance lost its part of the key, for instance after
-    /// an old backup was restored). The store starts empty again, and the
-    /// interface must say that the local history is gone.
+    /// be opened: the instance lost its part of the key (for instance after
+    /// an old backup was restored), or the file was damaged or deleted. The
+    /// store starts empty again, and the interface must say that the local
+    /// history is gone.
     pub store_reset: bool,
 }
 
@@ -174,18 +179,72 @@ impl PendingTotp {
 }
 
 impl InstanceClient {
-    /// Prepares to talk to an instance. `profile` separates several accounts
-    /// on one computer; pass `None` normally.
+    /// Prepares to talk to an instance. `local_root` is the directory of this
+    /// computer's local stores (the application's local data directory).
+    /// `profile` separates several accounts on one computer; pass `None`
+    /// normally.
     pub fn new(
         instance: InstanceUrl,
         store: Arc<dyn SecretStore>,
+        local_root: &Path,
         profile: Option<&str>,
     ) -> Result<Self, ClientError> {
         let records = Records::new(store, instance.as_str(), profile);
         Ok(Self {
             api: Api::new(instance)?,
             records,
+            local_root: Arc::new(local_root.to_owned()),
         })
+    }
+
+    /// The directory of an account's local store on this computer.
+    fn account_directory(&self, user_id: Uuid) -> AccountDirectory {
+        AccountDirectory(
+            self.local_root
+                .join("accounts")
+                .join(local_store::directory_name(
+                    self.records.scope(),
+                    user_id.as_bytes(),
+                )),
+        )
+    }
+
+    /// Opens the local store of a signed-in account (see
+    /// [`AccountDirectory::open`]) and records that this device has one.
+    /// Returns the store and whether it had to start empty.
+    async fn open_local_store(
+        &self,
+        device: &StoredDevice,
+        store_key: &Arc<Secret<32>>,
+        fresh: bool,
+    ) -> Result<(LocalStore, bool), ClientError> {
+        let directory = self.account_directory(device.user_id);
+        let key = Arc::clone(store_key);
+        let binding = Binding {
+            user_id: device.user_id,
+            device_id: device.device_id,
+        };
+        let existed = device.local_store_created;
+        let opened =
+            blocking(move || directory.open(&key, binding, fresh, existed, now_ms())).await??;
+        if !existed {
+            let mut device = device.clone();
+            device.local_store_created = true;
+            self.records.update_device(&device)?;
+        }
+        Ok((opened.store, opened.reset))
+    }
+
+    /// Deletes an account's local store from this computer, after its device
+    /// was revoked: nothing can open it any more. A failure is only logged:
+    /// the files are unreadable, and the next new store replaces them.
+    async fn remove_local_store(&self, user_id: Uuid) {
+        let directory = self.account_directory(user_id);
+        match blocking(move || directory.remove()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "could not delete a revoked local store"),
+            Err(error) => tracing::warn!(%error, "could not delete a revoked local store"),
+        }
     }
 
     /// The instance this client talks to.
@@ -358,7 +417,7 @@ impl InstanceClient {
         })?;
 
         let known = self.records.device(grant.user_id)?;
-        let (session, device_seed, wrapped, new_device) = match known {
+        let (session, device_seed, wrapped, new_device, store_created) = match known {
             Some(device) => {
                 let seed =
                     Secret::<32>::from_slice(device.device_seed.as_slice()).ok_or_else(|| {
@@ -370,12 +429,14 @@ impl InstanceClient {
                         device.device_seed,
                         Some(device.wrapped_store_key),
                         false,
+                        device.local_store_created,
                     ),
                     Err(error) => {
                         if error.api_code() == Some(ErrorCode::InvalidProof) {
                             // The device was revoked. Forget it: the next
                             // login enrols this computer as a new device.
                             self.records.forget_device(grant.user_id)?;
+                            self.remove_local_store(grant.user_id).await;
                             return Err(ClientError::DeviceRevoked);
                         }
                         return Err(error);
@@ -384,7 +445,7 @@ impl InstanceClient {
             }
             None => {
                 let (session, seed) = self.enrol(&grant, &root).await?;
-                (session, B64::from(*seed.expose()), None, true)
+                (session, B64::from(*seed.expose()), None, true, false)
             }
         };
 
@@ -403,7 +464,7 @@ impl InstanceClient {
         let opened = wrapped
             .as_ref()
             .and_then(|wrapped| parts.unwrap(wrapped.as_slice()).ok());
-        let store_reset = wrapped.is_some() && opened.is_none();
+        let key_reset = wrapped.is_some() && opened.is_none();
         let (store_key, wrapped_store_key) = match (opened, wrapped) {
             (Some(store_key), Some(wrapped)) => (store_key, wrapped),
             _ => {
@@ -413,7 +474,7 @@ impl InstanceClient {
             }
         };
 
-        self.records.save_device(&StoredDevice {
+        let device = StoredDevice {
             user_id: grant.user_id,
             handle: grant.handle.clone(),
             device_id: session.device_id,
@@ -421,17 +482,27 @@ impl InstanceClient {
             wrapped_store_key,
             session_token: Some(session.session_token.clone()),
             store_key: Some(B64::from(*store_key.expose())),
-        })?;
+            // A new key cannot open what a store had before.
+            local_store_created: store_created && !key_reset,
+        };
+        // Saved before the store is opened: if that fails, the next start
+        // resumes this session and tries again, instead of enrolling anew.
+        self.records.save_device(&device)?;
+        let store_key = Arc::new(store_key);
+        let (local, store_reset) = self
+            .open_local_store(&device, &store_key, new_device || key_reset)
+            .await?;
         Ok(SignedIn {
             client: Client {
                 instance: self.clone(),
                 user_id: grant.user_id,
                 device_id: session.device_id,
                 session_token: session.session_token,
-                store_key: Arc::new(store_key),
+                store_key,
+                local,
             },
             new_device,
-            store_reset,
+            store_reset: key_reset || store_reset,
         })
     }
 
@@ -593,9 +664,10 @@ impl InstanceClient {
     }
 
     /// Resumes the session of the account used last on this computer, if it
-    /// is still valid. Needs neither the password nor, for the local store,
-    /// the instance: a signed-in account keeps its store key in the record.
-    pub async fn resume(&self) -> Result<Option<Client>, ClientError> {
+    /// is still valid, and opens its local store. Needs neither the password
+    /// nor, for the store, the instance's part of the key: a signed-in
+    /// account keeps its store key in the record. Never a new device.
+    pub async fn resume(&self) -> Result<Option<SignedIn>, ClientError> {
         let Some(mut device) = self.records.last_device()? else {
             return Ok(None);
         };
@@ -608,24 +680,35 @@ impl InstanceClient {
         ) else {
             return Ok(None);
         };
-        let client = Client {
-            instance: self.clone(),
-            user_id: device.user_id,
-            device_id: device.device_id,
-            session_token,
-            store_key: Arc::new(store_key),
-        };
-        match client.me().await {
-            Ok(_) => Ok(Some(client)),
+        let me: Result<Me, ClientError> = self
+            .api
+            .fetch("v1/users/me", Auth::Session(&session_token))
+            .await;
+        match me {
+            Ok(_) => {}
             Err(ClientError::SessionEnded) => {
                 // Same as signing out: the device key stays, so the next
                 // login reopens this device; the store key goes.
                 device.sign_out();
                 self.records.update_device(&device)?;
-                Ok(None)
+                return Ok(None);
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
         }
+        let store_key = Arc::new(store_key);
+        let (local, store_reset) = self.open_local_store(&device, &store_key, false).await?;
+        Ok(Some(SignedIn {
+            client: Client {
+                instance: self.clone(),
+                user_id: device.user_id,
+                device_id: device.device_id,
+                session_token,
+                store_key,
+                local,
+            },
+            new_device: false,
+            store_reset,
+        }))
     }
 }
 
@@ -654,6 +737,8 @@ pub struct Client {
     session_token: B64,
     /// Key of this device's local store.
     store_key: Arc<Secret<32>>,
+    /// The local store, open while signed in.
+    local: LocalStore,
 }
 
 impl std::fmt::Debug for Client {
@@ -690,6 +775,11 @@ impl Client {
         &self.store_key
     }
 
+    /// This device's local store for the account. Closed by signing out.
+    pub fn local_store(&self) -> &LocalStore {
+        &self.local
+    }
+
     /// The signed-in account, as the instance sees it.
     pub async fn me(&self) -> Result<Me, ClientError> {
         self.api().fetch("v1/users/me", self.auth()).await
@@ -710,15 +800,19 @@ impl Client {
             )
             .await?;
         if device_id == self.device_id {
+            // Its store can never be opened again (the instance erased its
+            // part of the key): close it and delete it.
             self.instance.records.forget_device(self.user_id)?;
+            self.local.close();
+            self.instance.remove_local_store(self.user_id).await;
         }
         Ok(())
     }
 
     /// Signs out and erases this device: it is revoked on the instance, which
-    /// destroys its part of the local store key, and its record is deleted
-    /// from this computer. The next sign-in enrols a new device, without
-    /// history. This cannot be undone.
+    /// destroys its part of the local store key, and its record and its
+    /// local store are deleted from this computer. The next sign-in enrols a
+    /// new device, without history. This cannot be undone.
     pub async fn erase_device(self) -> Result<(), ClientError> {
         self.revoke_device(self.device_id).await
     }
@@ -738,9 +832,11 @@ impl Client {
         }
     }
 
-    /// Removes the session token and the store key from the record, keeping
-    /// the device key. Also used when the instance ended the session.
+    /// Closes the local store, and removes the session token and the store
+    /// key from the record, keeping the device key. Also used when the
+    /// instance ended the session.
     pub fn forget_session(&self) -> Result<(), ClientError> {
+        self.local.close();
         let records = &self.instance.records;
         if let Some(mut device) = records.device(self.user_id)? {
             device.sign_out();

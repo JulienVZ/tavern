@@ -72,9 +72,9 @@ Using a single multiplexed UDP port keeps port forwarding simple on a home route
 
 ### Client-side storage
 
-- A SQLCipher database (through `rusqlite`) holds MLS group state, decrypted message history, the search index, contacts and settings.
-- The database key is random, generated at first launch and kept in the OS keychain (`keyring`).
-- The session token and the device signature key live in that database. The account identity key is **not** stored on devices (see section 3.2).
+- **Keychain** (`keyring`, [ADR 0017](adr/0017-device-identity-and-sign-out.md)): one record per instance, profile and account, holding the device key seed, the wrapped key of the local store and, while signed in, the session token and the store key itself. The account root secret and the account identity key are **not** stored on devices (see section 3.2).
+- **Local store** ([ADR 0018](adr/0018-local-store-encryption.md), `crates/client-core/src/local/`): one SQLCipher 4 database per account, `<local data directory>/accounts/<hashed name>/store.db`, encrypted with the store key as a raw 256-bit key, opened only while the account is signed in. It will hold MLS group state, decrypted message history, contacts and their pinned keys, and from M5 the full-text search index (FTS5). Pages, write-ahead log and indexes are encrypted; temporary data stays in memory. Schema versions use `PRAGMA user_version`, each feature adding its tables in its own migration; version 1 only records the account and device the store belongs to.
+- SQLCipher's crypto comes from CommonCrypto on macOS and from OpenSSL compiled into the client on Windows and Linux: the only place OpenSSL is allowed, checked by `deny.toml` and CI.
 
 ### Identity model
 

@@ -55,6 +55,11 @@ pub struct StoredDevice {
     pub session_token: Option<B64>,
     /// The key of the local store. Absent while signed out.
     pub store_key: Option<B64>,
+    /// Whether this device has created its local store. If the store is
+    /// missing later, the user is told that the local history is gone.
+    /// Records written before the store existed lack it.
+    #[serde(default)]
+    pub local_store_created: bool,
 }
 
 impl StoredDevice {
@@ -76,6 +81,7 @@ impl std::fmt::Debug for StoredDevice {
             .field("wrapped_store_key", &"<redacted>")
             .field("session_token", &redacted(self.session_token.is_some()))
             .field("store_key", &redacted(self.store_key.is_some()))
+            .field("local_store_created", &self.local_store_created)
             .finish()
     }
 }
@@ -129,6 +135,11 @@ impl Records {
             _ => instance_url.to_owned(),
         };
         Self { store, base }
+    }
+
+    /// The instance and profile these records are for, as one string.
+    pub(crate) fn scope(&self) -> &str {
+        &self.base
     }
 
     fn device_key(&self, user_id: Uuid) -> String {
@@ -307,7 +318,26 @@ mod tests {
             wrapped_store_key: B64(vec![0xEF; 73]),
             session_token: Some(B64(vec![0xCD; 32])),
             store_key: Some(B64(vec![0x12; 32])),
+            local_store_created: true,
         }
+    }
+
+    #[test]
+    fn a_record_written_before_the_local_store_still_reads() {
+        let store = Arc::new(MemoryStore::default());
+        let records = records(&store, None);
+        let mut old = serde_json::to_value(sample(1, "ann")).unwrap();
+        old.as_object_mut().unwrap().remove("local_store_created");
+        store
+            .write(
+                &records.device_key(Uuid::from_u128(1)),
+                old.to_string().as_bytes(),
+            )
+            .unwrap();
+
+        let read = records.device(Uuid::from_u128(1)).unwrap().unwrap();
+        assert!(!read.local_store_created);
+        assert_eq!(read.handle, "ann");
     }
 
     fn records(store: &Arc<MemoryStore>, profile: Option<&str>) -> Records {
