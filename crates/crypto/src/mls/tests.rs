@@ -304,6 +304,37 @@ fn the_parameters_are_frozen() {
         (20, 10)
     );
     assert_eq!(key_package::LIFETIME_SECONDS, 90 * 24 * 3600);
+    assert!(create.use_ratchet_tree_extension());
+
+    // What the groups actually have, created and joined.
+    let mut dm = Dm::new();
+    let instance = vec![server_external_sender(&dm.server.public_bytes())];
+    for group in &mut dm.groups {
+        let group = group.inner_mut();
+        assert_eq!(group.ciphersuite(), CIPHERSUITE);
+        assert!(matches!(
+            group.past_epoch_deletion_policy(),
+            openmls::prelude::PastEpochDeletionPolicy::MaxEpochs(0)
+        ));
+        assert_eq!(group.extensions().external_senders(), Some(&instance));
+        assert_eq!(
+            group.extensions().required_capabilities(),
+            Some(&required_capabilities())
+        );
+        assert_eq!(group.configuration().padding_size(), 256);
+        assert_eq!(
+            group.configuration().wire_format_policy(),
+            PURE_PLAINTEXT_WIRE_FORMAT_POLICY
+        );
+        let leaf = group.own_leaf().unwrap();
+        let capabilities = leaf.capabilities();
+        assert_eq!(capabilities.credentials(), &[CredentialType::Basic]);
+        assert_eq!(
+            capabilities.extensions(),
+            &[openmls::prelude::ExtensionType::LastResort]
+        );
+        assert_eq!(capabilities.ciphersuites().len(), 1);
+    }
 }
 
 #[test]
@@ -728,7 +759,11 @@ fn a_proposal_signed_by_an_unknown_external_key_is_refused() {
     .tls_serialize_detached()
     .unwrap();
 
-    assert!(dm.deliver(1, &proposal).is_err());
+    let result = dm.deliver(1, &proposal);
+    assert!(
+        matches!(result, Err(MlsError::Refused(Refusal::InvalidSignature))),
+        "{result:?}"
+    );
     assert_eq!(dm.groups[1].inner_mut().pending_proposals().count(), 0);
 }
 
@@ -1163,6 +1198,268 @@ fn devices_are_told_apart_by_user_and_device_id() {
     );
 }
 
+// --- Other refusals, conflicts and own commits ---------------------------------------------
+
+#[test]
+fn a_welcome_for_a_group_id_that_is_not_tavern_s_is_refused() {
+    let alice = Account::new(1);
+    let bob = Account::new(2);
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let joiner = bob.device(0xb1);
+    let config = create_config(&server.public_bytes()).unwrap();
+    let mut group = openmls::prelude::MlsGroup::new_with_group_id(
+        &creator.provider,
+        &creator.signer(),
+        &config,
+        openmls::prelude::GroupId::from_slice(b"short"),
+        creator.credential(),
+    )
+    .unwrap();
+    let (_, welcome, _) = group
+        .add_members(
+            &creator.provider,
+            &creator.signer(),
+            &[joiner.key_package()],
+        )
+        .unwrap();
+    let result = Group::join(
+        &joiner.provider,
+        &welcome.tls_serialize_detached().unwrap(),
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    );
+    assert!(
+        matches!(result, Err(MlsError::UnexpectedGroup)),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_commit_giving_a_device_two_leaves_raises_the_alarm() {
+    let mut dm = Dm::new();
+    // Another leaf for Bob's first device (same user and device ids).
+    let twin = dm.bob.device(0xb1);
+    let device = &dm.devices[0];
+    let (commit, _, _) = dm.groups[0]
+        .inner_mut()
+        .add_members(&device.provider, &device.signer(), &[twin.key_package()])
+        .unwrap();
+    let commit = commit.tls_serialize_detached().unwrap();
+    let result = dm.deliver(3, &commit);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Leaf(LeafError::DuplicateDevice)))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn external_join_proposals_are_refused() {
+    let mut dm = Dm::new();
+    let bob3 = dm.bob.device(0xb3);
+    let proposal = openmls::prelude::JoinProposal::new::<MemoryStorage>(
+        bob3.key_package(),
+        dm.groups[0].inner_mut().group_id().clone(),
+        dm.groups[0].inner_mut().epoch(),
+        &bob3.signer(),
+    )
+    .unwrap()
+    .tls_serialize_detached()
+    .unwrap();
+    let result = dm.deliver(0, &proposal);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Policy(PolicyError::ExternalJoinProposal))
+        ),
+        "{result:?}"
+    );
+    assert!(!result.unwrap_err().is_alarm());
+    assert_eq!(dm.groups[0].inner_mut().pending_proposals().count(), 0);
+}
+
+#[test]
+fn a_message_for_a_later_epoch_waits_for_its_commit() {
+    let mut dm = Dm::new();
+    let device = &dm.devices[2];
+    let update = dm.groups[2]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    let device = &dm.devices[2];
+    dm.groups[2].merge_pending_commit(&device.provider).unwrap();
+    let device = &dm.devices[2];
+    let message = dm.groups[2]
+        .encrypt(&device.provider, &device.signer(), b"after the update")
+        .unwrap();
+
+    let result = dm.deliver(0, &message);
+    assert!(
+        matches!(result, Err(MlsError::Refused(Refusal::WrongEpoch))),
+        "{result:?}"
+    );
+    dm.deliver(0, &update.commit).unwrap();
+    assert!(matches!(
+        dm.deliver(0, &message).unwrap(),
+        Incoming::Application { .. }
+    ));
+}
+
+/// Two devices commit in the same epoch; the server accepts the first and
+/// answers `STALE_EPOCH` to the second, which drops its commit, applies the
+/// accepted one and commits again in the new epoch (section 7).
+#[test]
+fn a_commit_that_lost_the_race_is_discarded_and_made_again() {
+    let mut dm = Dm::new();
+    let device = &dm.devices[0];
+    let winner = dm.groups[0]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    let device = &dm.devices[2];
+    let loser = dm.groups[2]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    assert_ne!(winner.commit, loser.commit);
+
+    // Accepted: its author merges, the others apply it.
+    let device = &dm.devices[0];
+    dm.groups[0].merge_pending_commit(&device.provider).unwrap();
+    let device = &dm.devices[2];
+    dm.groups[2]
+        .discard_pending_commit(&device.provider)
+        .unwrap();
+    assert!(dm.groups[2].inner_mut().pending_commit().is_none());
+    for incoming in dm.deliver_all(&winner.commit, &[0]) {
+        assert!(matches!(incoming, Incoming::Commit { .. }), "{incoming:?}");
+    }
+    assert_eq!(dm.epochs(), [2, 2, 2, 2]);
+
+    // The refused commit is for a past epoch now: nobody takes it.
+    let result = dm.deliver(1, &loser.commit);
+    assert!(
+        matches!(result, Err(MlsError::Refused(Refusal::PastEpoch))),
+        "{result:?}"
+    );
+
+    // Made again in the new epoch, it goes through.
+    let device = &dm.devices[2];
+    let again = dm.groups[2]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    let device = &dm.devices[2];
+    dm.groups[2].merge_pending_commit(&device.provider).unwrap();
+    dm.deliver_all(&again.commit, &[2]);
+    assert_eq!(dm.epochs(), [3, 3, 3, 3]);
+    dm.send(2, b"in sync");
+}
+
+#[test]
+fn an_own_commit_sent_back_by_the_server_is_merged() {
+    let mut dm = Dm::new();
+    let device = &dm.devices[1];
+    let commit = dm.groups[1]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    // Not merged yet: the server fans the commit out to its author too.
+    assert_eq!(dm.groups[1].epoch(), 1);
+    assert_eq!(dm.deliver(1, &commit.commit).unwrap(), Incoming::OwnCommit);
+    assert_eq!(dm.groups[1].epoch(), 2);
+    dm.deliver_all(&commit.commit, &[1]);
+    assert_eq!(dm.epochs(), [2, 2, 2, 2]);
+    dm.send(1, b"merged");
+}
+
+// --- Serialization round trips ------------------------------------------------------------
+
+proptest! {
+    // A safety number costs 10,400 SHA-512: fewer cases than the default.
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn group_ids_round_trip(conversation in any::<[u8; ID_LEN]>(), generation in any::<u32>()) {
+        let identity = GroupIdentity { conversation_id: conversation, generation };
+        prop_assert_eq!(GroupIdentity::from_group_id(&identity.to_group_id()).unwrap(), identity);
+    }
+
+    #[test]
+    fn safety_numbers_do_not_depend_on_the_side(a in any::<[u8; ID_LEN]>(), b in any::<[u8; ID_LEN]>()) {
+        let (key_a, key_b) = (key(KEY_1), key(KEY_2));
+        let one = safety_number::safety_number(
+            Party { user_id: &a, identity_key: &key_a },
+            Party { user_id: &b, identity_key: &key_b },
+        );
+        let other = safety_number::safety_number(
+            Party { user_id: &b, identity_key: &key_b },
+            Party { user_id: &a, identity_key: &key_a },
+        );
+        prop_assert_eq!(one, other);
+    }
+}
+
+#[test]
+fn key_packages_round_trip_through_their_bytes() {
+    let alice = Account::new(1);
+    let pins = Pins::of(&[&alice]);
+    let mut runner =
+        proptest::test_runner::TestRunner::new(proptest::test_runner::Config::with_cases(8));
+    runner
+        .run(&(any::<u8>(), any::<bool>()), |(device_id, last_resort)| {
+            let device = alice.device(device_id);
+            let package = key_package::build(
+                &device.provider,
+                &device.signer(),
+                device.credential(),
+                last_resort,
+            )
+            .unwrap();
+            let encoded = bytes(&package);
+            let claimed = claim(&device, &package, &pins);
+            prop_assert_eq!(bytes(claimed.key_package()), encoded);
+            prop_assert_eq!(claimed.device(), Some(device.leaf()));
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn any_content_round_trips_through_a_group() {
+    let dm = std::cell::RefCell::new(Dm::new());
+    let mut runner =
+        proptest::test_runner::TestRunner::new(proptest::test_runner::Config::with_cases(24));
+    runner
+        .run(
+            &proptest::collection::vec(any::<u8>(), 0..3000),
+            |content| {
+                let mut guard = dm.borrow_mut();
+                let dm = &mut *guard;
+                let device = &dm.devices[0];
+                let message = dm.groups[0]
+                    .encrypt(&device.provider, &device.signer(), &content)
+                    .unwrap();
+                let bucket = padding::pad(&content).unwrap().len();
+                match dm.deliver(3, &message).unwrap() {
+                    Incoming::Application { content: got, .. } => {
+                        prop_assert_eq!(got.expose(), content.as_slice());
+                    }
+                    other => prop_assert!(false, "{other:?}"),
+                }
+                // Messages of one bucket all have one size.
+                let device = &dm.devices[0];
+                let same_bucket = dm.groups[0]
+                    .encrypt(&device.provider, &device.signer(), &vec![0; bucket - 4])
+                    .unwrap();
+                prop_assert_eq!(same_bucket.len(), message.len());
+                dm.deliver(3, &same_bucket).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
 // --- Section 8: padding -------------------------------------------------------------------
 
 proptest! {
@@ -1242,7 +1539,37 @@ fn padding_refuses_a_padding_byte_that_is_not_zero() {
 }
 
 #[test]
-fn a_tampered_padding_inside_a_message_is_refused_by_the_receiver() {
+fn a_padding_tampered_with_by_a_member_is_refused_by_the_receiver() {
+    let mut dm = Dm::new();
+    for (tamper, error) in [
+        (
+            Box::new(|padded: &mut Vec<u8>| padded[200] = 1) as Box<dyn Fn(&mut Vec<u8>)>,
+            PaddingError::NonZeroPadding,
+        ),
+        (
+            Box::new(|padded: &mut Vec<u8>| padded[..4].copy_from_slice(&253u32.to_be_bytes())),
+            PaddingError::LengthBeyondData,
+        ),
+    ] {
+        let mut padded = padding::pad(b"hello").unwrap().to_vec();
+        tamper(&mut padded);
+        let device = &dm.devices[0];
+        let raw = dm.groups[0]
+            .inner_mut()
+            .create_message(&device.provider, &device.signer(), &padded)
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap();
+        let result = dm.deliver(1, &raw);
+        assert!(
+            matches!(result, Err(MlsError::Padding(got)) if got == error),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unpadded_message_is_refused_by_the_receiver() {
     // Padding is checked after decryption: a device can only receive what a
     // member padded, so this exercises `unpad` on the receiving path.
     let mut dm = Dm::new();
@@ -1295,9 +1622,10 @@ fn a_message_of_a_past_epoch_can_no_longer_be_read() {
         .unwrap();
     dm.deliver(1, &update.commit).unwrap();
 
+    let result = dm.deliver(1, &late);
     assert!(
-        dm.deliver(1, &late).is_err(),
-        "past epoch secrets are deleted"
+        matches!(result, Err(MlsError::Refused(Refusal::PastEpoch))),
+        "{result:?}"
     );
 }
 
@@ -1318,7 +1646,11 @@ fn messages_of_one_sender_may_arrive_out_of_order() {
         }
     }
     // A message is read once only: its key is deleted.
-    assert!(dm.deliver(2, &first).is_err());
+    let result = dm.deliver(2, &first);
+    assert!(
+        matches!(result, Err(MlsError::Refused(Refusal::AlreadyRead))),
+        "{result:?}"
+    );
 }
 
 // --- Section 10: safety numbers ------------------------------------------------------------

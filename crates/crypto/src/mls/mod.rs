@@ -107,10 +107,11 @@ impl MlsError {
 /// Why OpenMLS refused an incoming message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
-    /// For another epoch than the current one.
-    #[error("the message is for another epoch")]
+    /// For a later epoch: this device has not processed a commit yet.
+    #[error("the message is for a later epoch")]
     WrongEpoch,
-    /// For a past epoch, whose secrets are deleted (section 9).
+    /// For a past epoch, whose secrets are deleted (section 9): the sender
+    /// re-encrypts and resends (`STALE_EPOCH`, section 7).
     #[error("the message is for a past epoch")]
     PastEpoch,
     /// For another group.
@@ -122,7 +123,11 @@ pub enum Refusal {
     /// From an external sender the group does not list.
     #[error("the external sender is not the group's")]
     UnauthorizedExternalSender,
-    /// Cannot be decrypted: already read, too far ahead, or tampered with.
+    /// Already read: its key was deleted once used (section 9).
+    #[error("the message was already read")]
+    AlreadyRead,
+    /// Cannot be decrypted: too far from the sender's last message, or
+    /// tampered with.
     #[error("the message cannot be decrypted")]
     UnableToDecrypt,
     /// From a leaf that is not in the group.
@@ -138,6 +143,7 @@ pub(crate) fn library(error: impl std::fmt::Display) -> MlsError {
 pub(crate) fn processing_error<E: std::fmt::Display>(
     error: openmls::prelude::ProcessMessageError<E>,
 ) -> MlsError {
+    use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
     use openmls::prelude::{ProcessMessageError as P, StageCommitError, ValidationError as V};
     match error {
         P::InvalidCommit(StageCommitError::MissingProposal) => Alarm::UnknownProposal.into(),
@@ -148,6 +154,9 @@ pub(crate) fn processing_error<E: std::fmt::Display>(
         P::ValidationError(V::UnauthorizedExternalSender) => {
             MlsError::Refused(Refusal::UnauthorizedExternalSender)
         }
+        P::ValidationError(V::UnableToDecrypt(MessageDecryptionError::SecretTreeError(
+            SecretTreeError::SecretReuseError,
+        ))) => MlsError::Refused(Refusal::AlreadyRead),
         P::ValidationError(V::UnableToDecrypt(_)) => MlsError::Refused(Refusal::UnableToDecrypt),
         P::ValidationError(V::UnknownMember) => MlsError::Refused(Refusal::UnknownMember),
         other => library(other),

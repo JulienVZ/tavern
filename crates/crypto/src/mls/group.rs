@@ -541,6 +541,18 @@ impl Group {
         let protocol: ProtocolMessage = parse(message)?
             .try_into_protocol_message()
             .map_err(|_| MlsError::Malformed)?;
+        // Said plainly before anything is decrypted: the sequence is
+        // processed in order, so another epoch means a resend or a gap.
+        if protocol.group_id() != self.inner.group_id() {
+            return Err(MlsError::Refused(super::Refusal::WrongGroup));
+        }
+        let (epoch, current) = (protocol.epoch(), self.inner.epoch());
+        if epoch < current {
+            return Err(MlsError::Refused(super::Refusal::PastEpoch));
+        }
+        if epoch > current {
+            return Err(MlsError::Refused(super::Refusal::WrongEpoch));
+        }
         let processed = self
             .inner
             .process_message(provider, protocol)
