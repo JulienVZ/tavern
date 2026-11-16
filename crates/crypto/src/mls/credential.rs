@@ -57,7 +57,7 @@ pub enum LeafError {
     /// The leaf's signature key is not the certified device key.
     #[error("the leaf's key is not the certified device key")]
     KeyMismatch,
-    /// Two leaves belong to the same device.
+    /// Two leaves belong to the same device (same user and device ids).
     #[error("two leaves belong to the same device")]
     DuplicateDevice,
     /// A leaf was replaced by the leaf of another device.
@@ -108,7 +108,8 @@ pub fn verify_leaf(
     })
 }
 
-/// Checks every leaf of a group, and that no device has two leaves.
+/// Checks every leaf of a group, and that no device (user id and device id)
+/// has two leaves.
 pub fn verify_members<'a>(
     leaves: impl IntoIterator<Item = (&'a Credential, &'a [u8])>,
     roster: &impl Roster,
@@ -117,7 +118,7 @@ pub fn verify_members<'a>(
     let mut verified = Vec::new();
     for (credential, signature_key) in leaves {
         let leaf = verify_leaf(credential, signature_key, roster)?;
-        if !seen.insert(leaf.device_id) {
+        if !seen.insert(leaf) {
             return Err(LeafError::DuplicateDevice);
         }
         verified.push(leaf);

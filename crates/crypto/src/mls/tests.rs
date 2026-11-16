@@ -15,7 +15,8 @@ use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
 use openmls::prelude::{
     BasicCredential, Ciphersuite, Credential, CredentialType, CredentialWithKey, Extension,
     Extensions, ExternalProposal, KeyPackage, LeafNodeParameters, Lifetime, MlsMessageIn,
-    NewSignerBundle, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, SenderExtensionIndex, WireFormat,
+    NewSignerBundle, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, Proposal, Sender, SenderExtensionIndex,
+    WireFormat,
 };
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::OpenMlsProvider;
@@ -285,7 +286,7 @@ fn a_dm_runs_through_the_wrapper() {
     // An update of Bob's first device, accepted by the server.
     let device = &dm.devices[2];
     let update = dm.groups[2]
-        .self_update(&device.provider, &device.signer())
+        .self_update(&device.provider, &device.signer(), &dm.pins)
         .unwrap();
     assert_eq!(wire_format(&update.commit), WireFormat::PublicMessage);
     assert!(update.welcome.is_none());
@@ -304,7 +305,9 @@ fn a_dm_runs_through_the_wrapper() {
     assert_eq!(dm.epochs(), [2, 2, 2, 2]);
 
     // The server removes Bob's second device; Alice's first device commits.
-    let removed = dm.groups[0].leaf_of(&dm.devices[3].device_id).unwrap();
+    let removed = dm.groups[0]
+        .leaf_of(&dm.devices[3].user_id, &dm.devices[3].device_id)
+        .unwrap();
     let proposal = ExternalProposal::new_remove::<TestProvider>(
         removed,
         dm.groups[0].inner_mut().group_id().clone(),
@@ -320,7 +323,7 @@ fn a_dm_runs_through_the_wrapper() {
     }
     let device = &dm.devices[0];
     let commit = dm.groups[0]
-        .commit_pending_proposals(&device.provider, &device.signer())
+        .commit_pending_proposals(&device.provider, &device.signer(), &dm.pins)
         .unwrap()
         .expect("the removal is pending");
     dm.groups[0]
@@ -492,9 +495,13 @@ fn an_update_may_not_swap_the_leaf_for_another_device() {
 
     let result = dm.deliver(1, &commit);
     assert!(
-        matches!(result, Err(MlsError::Leaf(LeafError::DeviceChanged))),
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Leaf(LeafError::DeviceChanged)))
+        ),
         "{result:?}"
     );
+    assert!(result.unwrap_err().is_alarm());
     assert_eq!(dm.groups[1].epoch(), before, "not merged");
 }
 
@@ -670,7 +677,9 @@ fn the_server_may_propose_removals_only() {
 #[test]
 fn a_proposal_signed_by_an_unknown_external_key_is_refused() {
     let mut dm = Dm::new();
-    let removed = dm.groups[0].leaf_of(&dm.devices[3].device_id).unwrap();
+    let removed = dm.groups[0]
+        .leaf_of(&dm.devices[3].user_id, &dm.devices[3].device_id)
+        .unwrap();
     let rogue = ExternalSenderKey::generate();
     let proposal = ExternalProposal::new_remove::<TestProvider>(
         removed,
@@ -690,27 +699,435 @@ fn a_proposal_signed_by_an_unknown_external_key_is_refused() {
 #[test]
 fn nobody_may_change_the_external_senders() {
     let mut dm = Dm::new();
+    let current = dm.groups[0].inner_mut().extensions().clone();
     let rogue = ExternalSenderKey::generate();
-    let extensions = Extensions::single(Extension::ExternalSenders(vec![server_external_sender(
-        &rogue.public_bytes(),
-    )]))
+    let changed = Extensions::from_vec(
+        current
+            .iter()
+            .map(|extension| match extension {
+                Extension::ExternalSenders(_) => {
+                    Extension::ExternalSenders(vec![server_external_sender(&rogue.public_bytes())])
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    )
     .unwrap();
-    let device = &dm.devices[0];
-    let (proposal, _) = dm.groups[0]
-        .inner_mut()
-        .propose_group_context_extensions(&device.provider, extensions, &device.signer())
-        .unwrap();
-    let proposal = proposal.tls_serialize_detached().unwrap();
 
-    let result = dm.deliver(2, &proposal);
+    // A commit that changes them is an alarm, and is not merged.
+    let device = &dm.devices[0];
+    let (commit, _, _) = dm.groups[0]
+        .inner_mut()
+        .update_group_context_extensions(&device.provider, changed, &device.signer())
+        .unwrap();
+    let commit = commit.tls_serialize_detached().unwrap();
+    let before = dm.groups[2].epoch();
+    let result = dm.deliver(2, &commit);
     assert!(
         matches!(
             result,
-            Err(MlsError::Policy(PolicyError::ExternalSendersChange))
+            Err(MlsError::Alarm(Alarm::Policy(
+                PolicyError::ExternalSendersChange
+            )))
         ),
         "{result:?}"
     );
-    assert_eq!(dm.groups[2].inner_mut().pending_proposals().count(), 0);
+    assert_eq!(dm.groups[2].epoch(), before);
+
+    // One that keeps them is accepted.
+    let device = &dm.devices[0];
+    dm.groups[0]
+        .discard_pending_commit(&device.provider)
+        .unwrap();
+    let (commit, _, _) = dm.groups[0]
+        .inner_mut()
+        .update_group_context_extensions(&device.provider, current, &device.signer())
+        .unwrap();
+    let commit = commit.tls_serialize_detached().unwrap();
+    assert!(matches!(
+        dm.deliver(2, &commit).unwrap(),
+        Incoming::Commit { .. }
+    ));
+}
+
+// --- Section 5: external commits ------------------------------------------------------------
+
+/// The GroupInfo of the current epoch, as the server keeps it.
+fn group_info(dm: &mut Dm, from: usize) -> Vec<u8> {
+    let device = &dm.devices[from];
+    dm.groups[from]
+        .inner_mut()
+        .export_group_info(device.provider.crypto(), &device.signer(), true)
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap()
+}
+
+/// A device of `account` with id `device_id`, whose certificate (signed by
+/// `account`) certifies the key of `key_of`.
+fn device_with_key_of(account: &Account, device_id: u8, key_of: &Device) -> Device {
+    let key = DeviceKey::from_seed(&key_of.key.seed());
+    let device_id = [device_id; ID_LEN];
+    let certificate =
+        account
+            .identity
+            .certify_device(&account.user_id, &device_id, &key.public(), 0);
+    Device {
+        user_id: account.user_id,
+        device_id,
+        certificate,
+        key,
+        provider: TestProvider::default(),
+    }
+}
+
+fn join_externally(dm: &mut Dm, joiner: &Device) -> Result<(Group, Commit), MlsError> {
+    let info = group_info(dm, 0);
+    Group::join_by_external_commit(
+        &joiner.provider,
+        &joiner.signer(),
+        joiner.credential(),
+        &info,
+        &dm.pins,
+        &dm.server.public_bytes(),
+    )
+    .map(|(group, commit, members)| {
+        assert!(members.contains(&joiner.leaf()));
+        (group, commit)
+    })
+}
+
+#[test]
+fn a_new_device_joins_by_external_commit() {
+    let mut dm = Dm::new();
+    let bob3 = dm.bob.device(0xb3);
+    let (group, commit) = join_externally(&mut dm, &bob3).unwrap();
+    assert_eq!(wire_format(&commit.commit), WireFormat::PublicMessage);
+    assert!(commit.welcome.is_none());
+
+    for incoming in dm.deliver_all(&commit.commit, &[]) {
+        assert_eq!(
+            incoming,
+            Incoming::Commit {
+                changes: MembershipChanges {
+                    added: vec![bob3.leaf()],
+                    removed: Vec::new(),
+                },
+                self_removed: false,
+            }
+        );
+    }
+    dm.devices.push(bob3);
+    dm.groups.push(group);
+    assert_eq!(dm.epochs(), [2, 2, 2, 2, 2]);
+    dm.send(0, b"welcome, new device");
+    dm.send(4, b"thanks");
+}
+
+#[test]
+fn a_device_that_lost_its_state_resyncs_by_external_commit() {
+    let mut dm = Dm::new();
+    // Bob's second device, same key and certificate, empty storage.
+    let lost = &dm.devices[3];
+    let fresh = Device {
+        user_id: lost.user_id,
+        device_id: lost.device_id,
+        certificate: lost.certificate.clone(),
+        key: DeviceKey::from_seed(&lost.key.seed()),
+        provider: TestProvider::default(),
+    };
+    let (group, commit) = join_externally(&mut dm, &fresh).unwrap();
+
+    for incoming in dm.deliver_all(&commit.commit, &[3]) {
+        assert_eq!(
+            incoming,
+            Incoming::Commit {
+                changes: MembershipChanges {
+                    added: vec![fresh.leaf()],
+                    removed: vec![fresh.leaf()],
+                },
+                self_removed: false,
+            }
+        );
+    }
+    dm.devices[3] = fresh;
+    dm.groups[3] = group;
+    assert_eq!(dm.groups[0].devices().len(), 4);
+    dm.send(3, b"back");
+}
+
+#[test]
+fn an_external_commit_may_not_remove_another_device_of_its_user() {
+    let mut dm = Dm::new();
+    // Certified by Bob as a new device, with the key of Bob's first device:
+    // OpenMLS takes the external commit for a resync and removes that leaf.
+    let joiner = device_with_key_of(&dm.bob, 0xb3, &dm.devices[2]);
+    let (_, commit) = join_externally(&mut dm, &joiner).unwrap();
+
+    let before = dm.groups[0].epoch();
+    let result = dm.deliver(0, &commit.commit);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Policy(
+                PolicyError::ExternalCommitContent
+            )))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(dm.groups[0].epoch(), before, "not merged");
+}
+
+#[test]
+fn an_external_commit_may_not_remove_a_device_of_another_user() {
+    let mut dm = Dm::new();
+    let joiner = device_with_key_of(&dm.bob, 0xb3, &dm.devices[1]);
+    let (_, commit) = join_externally(&mut dm, &joiner).unwrap();
+
+    let result = dm.deliver(0, &commit.commit);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Policy(
+                PolicyError::ExternalCommitContent
+            )))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(dm.groups[0].devices().len(), 4);
+}
+
+// --- Section 6: proposals and removals from members -------------------------------------
+
+#[test]
+fn members_may_not_send_proposals_on_their_own() {
+    let mut dm = Dm::new();
+    // Bob's first device proposes, alone, an Add of an unpinned device.
+    let intruder = Account::new(2).device(0xb7);
+    let device = &dm.devices[2];
+    let (proposal, _) = dm.groups[2]
+        .inner_mut()
+        .propose_add_member(&device.provider, &device.signer(), &intruder.key_package())
+        .unwrap();
+    let proposal = proposal.tls_serialize_detached().unwrap();
+    let result = dm.deliver(0, &proposal);
+    assert!(
+        matches!(result, Err(MlsError::Policy(PolicyError::MemberProposal))),
+        "{result:?}"
+    );
+    assert!(!result.unwrap_err().is_alarm(), "dropped, not an alarm");
+    assert_eq!(dm.groups[0].inner_mut().pending_proposals().count(), 0);
+
+    // When Alice's first device later commits the server's removal, the
+    // commit carries that removal and nothing else.
+    let removed = dm.groups[0]
+        .leaf_of(&dm.devices[3].user_id, &dm.devices[3].device_id)
+        .unwrap();
+    let server_remove = server_remove(&mut dm, removed);
+    dm.deliver(0, &server_remove).unwrap();
+    let device = &dm.devices[0];
+    let commit = dm.groups[0]
+        .commit_pending_proposals(&device.provider, &device.signer(), &dm.pins)
+        .unwrap()
+        .unwrap();
+    assert!(commit.welcome.is_none(), "nobody is added");
+    let staged = dm.groups[0].inner_mut().pending_commit().unwrap();
+    let proposals: Vec<_> = staged.queued_proposals().collect();
+    assert_eq!(proposals.len(), 1);
+    assert!(matches!(proposals[0].proposal(), Proposal::Remove(_)));
+    assert!(matches!(proposals[0].sender(), Sender::External(_)));
+}
+
+fn server_remove(dm: &mut Dm, removed: openmls::prelude::LeafNodeIndex) -> Vec<u8> {
+    ExternalProposal::new_remove::<TestProvider>(
+        removed,
+        dm.groups[0].inner_mut().group_id().clone(),
+        dm.groups[0].inner_mut().epoch(),
+        &ServerSigner(&dm.server),
+        SenderExtensionIndex::new(0),
+    )
+    .unwrap()
+    .tls_serialize_detached()
+    .unwrap()
+}
+
+#[test]
+fn a_commit_that_refers_to_a_refused_proposal_raises_the_alarm() {
+    let mut dm = Dm::new();
+    let intruder = Account::new(2).device(0xb7);
+    let device = &dm.devices[2];
+    let (proposal, _) = dm.groups[2]
+        .inner_mut()
+        .propose_add_member(&device.provider, &device.signer(), &intruder.key_package())
+        .unwrap();
+    let proposal = proposal.tls_serialize_detached().unwrap();
+    assert!(dm.deliver(0, &proposal).is_err());
+
+    // Bob's device commits its own proposal, by reference.
+    let device = &dm.devices[2];
+    let (commit, _, _) = dm.groups[2]
+        .inner_mut()
+        .commit_to_pending_proposals(&device.provider, &device.signer())
+        .unwrap();
+    let commit = commit.tls_serialize_detached().unwrap();
+    let result = dm.deliver(0, &commit);
+    assert!(
+        matches!(result, Err(MlsError::Alarm(Alarm::UnknownProposal))),
+        "{result:?}"
+    );
+    assert!(result.unwrap_err().is_alarm());
+}
+
+#[test]
+fn proposals_tavern_never_uses_are_refused_in_commits() {
+    use openmls::prelude::PreSharedKeyProposal;
+    use openmls::schedule::{ExternalPsk, PreSharedKeyId, Psk};
+
+    let mut dm = Dm::new();
+    let psk = PreSharedKeyId::new(
+        CIPHERSUITE,
+        dm.devices[2].provider.rand(),
+        Psk::External(ExternalPsk::new(b"shared".to_vec())),
+    )
+    .unwrap();
+    for index in [0, 2] {
+        psk.store(&dm.devices[index].provider, &[7; 32]).unwrap();
+    }
+    let device = &dm.devices[2];
+    let bundle = dm.groups[2]
+        .inner_mut()
+        .commit_builder()
+        .add_proposal(Proposal::PreSharedKey(Box::new(PreSharedKeyProposal::new(
+            psk,
+        ))))
+        .load_psks(device.provider.storage())
+        .unwrap()
+        .build(
+            device.provider.rand(),
+            device.provider.crypto(),
+            &device.signer(),
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&device.provider)
+        .unwrap();
+    let commit = bundle.into_commit().tls_serialize_detached().unwrap();
+
+    let result = dm.deliver(0, &commit);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Policy(
+                PolicyError::ForbiddenProposal
+            )))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_member_removes_its_own_devices_or_those_the_server_asked_for() {
+    let mut dm = Dm::new();
+    let bob2 = dm.groups[0]
+        .leaf_of(&dm.devices[3].user_id, &dm.devices[3].device_id)
+        .unwrap();
+    let alice2 = dm.groups[0]
+        .leaf_of(&dm.devices[1].user_id, &dm.devices[1].device_id)
+        .unwrap();
+
+    // Alice may not remove Bob's device on her own.
+    let device = &dm.devices[0];
+    let result = dm.groups[0].remove(&device.provider, &device.signer(), &[bob2], &dm.pins);
+    assert!(
+        matches!(result, Err(MlsError::Policy(PolicyError::RemoveNotAllowed))),
+        "{result:?}"
+    );
+    assert!(dm.groups[0].inner_mut().pending_commit().is_none());
+
+    // A commit that does it anyway is an alarm for the others.
+    let device = &dm.devices[0];
+    let (commit, _, _) = dm.groups[0]
+        .inner_mut()
+        .remove_members(&device.provider, &device.signer(), &[bob2])
+        .unwrap();
+    let commit = commit.tls_serialize_detached().unwrap();
+    let result = dm.deliver(2, &commit);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Policy(
+                PolicyError::RemoveNotAllowed
+            )))
+        ),
+        "{result:?}"
+    );
+    let device = &dm.devices[0];
+    dm.groups[0]
+        .discard_pending_commit(&device.provider)
+        .unwrap();
+
+    // Once the server asked for it, she may.
+    let request = server_remove(&mut dm, bob2);
+    dm.deliver_all(&request, &[]);
+    let device = &dm.devices[0];
+    let commit = dm.groups[0]
+        .remove(&device.provider, &device.signer(), &[bob2], &dm.pins)
+        .unwrap();
+    let device = &dm.devices[0];
+    dm.groups[0].merge_pending_commit(&device.provider).unwrap();
+    assert!(matches!(
+        dm.deliver(2, &commit.commit).unwrap(),
+        Incoming::Commit { .. }
+    ));
+
+    // And she may always remove her own other device.
+    let device = &dm.devices[0];
+    let commit = dm.groups[0]
+        .remove(&device.provider, &device.signer(), &[alice2], &dm.pins)
+        .unwrap();
+    let device = &dm.devices[0];
+    dm.groups[0].merge_pending_commit(&device.provider).unwrap();
+    let alice2_leaf = dm.devices[1].leaf();
+    assert_eq!(
+        dm.deliver(2, &commit.commit).unwrap(),
+        Incoming::Commit {
+            changes: MembershipChanges {
+                added: Vec::new(),
+                removed: vec![alice2_leaf],
+            },
+            self_removed: false,
+        }
+    );
+}
+
+#[test]
+fn devices_are_told_apart_by_user_and_device_id() {
+    let mut dm = Dm::new();
+    // Alice certifies a device whose id is the id of Bob's first device.
+    let bob1 = dm.devices[2].leaf();
+    let lookalike = dm.alice.device(bob1.device_id[0]);
+    assert_eq!(lookalike.device_id, bob1.device_id);
+
+    let device = &dm.devices[0];
+    let commit = dm.groups[0]
+        .add(
+            &device.provider,
+            &device.signer(),
+            &[lookalike.key_package()],
+            &dm.pins,
+        )
+        .unwrap();
+    assert!(commit.welcome.is_some(), "not taken for Bob's device");
+    let device = &dm.devices[0];
+    dm.groups[0].merge_pending_commit(&device.provider).unwrap();
+    assert_eq!(
+        dm.groups[0].leaf_of(&bob1.user_id, &bob1.device_id),
+        dm.groups[2].leaf_of(&bob1.user_id, &bob1.device_id),
+    );
+    assert_ne!(
+        dm.groups[0].leaf_of(&bob1.user_id, &bob1.device_id),
+        dm.groups[0].leaf_of(&lookalike.user_id, &lookalike.device_id),
+    );
 }
 
 // --- Section 8: padding -------------------------------------------------------------------
@@ -825,7 +1242,7 @@ fn a_message_of_a_past_epoch_can_no_longer_be_read() {
         .unwrap();
     let device = &dm.devices[2];
     let update = dm.groups[2]
-        .self_update(&device.provider, &device.signer())
+        .self_update(&device.provider, &device.signer(), &dm.pins)
         .unwrap();
     dm.groups[2]
         .merge_pending_commit(&dm.devices[2].provider)
@@ -995,9 +1412,13 @@ fn a_commit_adding_a_device_with_an_unpinned_identity_is_not_merged() {
 
     let result = dm.deliver(1, &commit);
     assert!(
-        matches!(result, Err(MlsError::Leaf(LeafError::Untrusted))),
+        matches!(
+            result,
+            Err(MlsError::Alarm(Alarm::Leaf(LeafError::Untrusted)))
+        ),
         "{result:?}"
     );
+    assert!(result.unwrap_err().is_alarm());
     assert_eq!(dm.groups[1].epoch(), before, "not merged");
     assert_eq!(dm.groups[1].devices().len(), 4);
 }

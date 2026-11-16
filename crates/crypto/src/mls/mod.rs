@@ -34,7 +34,7 @@ use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
 
 pub use credential::{LeafError, Roster, VerifiedLeaf};
 pub use group::{Commit, Group, Incoming, MembershipChanges};
-pub use policy::PolicyError;
+pub use policy::{Alarm, PolicyError};
 pub use signer::{DeviceSigner, ServerSigner};
 
 /// The only ciphersuite of Tavern's groups.
@@ -59,13 +59,21 @@ pub const UPDATE_AFTER_MESSAGES: u32 = 100;
 /// Something MLS-related failed.
 #[derive(Debug, thiserror::Error)]
 pub enum MlsError {
-    /// A member's leaf is not acceptable (section 2). In a commit, the
-    /// conversation must be marked broken (section 11).
-    #[error("a member's certificate is not acceptable: {0}")]
+    /// A commit or a Welcome accepted by the server breaks the rules: the
+    /// conversation must be marked broken, with the alarm of section 11.
+    /// See [`MlsError::is_alarm`].
+    #[error("alarm: {0}")]
+    Alarm(#[from] Alarm),
+    /// A leaf this device was about to add is not acceptable (section 2).
+    #[error("a device's certificate is not acceptable: {0}")]
     Leaf(#[from] LeafError),
-    /// Refused by Tavern's policy on handshake messages (section 6).
+    /// A proposal received on its own, or an operation of this device, is
+    /// refused by Tavern's policy (section 6). A refused proposal is dropped.
     #[error("refused by the group policy: {0}")]
     Policy(#[from] PolicyError),
+    /// OpenMLS refused the message.
+    #[error("refused message: {0}")]
+    Refused(Refusal),
     /// The padded content is malformed.
     #[error("malformed padding: {0}")]
     Padding(#[from] padding::PaddingError),
@@ -81,8 +89,63 @@ pub enum MlsError {
     Library(String),
 }
 
+impl MlsError {
+    /// Whether this must raise the alarm of section 11: a leaf that is not a
+    /// verified device of a participant, a policy violation in a commit the
+    /// server accepted, or a commit that refers to a refused proposal.
+    pub fn is_alarm(&self) -> bool {
+        matches!(self, Self::Alarm(_))
+    }
+}
+
+/// Why OpenMLS refused an incoming message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    /// For another epoch than the current one.
+    #[error("the message is for another epoch")]
+    WrongEpoch,
+    /// For a past epoch, whose secrets are deleted (section 9).
+    #[error("the message is for a past epoch")]
+    PastEpoch,
+    /// For another group.
+    #[error("the message is for another group")]
+    WrongGroup,
+    /// The signature does not verify.
+    #[error("the signature does not verify")]
+    InvalidSignature,
+    /// From an external sender the group does not list.
+    #[error("the external sender is not the group's")]
+    UnauthorizedExternalSender,
+    /// Cannot be decrypted: already read, too far ahead, or tampered with.
+    #[error("the message cannot be decrypted")]
+    UnableToDecrypt,
+    /// From a leaf that is not in the group.
+    #[error("the sender is not a member")]
+    UnknownMember,
+}
+
 pub(crate) fn library(error: impl std::fmt::Display) -> MlsError {
     MlsError::Library(error.to_string())
+}
+
+/// Classifies OpenMLS's refusal of an incoming message.
+pub(crate) fn processing_error<E: std::fmt::Display>(
+    error: openmls::prelude::ProcessMessageError<E>,
+) -> MlsError {
+    use openmls::prelude::{ProcessMessageError as P, StageCommitError, ValidationError as V};
+    match error {
+        P::InvalidCommit(StageCommitError::MissingProposal) => Alarm::UnknownProposal.into(),
+        P::ValidationError(V::WrongEpoch) => MlsError::Refused(Refusal::WrongEpoch),
+        P::ValidationError(V::NoPastEpochData) => MlsError::Refused(Refusal::PastEpoch),
+        P::ValidationError(V::WrongGroupId) => MlsError::Refused(Refusal::WrongGroup),
+        P::ValidationError(V::InvalidSignature) => MlsError::Refused(Refusal::InvalidSignature),
+        P::ValidationError(V::UnauthorizedExternalSender) => {
+            MlsError::Refused(Refusal::UnauthorizedExternalSender)
+        }
+        P::ValidationError(V::UnableToDecrypt(_)) => MlsError::Refused(Refusal::UnableToDecrypt),
+        P::ValidationError(V::UnknownMember) => MlsError::Refused(Refusal::UnknownMember),
+        other => library(other),
+    }
 }
 
 /// What OpenMLS needs: RustCrypto for the crypto and the randomness, and the
