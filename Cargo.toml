@@ -12,8 +12,9 @@ members = [
     "crates/e2e-tests",
     "apps/desktop/src-tauri",
 ]
-# Built only by the fuzzing workflow, with a nightly toolchain.
-exclude = ["crates/protocol/fuzz"]
+# Built only by the fuzzing workflow, with a nightly toolchain; and a
+# stand-in that is never built (see [patch.crates-io] below).
+exclude = ["crates/protocol/fuzz", "third_party/sqlx-sqlite-unused"]
 
 [workspace.package]
 version = "0.0.1"
@@ -65,6 +66,10 @@ keyring = "4.2.0"
 libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 zxcvbn = { version = "3.1.1", default-features = false }
+# The client's local store: SQLCipher through rusqlite (docs/adr/0018). The
+# crypto provider is chosen per system in crates/client-core/Cargo.toml.
+rusqlite = { version = "0.43", default-features = false }
+tempfile = "3.27"
 thiserror = "2.0"
 totp-rs = { version = "6.0.0", features = ["otpauth"] }
 utoipa = { version = "6.0.0", features = ["uuid"] }
@@ -76,6 +81,13 @@ tower-http = { version = "0.7.1", features = ["timeout", "limit"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5"
+
+# sqlx 0.9.0 keeps an optional dependency on its SQLite driver, which pins
+# libsqlite3-sys below 0.38; Cargo resolves it even though it is never
+# enabled, and only one crate may link `sqlite3`. The stand-in frees that slot
+# for the client's SQLCipher. Never built. See its README before upgrading sqlx.
+[patch.crates-io]
+sqlx-sqlite = { path = "third_party/sqlx-sqlite-unused" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,6 +1,6 @@
 # ADR 0018 — Encryption of the local store
 
-- Status: proposed
+- Status: accepted (option 1, with conditions; see [Decision](#decision))
 - Date: 2026-11-16
 
 ## Context
@@ -120,10 +120,52 @@ If you prefer to keep the "no OpenSSL" rule intact, option 2 is sound; its real 
 
 **Tests:** encryption effective (no known marker readable in the file, including WAL and journal), refusal of a wrong key and of a plain file, key from ADR 0017 opening the same store after sign-out and back in, migrations, and the store built and tested in CI on the three systems.
 
+## Decision
+
+Accepted by the maintainer on 2026-11-16: **option 1**, SQLCipher through rusqlite, CommonCrypto on macOS and OpenSSL compiled from source on Windows and Linux, SQLCipher 4 format with a raw key. SQLite3 Multiple Ciphers stays the documented fallback (option 2); moving to it later changes no user's data.
+
+Conditions, all applied:
+
+1. **OpenSSL only inside SQLCipher, in the client.** `deny.toml` bans `openssl-sys` except as a dependency of `libsqlite3-sys`, and `openssl-src` except as a dependency of `openssl-sys` (that is how it is reached: it is the build dependency that compiles OpenSSL). CI fails if the server depends on OpenSSL or SQLite (`cargo tree`), if the server binary in the image links `libssl`/`libcrypto` or carries OpenSSL's version text, or if the Linux client links the system's `libssl`/`libcrypto` instead of carrying the version that `openssl-src` compiles (`readelf`, with `ldd` shown for information).
+2. **Licences `blessing` and `WTFPL` for the crate `sqlcipher-src` only** (`[licenses] exceptions` in `deny.toml`).
+3. **Frozen SQLCipher parameters**: compatibility 4, raw key, no PBKDF2 stretching of the key. A test checks the effective settings, and another opens a store committed in the repository (`crates/client-core/fixtures/local-store-v1.db`, written on macOS with CommonCrypto), which every later client must open on every system. A test on the three systems creates a store, closes it, reopens it with the right key and refuses a wrong one.
+4. **No data in clear in the store's files**: a test writes markers (row contents, a blob, a table name, words in a full-text index), then searches the bytes of every file in the directory, while the data is still in the write-ahead log and again after closing; it also checks that no file starts with SQLite's plain header and that no temporary file appears. The same test fails if the key is not set.
+5. **OpenSSL advisories**: any security advisory on OpenSSL requires a new client release, like an advisory on any library linked into the client. `cargo deny check advisories` watches `openssl-src` and `openssl-sys` through RustSec on every CI run, and Dependabot proposes their updates.
+
+### A constraint found while applying it: sqlx and `links = "sqlite3"`
+
+Cargo allows one crate per `links` value in the whole dependency graph, **optional dependencies included**. sqlx 0.9.0 (the server's PostgreSQL driver, latest release) keeps an optional dependency on its SQLite driver, `sqlx-sqlite` 0.9.0, which requires `libsqlite3-sys` `>=0.30.1, <0.38.0`. rusqlite 0.43 needs `libsqlite3-sys` 0.40: the two cannot be resolved together, although the server never enables SQLite.
+
+The versions sqlx accepts are not an option: every `libsqlite3-sys` below 0.39 bundles a SQLite older than 3.54.0 and is affected by **RUSTSEC-2026-0459** (`cargo deny` fails); `libsqlite3-sys` 0.37 bundles SQLCipher 4.10.0 on SQLite 3.50.4, which also predates the FTS5 fixes of SQLite 3.53.2. sqlx's main branch still requires `<0.40`.
+
+So `third_party/sqlx-sqlite-unused` replaces `sqlx-sqlite` through `[patch.crates-io]`: an empty crate with the same version and features, which only frees the `links` slot. It is never built, and building it fails with an explanation, so enabling SQLite in sqlx cannot happen by accident. It must follow sqlx's version at each upgrade, and is to be deleted as soon as a sqlx release accepts our `libsqlite3-sys` (see its README).
+
+### How the client uses SQLCipher
+
+- `crates/client-core/src/local/`. Opening sets `PRAGMA cipher_memory_security = ON` (process-wide: SQLCipher wipes every block SQLite frees; key material lives in its locked private heap in any case), then `PRAGMA key = "x'<64 hex digits>'"`, then `PRAGMA cipher_compatibility = 4`, then reads the schema, which fails on a wrong key, a plain file or a damaged file.
+- The key statement is built in a buffer that never reallocates and is erased after use; errors from that statement are reported without any detail, since some rusqlite errors carry the SQL text. `sqlite3_key` would avoid the string but needs `unsafe`.
+- Then: defensive mode, untrusted schema, WAL journal (encrypted by SQLCipher), `synchronous = NORMAL`, `foreign_keys = ON`, `secure_delete = ON`, `temp_store = MEMORY`, a page cache of 2 MiB, a busy timeout of 5 s for a second window of the same profile.
+- One database per account and profile: `<local data directory>/accounts/<name>/store.db`, where `<name>` is the first 16 bytes of `SHA-256("tavern local store directory v1" || 0 || user id || instance and profile)`, in hexadecimal. The directory is created with mode 0700 on Unix. The local data directory is the application's *local* one (`%LOCALAPPDATA%` on Windows, not the roaming profile: the store is useless on another computer).
+- Schema versions with `PRAGMA user_version`, one transaction per migration; a store newer than the client is refused, never opened. Version 1 holds `store_info`, the account and device the store belongs to, checked at every opening. Each later feature adds its tables in its own migration.
+
+### What happens to the store
+
+| Event | Store |
+|---|---|
+| Sign-in to a known device | Opened with the key from the keychain record. |
+| Sign-in that enrols a new device, or whose store key could not be unwrapped (ADR 0017) | Whatever was in the account's directory is deleted, a new store is created. |
+| The file does not open with the right key (damaged, replaced by a plain file) | Moved aside to `unreadable.db` (replaced the next time), a new store is created, and the user is told that the local history starts again. Never deleted: it could be the victim of a bug that a later version fixes. |
+| The file has gone although this device had created one (flag in the keychain record) | New store, and the user is told. |
+| A newer schema, a disk or permission error | Error shown; nothing is touched. |
+| Sign-out, or session ended by the instance | Closed: SQLite checkpoints the journal and SQLCipher erases the key from memory. |
+| "Sign out and erase this device", or this device revoked | Closed and its directory deleted. A device revoked from elsewhere deletes it at its next sign-in attempt. |
+
 ## Consequences
 
 - Open decision 9 of `CLAUDE.md` is settled by this ADR; `CLAUDE.md` §3 and §10 are updated with the exception.
 - The client contains two crypto libraries: RustCrypto for everything we do, OpenSSL (or CommonCrypto) inside SQLCipher only.
-- OpenSSL advisories become client release triggers.
+- **Any security advisory on OpenSSL requires a new client release.** `cargo deny` watches `openssl-src` on every CI run.
+- Compiling OpenSSL from source adds about a minute to a clean Linux build and several minutes on Windows (Perl is required, present on GitHub's runners); macOS builds compile no OpenSSL.
+- `third_party/sqlx-sqlite-unused` lives until sqlx accepts a recent `libsqlite3-sys`.
 - The MLS state is stored by a storage provider of our own on this database, not by `openmls_sqlite_storage` (see the MLS plan).
 - Moving to SQLite3 Multiple Ciphers stays possible without migrating data.

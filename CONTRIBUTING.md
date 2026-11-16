@@ -31,6 +31,8 @@ Security problems are **not** reported through issues: see [SECURITY.md](SECURIT
 
 `protoc` is not needed: `.proto` files are compiled with a pure-Rust compiler.
 
+The client's local store is SQLCipher ([ADR 0018](docs/adr/0018-local-store-encryption.md)). On Windows and Linux the first build compiles OpenSSL from source for it (about a minute on Linux, several on Windows); Windows needs Perl for that, for example [Strawberry Perl](https://strawberryperl.com/). The system's OpenSSL is never used, and macOS needs nothing. Do not enable SQLite in sqlx: see `third_party/sqlx-sqlite-unused/README.md`.
+
 ## Building and testing
 
 ```bash

@@ -32,6 +32,16 @@ uuid.workspace = true
 zeroize.workspace = true
 zxcvbn.workspace = true
 
+# The local store: SQLCipher 4 (docs/adr/0018). Its crypto comes from the
+# system's CommonCrypto on macOS, and elsewhere from OpenSSL compiled from
+# source and linked statically, never the system's libcrypto (checked in CI).
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
+
 [dev-dependencies]
+tempfile.workspace = true
 [lints]
 workspace = true

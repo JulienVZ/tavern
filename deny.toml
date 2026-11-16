@@ -57,6 +57,13 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 
+exceptions = [
+    # SQLCipher, the client's local store (docs/adr/0018): SQLite's
+    # public-domain blessing, and libtomcrypt's WTFPL (shipped in the crate,
+    # not compiled in our builds). Approved for this crate only, 2026-11-16.
+    { crate = "sqlcipher-src", allow = ["blessing", "WTFPL"] },
+]
+
 [licenses.private]
 ignore = false
 
@@ -64,10 +71,17 @@ ignore = false
 multiple-versions = "allow"
 wildcards = "deny"
 allow-wildcard-paths = true
-# No OpenSSL in the default build: TLS goes through rustls.
+# No OpenSSL: TLS goes through rustls. One exception, approved 2026-11-16:
+# OpenSSL compiled from source inside SQLCipher, the client's local store on
+# Windows and Linux (docs/adr/0018). openssl-sys may only be reached through
+# libsqlite3-sys, and openssl-src only through openssl-sys. CI also checks
+# that the server binary contains no OpenSSL and that the Linux client does
+# not link the system's.
 deny = [
     { crate = "openssl", use-instead = "rustls" },
     { crate = "native-tls", use-instead = "rustls" },
+    { crate = "openssl-sys", wrappers = ["libsqlite3-sys"] },
+    { crate = "openssl-src", wrappers = ["openssl-sys"] },
 ]
 
 [sources]

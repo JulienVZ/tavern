@@ -63,7 +63,7 @@ Hors périmètre v1 : fédération entre instances, applications mobiles (mais l
 | E2EE messages | **MLS (RFC 9420) via OpenMLS** | Conçu pour les groupes ; un seul protocole pour DM, groupes, channels |
 | E2EE média | **LiveKit E2EE** avec **key provider personnalisé** alimenté par l'exporter MLS | |
 | Authentification | **OPAQUE** (crate `opaque-ke`, KSF Argon2id) + TOTP ; WebAuthn/passkeys plus tard | Le serveur ne voit jamais le mot de passe |
-| Stockage local client | **SQLite chiffré (SQLCipher)** via `rusqlite`, clé dans le trousseau OS (crate `keyring`) | |
+| Stockage local client | **SQLCipher 4** via `rusqlite` (`bundled-sqlcipher`) : CommonCrypto sous macOS, **OpenSSL compilé depuis les sources et lié statiquement** sous Windows et Linux, clé brute de 256 bits (ADR 0017, 0018) | Seule exception à « pas d'OpenSSL », limitée à SQLCipher dans le client et vérifiée en CI. Toute faille d'OpenSSL impose une nouvelle version du client. Repli documenté : SQLite3 Multiple Ciphers, même format |
 | Reverse proxy / TLS | **Caddy** (TLS automatique) dans le docker compose | |
 
 Avant d'ajouter une dépendance, vérifie qu'elle est maintenue, que sa licence est compatible (voir §10) et qu'elle passe `cargo deny`. Toute dépendance crypto ou réseau nouvelle doit faire l'objet d'un ADR.
@@ -98,6 +98,8 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 │   ├── client-core/           # Logique client sans UI : réseau, MLS, store local, LiveKit, état
 │   ├── media/                 # Capture écran/caméra/audio par OS, encodage matériel
 │   └── e2e-tests/             # Tests de bout en bout : vrai client contre vrai serveur (PostgreSQL requis)
+├── third_party/
+│   └── sqlx-sqlite-unused/    # Remplaçant vide de sqlx-sqlite, jamais compilé (libère `links = "sqlite3"` pour SQLCipher, ADR 0018)
 ├── apps/
 │   └── desktop/
 │       ├── src-tauri/         # Glue Tauri : commandes, événements, fenêtres (mince, délègue à client-core)
@@ -345,6 +347,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 - Projet sous **AGPL-3.0-or-later** : les instances modifiées et exposées en réseau doivent publier leurs modifications.
 - Dépendances autorisées : MIT, Apache-2.0, BSD, ISC, MPL-2.0, Zlib, Unicode, AGPL/GPL compatibles. À configurer dans `deny.toml`.
 - **BlueOak-1.0.0** : acceptée pour les dépendances de développement et de test **uniquement** (décision du 2026-11-15 ; aujourd'hui `lru-cache`, tirée par `jsdom`). Jamais pour une dépendance embarquée dans le client ou le serveur.
+- **`blessing` et `WTFPL`** : acceptées pour la seule crate `sqlcipher-src` (SQLite et libtomcrypt, décision du 2026-11-16, ADR 0018).
 - Ajouter un en-tête SPDX (`// SPDX-License-Identifier: AGPL-3.0-or-later`) dans chaque fichier source.
 
 ---
@@ -377,7 +380,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 6. **Mécanisme d'entrée dans les channels d'un serveur** : orientation retenue — external commit autorisé par les rôles (le nouveau membre n'attend pas), arrivée toujours affichée dans le channel, plus une option « channel privé » où l'entrée exige l'ajout par un membre. Décision finale au M4.
 7. **Historique sur un nouvel appareil** : ADR 0009 (proposé), transfert d'appareil à appareil au M5b ; sauvegarde chiffrée sous la clé de récupération à évaluer ensuite.
 8. **Identifiant de l'application** : `io.github.julienvz.tavern`, définitif depuis le 2026-11-14 (il nomme les entrées de trousseau et, à partir de M2, le dossier de données local). Ne plus le modifier.
-9. **SQLCipher et OpenSSL** : SQLCipher embarqué exige OpenSSL sous Windows et Linux, ce que `deny.toml` interdit aujourd'hui. ADR à écrire au début de M2.
+9. **SQLCipher et OpenSSL** : tranché le 2026-11-16 — SQLCipher via rusqlite, OpenSSL compilé dans le client sous Windows et Linux, CommonCrypto sous macOS ; `deny.toml` n'autorise `openssl-sys` que sous `libsqlite3-sys` ; contrôles en CI (ADR 0018).
 10. **Mémoire Argon2id sur macOS** : tranché le 2026-11-15 — crate dédiée `tavern-argon2-memory` (zone `mmap` effacée puis démappée), `unsafe` toujours interdit dans `protocol`, `crypto` et `server` (ADR 0015).
 
 ---
