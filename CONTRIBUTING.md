@@ -94,6 +94,16 @@ pnpm client alice-2    # a third one, and so on
 - The window title shows the profile.
 - After a change to the Rust code, `tauri dev` rebuilds and restarts the first client only: close and restart the others. Changes to the interface reach every client at once.
 
+## Updating dependencies
+
+1. Try the change first (a branch, or a copy of the manifest) and run `cargo deny check`. Report any advisory, and any licence outside the list in `deny.toml`, before going further: `deny.toml` gets no new exception without the maintainer's agreement.
+2. Update with `cargo update --package <crate>` (or the version in `Cargo.toml`), then run formatting, clippy, the tests, the PostgreSQL tests and the UI checks.
+3. Check the entries of `deny.toml` that name the upgraded crate or its dependents: an ignored advisory or a licence exception may no longer be needed, or may no longer be justified.
+4. Some crates come with extra steps:
+   - **sqlx**: `third_party/sqlx-sqlite-unused` must carry the version and the features of the `sqlx-sqlite` that the new sqlx requires (see its README). CI fails (`still-needed.sh`) once a sqlx release accepts our `libsqlite3-sys`: then upgrade sqlx, delete that directory and the `[patch.crates-io]` entry.
+   - **rusqlite, libsqlite3-sys, sqlcipher-src, openssl-src**: run the three systems on demand (`gh workflow run ci.yml --ref <branch>`). The local store committed in `crates/client-core/fixtures/` must still open everywhere. An OpenSSL advisory means a client release ([ADR 0018](docs/adr/0018-local-store-encryption.md)).
+   - **opaque-ke** and its curve crates: the `crypto-bigint is not linked` check of CI must stay green ([ADR 0011](docs/adr/0011-account-identity-and-primitives.md)).
+
 ## Code conventions
 
 - Code, identifiers, comments, commit messages and documentation are in **English**.

@@ -154,6 +154,10 @@ jobs:
         with:
           command: check
           arguments: --all-features
+      # The sqlx-sqlite stand-in (docs/adr/0018) is a workaround: fail as soon
+      # as a sqlx release makes it unnecessary, so that it gets removed.
+      - name: The sqlx-sqlite stand-in is still needed
+        run: ./third_party/sqlx-sqlite-unused/still-needed.sh
 
   ui:
     name: UI (check, tests)
