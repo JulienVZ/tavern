@@ -44,7 +44,7 @@ Requirements set by the maintainer:
 
 Erasure revokes first: if the instance cannot be reached, nothing is deleted, the user stays signed in and sees the error, and can retry.
 
-A signed-out device receives nothing but stays a group member; its messages wait on the server within the retention limit. Devices that stay away longer than a configurable delay (90 days by default) are removed from their groups by the server; the delay and the return path are specified in the MLS plan of M2.
+A signed-out device receives nothing but stays a group member; its messages wait on the server within the retention limit. Devices that stay away longer than `TAVERN_DEVICE_INACTIVE_DAYS` (by default the retention, 30 days, never more) are removed from their groups by the server, and rejoin by external commit when they come back ([ADR 0019](0019-mls-direct-messages.md), section 15).
 
 ### Account root secret
 

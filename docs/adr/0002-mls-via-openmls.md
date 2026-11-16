@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-11-13
+- Version and detailed design for M2: [ADR 0019](0019-mls-direct-messages.md) (OpenMLS 0.9.2, `openmls_rust_crypto`)
 
 ## Context
 

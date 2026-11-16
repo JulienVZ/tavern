@@ -45,6 +45,15 @@ Read by the `tavern-server` binary. The compose file sets them from the variable
 
 An empty value counts as unset. An invalid value stops the server at start-up with a message naming the variable.
 
+### Coming with M2 (not read by the server yet)
+
+Decided in [ADR 0019](adr/0019-mls-direct-messages.md); implemented with tasks 8 and 9 of M2, when they also enter `.env.example`.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TAVERN_MESSAGE_RETENTION_DAYS` | no | `30` | Days a stored message (encrypted) waits for devices that have not acknowledged it (1 to 30). |
+| `TAVERN_DEVICE_INACTIVE_DAYS` | no | the retention | Days without connection after which a device is removed from its conversations (it rejoins when it comes back). Never more than `TAVERN_MESSAGE_RETENTION_DAYS`: a larger value stops the server at start-up. |
+
 ## Secrets
 
 All secrets live in `deploy/.env`. Each has a single purpose. `init.sh` generates the ones that are empty and never changes an existing one. `backup.sh` puts `.env` in every backup, next to the database dump it belongs to.

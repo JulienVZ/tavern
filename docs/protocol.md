@@ -278,17 +278,17 @@ Minor version 1 of the gateway. Each event below is stored for the account and r
 |---|---|
 | `POST /v1/devices/me/key-packages` | Upload a batch of KeyPackages and, optionally, a new last-resort KeyPackage |
 | `GET /v1/devices/me/key-packages/count` | Remaining one-time KeyPackages |
-| `POST /v1/users/{id}/key-packages/claim` | One KeyPackage per active device of the user, each with its device certificate. One-time packages are deleted when claimed; the last-resort package is returned when none is left |
+| `POST /v1/users/{id}/key-packages/claim` | One KeyPackage per active device of the user, each with its device certificate. Allowed only for a friend or for one's own user (`FORBIDDEN` otherwise, nothing consumed), at most 60 claims per hour per requester and 10 per hour per requester and target. One-time packages are deleted when claimed; the last-resort package is returned when none is left |
 | `GET /v1/users/{id}/devices` | Device ids, signature keys and certificates of a user |
 | `GET /v1/friends` | Friends and pending requests |
 | `POST /v1/friends/requests` | Send a request (by handle) |
 | `POST /v1/friends/requests/{user_id}/accept`, `DELETE /v1/friends/requests/{user_id}` | Accept, decline or cancel |
 | `DELETE /v1/friends/{user_id}` | Remove a friend |
 | `PUT /v1/blocks/{user_id}`, `DELETE /v1/blocks/{user_id}` | Block, unblock |
-| `POST /v1/conversations` | Create a DM with a friend; returns the conversation id, or the existing one |
+| `POST /v1/conversations` | Create a DM with a friend; idempotent: one DM per pair of users, returns the existing one (with its epoch) if any, also when two creations cross |
 | `GET /v1/conversations` | Conversations of the user with their current epoch and last sequence number |
 
-Creating a DM reserves a conversation id on the server. The creating device then builds the MLS group locally (group id = conversation id, `external_senders` = the server's key), adds its own other devices and the peer's devices, and submits the first commit with its Welcome.
+Creating a DM reserves a conversation id on the server. The creating device then builds the MLS group locally (group id = conversation id followed by a 32-bit group generation, 0 at first, incremented when the group is recreated; `external_senders` = the server's key), adds its own other devices and the peer's devices, and submits the first commit with its Welcome. Details, including unfriending, blocking and recreation: [ADR 0019](adr/0019-mls-direct-messages.md).
 
 ### 5.2 Gateway: messages and MLS
 
@@ -394,8 +394,9 @@ Delivery rules:
 - Application messages must be encrypted for the current epoch (`STALE_EPOCH` otherwise) and are refused while removals are pending (`REMOVAL_PENDING`). Both are recovered by the client without user-visible error: it applies or commits what is pending, re-encrypts for the new epoch and resends with the same `client_message_id`. Only repeated failure (three attempts) surfaces as "not sent, retry".
 - A commit is validated against the public group state: valid signature, proposals allowed for the sender, new leaves carry valid device certificates. The epoch update is atomic.
 - External proposals issued by the server are always `Remove`. Clients reject any other type from an external sender.
-- `SendMessage` is idempotent on (`device`, `client_message_id`): a retry returns the original acknowledgement.
-- The server deletes a stored message once every recipient device has acknowledged it, or after the retention limit (default 30 days), whichever comes first. A welcome is deleted when acknowledged.
+- `SendMessage` is idempotent on (`device`, `client_message_id`): a retry returns the original acknowledgement, and a message already accepted is never stored or delivered twice, even re-encrypted. The idempotency record outlives the message, for the retention period.
+- The server deletes a stored message once every recipient device has acknowledged it, or after the retention limit (`TAVERN_MESSAGE_RETENTION_DAYS`, default and maximum 30 days), whichever comes first. A welcome is deleted when acknowledged.
+- A device that has not connected for `TAVERN_DEVICE_INACTIVE_DAYS` (default: the retention; never more) is removed from its groups by the server's `Remove` proposals, without being revoked. It rejoins by external commit when it comes back.
 
 ### 5.3 Gateway: friends (M2), presence and typing (M3)
 
@@ -451,7 +452,7 @@ message Text {
 }
 ```
 
-A message id is the pair (conversation id, sequence number); the sender learns it from `SendMessageAck`. The plaintext is padded to a multiple of 256 bytes before encryption.
+A message id is the pair (conversation id, sequence number); the sender learns it from `SendMessageAck`. The plaintext is padded before encryption to a size bucket: multiples of 256 bytes up to 1 KiB, then 2, 4, 8, 16, 32 and 64 KiB ([ADR 0019](adr/0019-mls-direct-messages.md), section 8).
 
 ## 6. Error codes
 
@@ -545,6 +546,7 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | Typing updates | 1 per 3 s per conversation |
 | Auth routes | 30 per minute per client address, 5 per minute per handle |
 | Stored message retention | until acknowledged by all recipient devices, at most 30 days * |
+| Device inactivity before removal from groups | the retention period, never more * |
 | Password (client-enforced) | at least 12 characters, strength score ≥ 3 of 4 |
 
 Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE_LIMITED` with `retry_after_ms`. A connection that keeps exceeding rates is closed with 4007.
