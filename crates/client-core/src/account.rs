@@ -3,17 +3,22 @@
 //! Accounts: registration, login, device enrolment and the signed-in client.
 //!
 //! All key handling happens here, never in the user interface. The password
-//! is consumed by OPAQUE and never sent. The account identity key exists in
-//! memory only while a device is being certified.
+//! is consumed by OPAQUE and never sent. The account root secret, and the
+//! identity key derived from it, exist in memory only for the time of a
+//! sign-in or a credential change.
+//!
+//! One computer keeps one device per account (ADR 0017): signing out keeps
+//! the device, so signing in again finds it and its local store.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Method;
 use tavern_crypto::identity::{
-    AccountIdentityKey, CredentialUpdate, CredentialUpdatePurpose, DeviceKey, IdentityPublicKey,
+    AccountRootSecret, CredentialUpdate, CredentialUpdatePurpose, DeviceKey, IdentityPublicKey,
     SessionChallenge, WrappingKey,
 };
+use tavern_crypto::local_store::StoreKeyParts;
 use tavern_crypto::opaque::client::{Login, Registration};
 use tavern_crypto::opaque::{ExportKey, Password};
 use tavern_crypto::recovery::RecoveryKey;
@@ -35,7 +40,7 @@ use crate::error::ClientError;
 use crate::gateway::Gateway;
 use crate::instance::InstanceUrl;
 use crate::password;
-use crate::store::{SecretStore, StoredDevice, store_key};
+use crate::store::{KnownAccounts, Records, SecretStore, StoredDevice};
 
 /// Runs CPU-heavy work (Argon2id) off the async executor.
 async fn blocking<T, F>(work: F) -> Result<T, ClientError>
@@ -70,8 +75,7 @@ fn now_ms() -> u64 {
 #[derive(Clone)]
 pub struct InstanceClient {
     api: Api,
-    store: Arc<dyn SecretStore>,
-    store_key: String,
+    records: Records,
 }
 
 impl std::fmt::Debug for InstanceClient {
@@ -126,6 +130,11 @@ pub struct SignedIn {
     /// `true` when this login enrolled the device. The interface must then
     /// explain that a new device starts without message history.
     pub new_device: bool,
+    /// `true` when the device was known but its local store could no longer
+    /// be opened (the instance lost its part of the key, for instance after
+    /// an old backup was restored). The store starts empty again, and the
+    /// interface must say that the local history is gone.
+    pub store_reset: bool,
 }
 
 /// A login waiting for its TOTP code.
@@ -172,11 +181,10 @@ impl InstanceClient {
         store: Arc<dyn SecretStore>,
         profile: Option<&str>,
     ) -> Result<Self, ClientError> {
-        let store_key = store_key(instance.as_str(), profile);
+        let records = Records::new(store, instance.as_str(), profile);
         Ok(Self {
             api: Api::new(instance)?,
-            store,
-            store_key,
+            records,
         })
     }
 
@@ -185,12 +193,15 @@ impl InstanceClient {
         self.api.instance()
     }
 
-    /// The handle last used on this device for this instance, if any.
+    /// The accounts that have a device on this computer for this instance,
+    /// to offer them at sign-in.
+    pub fn known_accounts(&self) -> Result<KnownAccounts, ClientError> {
+        self.records.known()
+    }
+
+    /// The handle last used on this computer for this instance, if any.
     pub fn remembered_handle(&self) -> Result<Option<String>, ClientError> {
-        Ok(self
-            .store
-            .load(&self.store_key)?
-            .map(|device| device.handle))
+        Ok(self.records.last_device()?.map(|device| device.handle))
     }
 
     /// Creates an account. Does not sign in: call [`InstanceClient::login`] next.
@@ -228,8 +239,10 @@ impl InstanceClient {
         })
         .await??;
 
-        // The identity is created here and leaves this function only wrapped.
-        let identity = AccountIdentityKey::generate();
+        // The root secret is created here and leaves this function only
+        // wrapped; the identity key is derived from it.
+        let root = AccountRootSecret::generate();
+        let identity = root.identity_key()?;
         let recovery_key = RecoveryKey::generate();
         let request = RegisterFinishRequest {
             invite_code: input.invite_code.to_owned(),
@@ -238,11 +251,9 @@ impl InstanceClient {
             registration_upload: B64(output.upload),
             identity_key: B64::from(identity.public().to_bytes()),
             wrapped_password_copy: B64(
-                identity.wrap(&WrappingKey::from_export_key(&output.export_key)?)?
+                root.wrap(&WrappingKey::from_export_key(&output.export_key)?)?
             ),
-            wrapped_recovery_copy: B64(
-                identity.wrap(&WrappingKey::from_recovery_key(&recovery_key)?)?
-            ),
+            wrapped_recovery_copy: B64(root.wrap(&WrappingKey::from_recovery_key(&recovery_key)?)?),
         };
         let created: RegisterFinishResponse = self
             .api
@@ -327,31 +338,42 @@ impl InstanceClient {
     }
 
     /// Turns a grant into a session: reopens this device's session when the
-    /// device is already enrolled for the account, enrols it otherwise.
+    /// device is already enrolled for the account, enrols it otherwise. Either
+    /// way the key of the local store ends up in memory and in the record.
     async fn complete_login(
         &self,
         grant: LoginGrant,
         export_key: &ExportKey,
     ) -> Result<SignedIn, ClientError> {
-        let known = self
-            .store
-            .load(&self.store_key)?
-            .filter(|device| device.user_id == grant.user_id);
+        let expected = IdentityPublicKey::from_bytes(grant.identity_key.as_slice())
+            .map_err(|_| ClientError::UntrustedKeyMaterial)?;
+        // Erased when this function returns.
+        let root = AccountRootSecret::unwrap(
+            grant.wrapped_password_copy.as_slice(),
+            &WrappingKey::from_export_key(export_key)?,
+            &expected,
+        )
+        .map_err(|_| ClientError::UntrustedKeyMaterial)?;
 
-        let (session, device_seed, new_device) = match known {
+        let known = self.records.device(grant.user_id)?;
+        let (session, device_seed, wrapped, new_device) = match known {
             Some(device) => {
                 let seed =
                     Secret::<32>::from_slice(device.device_seed.as_slice()).ok_or_else(|| {
                         ClientError::Store("stored device key is malformed".to_owned())
                     })?;
-                let session = self.reopen(&grant, device.device_id, &seed).await;
-                match session {
-                    Ok(session) => (session, device.device_seed, false),
+                match self.reopen(&grant, device.device_id, &seed).await {
+                    Ok(session) => (
+                        session,
+                        device.device_seed,
+                        Some(device.wrapped_store_key),
+                        false,
+                    ),
                     Err(error) => {
                         if error.api_code() == Some(ErrorCode::InvalidProof) {
                             // The device was revoked. Forget it: the next
                             // login enrols this computer as a new device.
-                            self.store.delete(&self.store_key)?;
+                            self.records.forget_device(grant.user_id)?;
                             return Err(ClientError::DeviceRevoked);
                         }
                         return Err(error);
@@ -359,29 +381,55 @@ impl InstanceClient {
                 }
             }
             None => {
-                let (session, seed) = self.enrol(&grant, export_key).await?;
-                (session, B64::from(*seed.expose()), true)
+                let (session, seed) = self.enrol(&grant, &root).await?;
+                (session, B64::from(*seed.expose()), None, true)
             }
         };
 
-        self.store.save(
-            &self.store_key,
-            &StoredDevice {
-                user_id: grant.user_id,
-                handle: grant.handle.clone(),
-                device_id: session.device_id,
-                device_seed,
-                session_token: Some(session.session_token.clone()),
-            },
-        )?;
+        // The key of the local store: opened with the account's part and the
+        // server's, or created with the device.
+        let server_part = Secret::<32>::from_slice(session.local_store_share.as_slice())
+            .ok_or(ClientError::ServerError)?;
+        let account_part =
+            root.local_store_part(grant.user_id.as_bytes(), session.device_id.as_bytes())?;
+        let parts = StoreKeyParts {
+            account_part: &account_part,
+            server_part: &server_part,
+            user_id: grant.user_id.as_bytes(),
+            device_id: session.device_id.as_bytes(),
+        };
+        let opened = wrapped
+            .as_ref()
+            .and_then(|wrapped| parts.unwrap(wrapped.as_slice()).ok());
+        let store_reset = wrapped.is_some() && opened.is_none();
+        let (store_key, wrapped_store_key) = match (opened, wrapped) {
+            (Some(store_key), Some(wrapped)) => (store_key, wrapped),
+            _ => {
+                let store_key = Secret::<32>::random();
+                let wrapped = B64(parts.wrap(&store_key)?);
+                (store_key, wrapped)
+            }
+        };
+
+        self.records.save_device(&StoredDevice {
+            user_id: grant.user_id,
+            handle: grant.handle.clone(),
+            device_id: session.device_id,
+            device_seed,
+            wrapped_store_key,
+            session_token: Some(session.session_token.clone()),
+            store_key: Some(B64::from(*store_key.expose())),
+        })?;
         Ok(SignedIn {
             client: Client {
                 instance: self.clone(),
                 user_id: grant.user_id,
                 device_id: session.device_id,
                 session_token: session.session_token,
+                store_key: Arc::new(store_key),
             },
             new_device,
+            store_reset,
         })
     }
 
@@ -413,22 +461,15 @@ impl InstanceClient {
             .await
     }
 
-    /// Enrols this computer as a new device: opens the wrapped account key
-    /// with the export key, certifies a fresh device key, and lets the
-    /// account key go out of scope, which erases it.
+    /// Enrols this computer as a new device: derives the account identity
+    /// key, certifies a fresh device key with it, and lets the identity key
+    /// go out of scope, which erases it.
     async fn enrol(
         &self,
         grant: &LoginGrant,
-        export_key: &ExportKey,
+        root: &AccountRootSecret,
     ) -> Result<(SessionResponse, Secret<32>), ClientError> {
-        let expected = IdentityPublicKey::from_bytes(grant.identity_key.as_slice())
-            .map_err(|_| ClientError::UntrustedKeyMaterial)?;
-        let identity = AccountIdentityKey::unwrap(
-            grant.wrapped_password_copy.as_slice(),
-            &WrappingKey::from_export_key(export_key)?,
-            &expected,
-        )
-        .map_err(|_| ClientError::UntrustedKeyMaterial)?;
+        let identity = root.identity_key()?;
 
         let device_key = DeviceKey::generate();
         let device_id = Uuid::new_v4();
@@ -495,7 +536,7 @@ impl InstanceClient {
         // For an unknown handle the instance returns decoys, which no key opens.
         let expected = IdentityPublicKey::from_bytes(start.identity_key.as_slice())
             .map_err(|_| ClientError::InvalidRecoveryKey)?;
-        let identity = AccountIdentityKey::unwrap(
+        let root = AccountRootSecret::unwrap(
             start.wrapped_recovery_copy.as_slice(),
             &WrappingKey::from_recovery_key(&recovery_key)?,
             &expected,
@@ -513,16 +554,20 @@ impl InstanceClient {
             state.finish(&password, registration_response.as_slice(), &finish_handle)
         })
         .await??;
-        let wrapped = identity.wrap(&WrappingKey::from_export_key(&output.export_key)?)?;
-        let signature = identity.sign_credential_update(&CredentialUpdate {
-            purpose: CredentialUpdatePurpose::Recovery,
-            challenge: &challenge,
-            handle: &handle,
-            opaque_upload: &output.upload,
-            wrapped_password_copy: &wrapped,
-            wrapped_recovery_copy: &[],
-        });
-        drop(identity);
+        // The same root secret, wrapped under the new password: the identity
+        // and the local stores of the account's devices are unchanged.
+        let wrapped = root.wrap(&WrappingKey::from_export_key(&output.export_key)?)?;
+        let signature = root
+            .identity_key()?
+            .sign_credential_update(&CredentialUpdate {
+                purpose: CredentialUpdatePurpose::Recovery,
+                challenge: &challenge,
+                handle: &handle,
+                opaque_upload: &output.upload,
+                wrapped_password_copy: &wrapped,
+                wrapped_recovery_copy: &[],
+            });
+        drop(root);
 
         self.api
             .call_empty(
@@ -543,12 +588,20 @@ impl InstanceClient {
             })
     }
 
-    /// Resumes the session saved on this device, if it is still valid.
+    /// Resumes the session of the account used last on this computer, if it
+    /// is still valid. Needs neither the password nor, for the local store,
+    /// the instance: a signed-in account keeps its store key in the record.
     pub async fn resume(&self) -> Result<Option<Client>, ClientError> {
-        let Some(mut device) = self.store.load(&self.store_key)? else {
+        let Some(mut device) = self.records.last_device()? else {
             return Ok(None);
         };
-        let Some(session_token) = device.session_token.clone() else {
+        let (Some(session_token), Some(store_key)) = (
+            device.session_token.clone(),
+            device
+                .store_key
+                .as_ref()
+                .and_then(|key| Secret::<32>::from_slice(key.as_slice())),
+        ) else {
             return Ok(None);
         };
         let client = Client {
@@ -556,14 +609,15 @@ impl InstanceClient {
             user_id: device.user_id,
             device_id: device.device_id,
             session_token,
+            store_key: Arc::new(store_key),
         };
         match client.me().await {
             Ok(_) => Ok(Some(client)),
             Err(ClientError::SessionEnded) => {
-                // Keep the device key: the next login reopens the session
-                // instead of enrolling this computer again.
-                device.session_token = None;
-                self.store.save(&self.store_key, &device)?;
+                // Same as signing out: the device key stays, so the next
+                // login reopens this device; the store key goes.
+                device.sign_out();
+                self.records.update_device(&device)?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -571,12 +625,12 @@ impl InstanceClient {
     }
 }
 
-/// Proof of a fresh password check, holding the account identity key in
+/// Proof of a fresh password check, holding the account root secret in
 /// memory for the one credential change it authorises. Erased when dropped.
 pub struct Reauthenticated {
     handle: Handle,
     display_name: String,
-    identity: AccountIdentityKey,
+    root: AccountRootSecret,
     challenge: [u8; 32],
     token: B64,
 }
@@ -594,6 +648,8 @@ pub struct Client {
     user_id: Uuid,
     device_id: Uuid,
     session_token: B64,
+    /// Key of this device's local store.
+    store_key: Arc<Secret<32>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -624,6 +680,12 @@ impl Client {
         self.device_id
     }
 
+    /// The key of this device's local store. It is the same after signing
+    /// out and back in, and unknown to the instance.
+    pub fn local_store_key(&self) -> &Secret<32> {
+        &self.store_key
+    }
+
     /// The signed-in account, as the instance sees it.
     pub async fn me(&self) -> Result<Me, ClientError> {
         self.api().fetch("v1/users/me", self.auth()).await
@@ -644,12 +706,22 @@ impl Client {
             )
             .await?;
         if device_id == self.device_id {
-            self.instance.store.delete(&self.instance.store_key)?;
+            self.instance.records.forget_device(self.user_id)?;
         }
         Ok(())
     }
 
-    /// Signs out. The device stays enrolled: the next login reopens its session.
+    /// Signs out and erases this device: it is revoked on the instance, which
+    /// destroys its part of the local store key, and its record is deleted
+    /// from this computer. The next sign-in enrols a new device, without
+    /// history. This cannot be undone.
+    pub async fn erase_device(self) -> Result<(), ClientError> {
+        self.revoke_device(self.device_id).await
+    }
+
+    /// Signs out. The device stays enrolled and keeps its key and its wrapped
+    /// store key: the next login to this account reopens the same device and
+    /// its local store. Until then the store cannot be read.
     pub async fn logout(self) -> Result<(), ClientError> {
         let result = self
             .api()
@@ -662,12 +734,13 @@ impl Client {
         }
     }
 
-    /// Removes the session token from the store, keeping the device key.
+    /// Removes the session token and the store key from the record, keeping
+    /// the device key. Also used when the instance ended the session.
     pub fn forget_session(&self) -> Result<(), ClientError> {
-        let store = &self.instance.store;
-        if let Some(mut device) = store.load(&self.instance.store_key)? {
-            device.session_token = None;
-            store.save(&self.instance.store_key, &device)?;
+        let records = &self.instance.records;
+        if let Some(mut device) = records.device(self.user_id)? {
+            device.sign_out();
+            records.update_device(&device)?;
         }
         Ok(())
     }
@@ -737,7 +810,7 @@ impl Client {
 
         let expected = IdentityPublicKey::from_bytes(me.identity_key.as_slice())
             .map_err(|_| ClientError::UntrustedKeyMaterial)?;
-        let identity = AccountIdentityKey::unwrap(
+        let root = AccountRootSecret::unwrap(
             grant.wrapped_password_copy.as_slice(),
             &WrappingKey::from_export_key(&output.export_key)?,
             &expected,
@@ -751,7 +824,7 @@ impl Client {
         Ok(Reauthenticated {
             handle,
             display_name: me.display_name,
-            identity,
+            root,
             challenge,
             token: grant.reauth_token,
         })
@@ -794,11 +867,12 @@ impl Client {
         })
         .await??;
 
-        // The identity key is wrapped again under the new export key.
+        // The root secret is wrapped again under the new export key.
         let wrapped = reauth
-            .identity
+            .root
             .wrap(&WrappingKey::from_export_key(&output.export_key)?)?;
-        let signature = reauth.identity.sign_credential_update(&CredentialUpdate {
+        let identity = reauth.root.identity_key()?;
+        let signature = identity.sign_credential_update(&CredentialUpdate {
             purpose: CredentialUpdatePurpose::PasswordChange,
             challenge: &reauth.challenge,
             handle: &reauth.handle,
@@ -829,9 +903,10 @@ impl Client {
     ) -> Result<RecoveryKey, ClientError> {
         let recovery_key = RecoveryKey::generate();
         let wrapped = reauth
-            .identity
+            .root
             .wrap(&WrappingKey::from_recovery_key(&recovery_key)?)?;
-        let signature = reauth.identity.sign_credential_update(&CredentialUpdate {
+        let identity = reauth.root.identity_key()?;
+        let signature = identity.sign_credential_update(&CredentialUpdate {
             purpose: CredentialUpdatePurpose::RecoveryKeyRotation,
             challenge: &reauth.challenge,
             handle: &reauth.handle,

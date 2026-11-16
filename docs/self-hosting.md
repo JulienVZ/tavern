@@ -166,6 +166,8 @@ What the secrets protect, and why they must be backed up together with the datab
 
 What a backup does **not** contain: readable messages. The server only stores ciphertext waiting for delivery; message history lives on your users' devices.
 
+The database does hold, for each device, the server's part of the key of that device's local history ([ADR 0017](adr/0017-device-identity-and-sign-out.md)). It is useless on its own, but a device cannot open its local history without it. **Back up often:** after restoring a backup, devices enrolled since that backup are unknown to the instance. Their users must sign in again, and those devices start over as new devices, without their local history. Devices that existed at the time of the backup keep everything. Restoring an older backup also has consequences for encrypted conversations, described in the M2 documentation.
+
 `restore.sh --db-only` restores the database and keeps the current configuration files. Uploaded files (attachments) will be added to both scripts when they exist (milestone M5).
 
 ## 7. Stopping and removing

@@ -117,7 +117,7 @@ pub(crate) async fn enrol(
         }
         return Err(error.into());
     }
-    let response = session::create(&mut *tx, device_id, state.settings.session_ttl).await?;
+    let response = session::create(&mut tx, device_id, state.settings.session_ttl).await?;
     tx.commit().await?;
 
     tracing::info!(%user_id, %device_id, "device enrolled");
@@ -176,7 +176,8 @@ pub(crate) async fn reopen_session(
         .verify_session_proof(&challenge, request.proof.as_slice())
         .map_err(|_| refused())?;
 
-    session::create(&state.db, device_id, state.settings.session_ttl)
+    let mut db = state.db.acquire().await?;
+    session::create(&mut db, device_id, state.settings.session_ttl)
         .await
         .map(Json)
 }
@@ -236,7 +237,9 @@ pub(crate) async fn revoke(
 ) -> ApiResult<StatusCode> {
     let mut tx = state.db.begin().await?;
     let revoked = sqlx::query(
-        "UPDATE devices SET revoked_at = now() \
+        // The server's part of its local store key goes with it: a store
+        // left on a revoked device can never be opened again (ADR 0017).
+        "UPDATE devices SET revoked_at = now(), local_store_share = NULL \
          WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
     )
     .bind(device_id)

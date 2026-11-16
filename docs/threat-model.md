@@ -20,7 +20,8 @@ Related documents: [architecture](architecture.md), [protocol](protocol.md), [da
 | Custom emojis, including animated ones | Devices; ciphertext in blob storage | Same as attachments |
 | Call audio, video, screen share, data packets | Devices in the call | LiveKit frame encryption with keys from the MLS exporter |
 | Passwords | The user's memory | OPAQUE; never sent to the server |
-| Account identity key (AIK) | Wrapped on the server; briefly in client memory | Wrapped under a password-derived key and under the recovery key |
+| Account root secret, and the account identity key (AIK) derived from it | Wrapped on the server; briefly in client memory | Wrapped under a password-derived key and under the recovery key ([ADR 0017](adr/0017-device-identity-and-sign-out.md)) |
+| Key of a device's local store | In the OS keychain while signed in; only wrapped while signed out | Wrapped under a key that needs both a part derived from the root secret and a part held by the server, erased at revocation ([ADR 0017](adr/0017-device-identity-and-sign-out.md)) |
 | Device signature keys, MLS group secrets | Device local store | SQLCipher database, key in the OS keychain |
 | Local message history and search index | Device local store | Same |
 | Session tokens | Device local store; SHA-256 hash on the server | Random 256-bit values, revocable |
@@ -67,7 +68,8 @@ Includes a malicious admin running modified software and an intruder who took ov
 
 - Powered off or locked, with full-disk encryption: the local database key sits in the OS keychain, protected by the OS login.
 - Unlocked, or OS account compromised: the attacker reads the local history, holds a valid session and can read and send messages as that device until it is revoked.
-- **Cannot** obtain the AIK private key from the device (it is not stored there), so cannot enrol further devices without the password. Any enrolment is notified to the account's other devices.
+- **Cannot** obtain the account root secret or the AIK private key from the device (they are not stored there), so cannot enrol further devices without the password. Any enrolment is notified to the account's other devices.
+- **Cannot** read the local store of a signed-out account: its key is kept only wrapped, and opening it needs the password (through the root secret) and the server's part. Once the device is revoked the server's part is erased and the store cannot be opened at all. A signed-in device keeps its store key in the keychain and is not protected this way.
 - Revoking the device from another device (or by an admin) invalidates its session and triggers Remove proposals in every group. After those commits the stolen device cannot decrypt new messages. Messages already on the device remain readable.
 - Malware on a device in use is out of scope: it sees what the user sees.
 
@@ -105,6 +107,7 @@ Includes a malicious admin running modified software and an intruder who took ov
 | Invitation codes (hashed), who invited whom | Closed registration |
 | Moderation actions: who kicked or banned whom, and when | Enforced server side |
 | Security notices: that an account's password, recovery key, TOTP or device list changed, when, and which devices dismissed the notice | The server performs these changes; it stores a kind and a date so that offline devices are told ([ADR 0016](adr/0016-security-notices.md)) |
+| For each device, the server's part of its local store key | Useless without the part derived from the user's root secret; erased at revocation ([ADR 0017](adr/0017-device-identity-and-sign-out.md)) |
 | IP addresses of connections | Inherent; not written to the database, and not logged at the default log level |
 
 ### Never visible to the server
@@ -135,7 +138,7 @@ Rule: a feature that would require the server to read content is redesigned on t
 5. **Window between a kick and its removal commit.** Delivery is cut at once; the cryptographic removal waits for the first online member device. A colluding server could exploit the window.
 6. **Spurious removals** by the server through the external sender key or by refusing delivery: denial of service only.
 7. **Loss or change of the MLS external sender key** disables server-initiated removals in existing groups until a member device repairs each group; see [ADR 0002](adr/0002-mls-via-openmls.md#external-sender-key-lifecycle). The key is dedicated to this purpose, separate from every other instance secret, and included in backups.
-8. **Offline password guessing** after a full server compromise, at Argon2id cost. A cracked password exposes the wrapped AIK, allowing device enrolment as that user. Mitigations: the client refuses weak passwords at registration and password change (minimum length and strength estimate), every enrolment is notified to all existing devices of the account, and contacts see a notice in shared conversations. TOTP does not protect against this, since it is enforced by the server.
+8. **Offline password guessing** after a full server compromise, at Argon2id cost. A cracked password exposes the wrapped account root secret, allowing device enrolment as that user, and, with a seized signed-out computer of that user, the reading of its local store. Mitigations: the client refuses weak passwords at registration and password change (minimum length and strength estimate), every enrolment is notified to all existing devices of the account, and contacts see a notice in shared conversations. TOTP does not protect against this, since it is enforced by the server.
 9. **LiveKit signalling is not end-to-end encrypted.** Call membership, timing and volumes are visible to the SFU. Codec headers needed for routing are not encrypted.
 10. **Members of a DM or group who are not in a call** hold the exporter secret from which that call's keys derive.
 11. **Prebuilt libwebrtc.** The LiveKit SDK downloads a binary WebRTC build at compile time. It processes plaintext media before encryption. Mitigation: exact version pinning, restricted sources in `deny.toml`, review on each upgrade. A build from source is an option for M9.

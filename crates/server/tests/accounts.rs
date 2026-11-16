@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{Account, Device, PASSWORD, TestApp, random_handle, session_proof};
 use reqwest::{Method, StatusCode};
-use tavern_crypto::identity::{AccountIdentityKey, DeviceKey};
+use tavern_crypto::identity::{AccountRootSecret, DeviceKey};
 use tavern_protocol::rest::*;
 use tavern_server::gateway::{Event, RevocationReason};
 use tavern_server::notices::{self, NoticeKind};
@@ -432,12 +432,15 @@ async fn a_device_certificate_must_come_from_the_account_itself() {
     };
 
     // Signed by a key that is not the account's identity key.
-    let forged = AccountIdentityKey::generate().certify_device(
-        account.user_id.as_bytes(),
-        device_id.as_bytes(),
-        &key.public(),
-        0,
-    );
+    let forged = AccountRootSecret::generate()
+        .identity_key()
+        .unwrap()
+        .certify_device(
+            account.user_id.as_bytes(),
+            device_id.as_bytes(),
+            &key.public(),
+            0,
+        );
     let grant = app.grant(&account).await;
     let (status, code) = app
         .post_err("/v1/devices", Some(&grant.enrolment_token), &enrol(forged))

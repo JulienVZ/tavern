@@ -424,6 +424,10 @@ dto! {
         pub session_token: B64,
         /// When the session expires if unused, in milliseconds since the Unix epoch.
         pub expires_at_ms: u64,
+        /// The server's part of the key that wraps this device's local store
+        /// (32 bytes). It is useless without the part derived from the
+        /// account root secret. Since REST 1.2.
+        pub local_store_share: B64,
     }
 }
 

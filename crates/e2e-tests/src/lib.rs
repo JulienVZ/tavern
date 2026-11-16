@@ -104,8 +104,21 @@ impl Server {
 
     /// A client on a computer that has never been used: empty secret store.
     pub fn new_computer(&self) -> InstanceClient {
+        self.new_computer_with_store().0
+    }
+
+    /// Same, with access to the computer's secret store, to check what it
+    /// keeps.
+    pub fn new_computer_with_store(&self) -> (InstanceClient, Arc<MemoryStore>) {
+        let store = Arc::new(MemoryStore::default());
+        (self.computer(&store, None), store)
+    }
+
+    /// Another client on a computer whose secret store is `store`, under
+    /// `profile`.
+    pub fn computer(&self, store: &Arc<MemoryStore>, profile: Option<&str>) -> InstanceClient {
         let url = InstanceUrl::parse(&format!("http://{}", self.addr)).unwrap();
-        InstanceClient::new(url, Arc::new(MemoryStore::default()), None).unwrap()
+        InstanceClient::new(url, store.clone(), profile).unwrap()
     }
 
     /// Creates an invitation on the host, as `create-admin.sh` does.

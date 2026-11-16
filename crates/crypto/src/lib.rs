@@ -7,8 +7,10 @@
 //! authentication and identity:
 //!
 //! - [`opaque`]: OPAQUE registration and login, client and server sides;
-//! - [`identity`]: account identity key, its wrapped copies, device keys,
-//!   device certificates and the signatures that authorise credential changes;
+//! - [`identity`]: account root secret and its wrapped copies, account
+//!   identity key, device keys, device certificates and the signatures that
+//!   authorise credential changes;
+//! - [`local_store`]: the key of a device's local store and its wrapped copy;
 //! - [`recovery`]: the recovery key shown once to the user;
 //! - [`token`]: random tokens and their hashes;
 //! - [`secret`]: containers that erase secrets from memory.
@@ -25,6 +27,7 @@ mod encoding;
 mod error;
 
 pub mod identity;
+pub mod local_store;
 pub mod opaque;
 pub mod recovery;
 pub mod secret;

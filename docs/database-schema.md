@@ -17,6 +17,7 @@ Every column belongs to one of these classes, noted in the comment next to it.
 | `WRAP` | Key material encrypted on the client under a key the server does not have |
 | `E2EE` | End-to-end encrypted payload, opaque to the server |
 | `SRV` | Secret the server must be able to use, encrypted at rest with an instance key |
+| `HALF` | Server half of a client key: random, stored in clear, useless without a half the server never has ([ADR 0017](adr/0017-device-identity-and-sign-out.md)) |
 
 There is no class for plaintext content, because there is no such column.
 
@@ -40,8 +41,8 @@ CREATE TABLE users (
     opaque_suite            smallint NOT NULL,               -- META  version of the OPAQUE and Argon2id parameters
     opaque_record           bytea NOT NULL,                  -- AUTH  OPAQUE ServerRegistration
     identity_key            bytea NOT NULL,                  -- PUB   account identity key (Ed25519)
-    identity_key_wrapped_pw bytea NOT NULL,                  -- WRAP  AIK private key under the OPAQUE export key
-    identity_key_wrapped_rk bytea NOT NULL,                  -- WRAP  AIK private key under the recovery key
+    identity_key_wrapped_pw bytea NOT NULL,                  -- WRAP  account root secret under the OPAQUE export key
+    identity_key_wrapped_rk bytea NOT NULL,                  -- WRAP  account root secret under the recovery key
     totp_secret             bytea,                           -- SRV   encrypted with the instance TOTP key
     totp_enabled_at         timestamptz,                     -- META
     totp_last_step          bigint,                          -- META  last accepted time step, against replay
@@ -69,7 +70,8 @@ CREATE TABLE devices (
     created_at      timestamptz NOT NULL DEFAULT now(),      -- META
     last_seen_at    timestamptz,                             -- META  day precision
     devices_seen_at timestamptz NOT NULL DEFAULT now(),      -- META  enrolments after this instant were not shown to this device yet
-    revoked_at      timestamptz                              -- META
+    revoked_at      timestamptz,                             -- META
+    local_store_share bytea                                  -- HALF  server part of the local store key (ADR 0017); erased at revocation
 );
 CREATE INDEX devices_user_idx ON devices (user_id) WHERE revoked_at IS NULL;
 

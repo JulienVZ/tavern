@@ -11,7 +11,8 @@ use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use data_encoding::BASE64URL_NOPAD;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+use tavern_crypto::local_store::PART_LEN as LOCAL_STORE_SHARE_LEN;
 use tavern_crypto::token;
 use tavern_protocol::rest::{B64, SessionResponse};
 use uuid::Uuid;
@@ -122,10 +123,26 @@ impl FromRequestParts<AppState> for EnrolmentAuth {
 }
 
 /// Creates the session of a device, replacing any previous one.
-pub async fn create<'e, E>(db: E, device_id: Uuid, ttl: Duration) -> ApiResult<SessionResponse>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
+///
+/// The response carries the server's part of the key that wraps the device's
+/// local store (ADR 0017). It is created with the device's first session and
+/// never changes afterwards, so that a database restored from a backup still
+/// opens the stores of the devices it knows.
+pub async fn create(
+    db: &mut PgConnection,
+    device_id: Uuid,
+    ttl: Duration,
+) -> ApiResult<SessionResponse> {
+    let fresh: [u8; LOCAL_STORE_SHARE_LEN] = token::random_bytes();
+    let share: Vec<u8> = sqlx::query_scalar(
+        "UPDATE devices SET local_store_share = COALESCE(local_store_share, $2) \
+         WHERE id = $1 RETURNING local_store_share",
+    )
+    .bind(device_id)
+    .bind(fresh.as_slice())
+    .fetch_one(&mut *db)
+    .await?;
+
     let token: [u8; CLIENT_TOKEN_LEN] = token::random_bytes();
     let expires_at_ms: i64 = sqlx::query_scalar(
         "INSERT INTO sessions (device_id, token_hash, expires_at) \
@@ -138,13 +155,14 @@ where
     .bind(device_id)
     .bind(token::hash(&token).as_slice())
     .bind(ttl.as_secs_f64())
-    .fetch_one(db)
+    .fetch_one(&mut *db)
     .await?;
 
     Ok(SessionResponse {
         device_id,
         session_token: B64(token.to_vec()),
         expires_at_ms: u64::try_from(expires_at_ms).unwrap_or_default(),
+        local_store_share: B64(share),
     })
 }
 

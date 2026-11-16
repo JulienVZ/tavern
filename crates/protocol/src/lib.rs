@@ -52,8 +52,10 @@ pub const REST_MAJOR_VERSION: u32 = 1;
 /// client, instead of failing on a missing route. History:
 ///
 /// - 0: health and version only (M0), and M1 before credential changes;
-/// - 1: accounts, devices, TOTP, administration, credential changes (M1).
-pub const REST_MINOR_VERSION: u32 = 1;
+/// - 1: accounts, devices, TOTP, administration, credential changes (M1);
+/// - 2: session responses carry `local_store_share`; wrapped copies hold the
+///   account root secret (format version 2, ADR 0017).
+pub const REST_MINOR_VERSION: u32 = 2;
 
 /// WebSocket subprotocol negotiated by the gateway.
 pub const GATEWAY_SUBPROTOCOL: &str = "tavern.v1";

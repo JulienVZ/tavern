@@ -80,7 +80,7 @@ Using a single multiplexed UDP port keeps port forwarding simple on a home route
 
 | Object | Key | Where the private part lives |
 |---|---|---|
-| Account | Ed25519 account identity key (AIK) | Wrapped copies on the server (password-derived key, recovery key). In client memory only while certifying a device. |
+| Account | Account root secret, and the Ed25519 account identity key (AIK) derived from it | Wrapped copies of the root secret on the server (password-derived key, recovery key). In client memory only during a sign-in or a credential change ([ADR 0017](adr/0017-device-identity-and-sign-out.md)). |
 | Device | Ed25519 MLS signature key | Device local store |
 | Device certificate | AIK signature over (user id, device id, device signature key) | Public; carried in the MLS credential |
 | Instance | Dedicated Ed25519 MLS external sender key | Server secret, backed up with the instance |
@@ -106,7 +106,7 @@ sequenceDiagram
   S-->>C: RegistrationResponse, registration id
   C->>C: OPAQUE finish, yields RegistrationUpload and export key
   C->>C: Generate account identity key and recovery key
-  C->>C: Wrap AIK private key under export key and under recovery key
+  C->>C: Generate the account root secret, derive the AIK, wrap the root secret under export key and under recovery key
   C->>S: POST /v1/auth/register/finish (RegistrationUpload, AIK public key, both wrapped copies)
   S->>DB: Store OPAQUE record and wrapped keys, consume invite
   S-->>C: 201 Created (user id)
@@ -134,10 +134,10 @@ sequenceDiagram
     S-->>C: TOTP required
     C->>S: POST /v1/auth/login/totp (code)
   end
-  S-->>C: Enrolment token (short lived), wrapped AIK
+  S-->>C: Enrolment token (short lived), wrapped root secret
   C->>C: Unwrap AIK with export key
   C->>C: Generate device signature key, sign device certificate with AIK
-  C->>C: Erase AIK private key from memory
+  C->>C: Erase the root secret and the AIK private key from memory
   C->>S: POST /v1/devices (device certificate, encrypted device name)
   S->>S: Verify certificate against stored AIK public key
   S->>DB: Create device and session (token hash only)
@@ -151,7 +151,7 @@ sequenceDiagram
   S-->>C: Ready
 ```
 
-A device that already has a session skips to the last two steps. The new device then joins each of the user's conversations with an MLS external commit (section 3.5); it has no earlier history ([ADR 0006](adr/0006-no-prior-history-v1.md)), which the UI explains at enrolment and at the top of each conversation. History transfer is planned in [ADR 0009](adr/0009-history-on-new-devices.md).
+A device that already has a session skips to the last two steps. A device already enrolled for the account reopens its session with a signature of its device key instead of enrolling again; one computer keeps one device per account, and signing out keeps it ([ADR 0017](adr/0017-device-identity-and-sign-out.md)). The response that opens a session carries the server's part of the device's local store key. The new device then joins each of the user's conversations with an MLS external commit (section 3.5); it has no earlier history ([ADR 0006](adr/0006-no-prior-history-v1.md)), which the UI explains at enrolment and at the top of each conversation. History transfer is planned in [ADR 0009](adr/0009-history-on-new-devices.md).
 
 At registration and password change the client enforces a minimum password strength locally (length and a zxcvbn-style estimate), because the password also protects the account identity key.
 

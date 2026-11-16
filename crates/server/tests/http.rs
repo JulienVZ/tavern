@@ -148,14 +148,15 @@ async fn wrong_database_password_is_explained() {
     );
 }
 
-/// The routes of REST 1.1, frozen. If this test fails because a route was
+/// The routes of REST 1.2, frozen (1.2 added no route: session responses
+/// gained `local_store_share`). If this test fails because a route was
 /// added or removed, update the list **and increment
 /// `tavern_protocol::REST_MINOR_VERSION`**: that number is how a client tells
 /// its user that an instance is older than the client.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn the_route_list_matches_the_announced_rest_version() {
-    const REST_MINOR_OF_THIS_LIST: u32 = 1;
+    const REST_MINOR_OF_THIS_LIST: u32 = 2;
     const ROUTES: &[&str] = &[
         "/health",
         "/v1/account/password/finish",
@@ -212,6 +213,10 @@ async fn the_route_list_matches_the_announced_rest_version() {
         "REST_MINOR_VERSION changed: update the frozen route list with it"
     );
     assert!(document["components"]["schemas"]["LoginGrant"].is_object());
+    assert!(
+        document["components"]["schemas"]["SessionResponse"]["properties"]["local_store_share"]
+            .is_object()
+    );
 
     let version: VersionResponse = reqwest::get(format!("http://{addr}/version"))
         .await

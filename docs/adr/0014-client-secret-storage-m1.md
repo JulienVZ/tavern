@@ -1,6 +1,6 @@
 # ADR 0014 — Client secret storage at milestone M1
 
-- Status: accepted
+- Status: accepted; the layout of the records is superseded by [ADR 0017](0017-device-identity-and-sign-out.md) (one record per account, an index, the wrapped key of the local store)
 - Date: 2026-11-14
 
 ## Context

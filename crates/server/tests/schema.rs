@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tavern_server::db;
 
 const SCHEMA_DOC: &str = include_str!("../../../docs/database-schema.md");
-const CLASSES: &[&str] = &["META", "PUB", "HASH", "AUTH", "WRAP", "E2EE", "SRV"];
+const CLASSES: &[&str] = &["META", "PUB", "HASH", "AUTH", "WRAP", "E2EE", "SRV", "HALF"];
 
 /// Extracts `table -> {column -> class}` from the SQL blocks of the document.
 fn documented_columns() -> BTreeMap<String, BTreeMap<String, String>> {

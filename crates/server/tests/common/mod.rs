@@ -21,7 +21,9 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tavern_crypto::identity::{AccountIdentityKey, DeviceKey, SessionChallenge, WrappingKey};
+use tavern_crypto::identity::{
+    AccountIdentityKey, AccountRootSecret, DeviceKey, SessionChallenge, WrappingKey,
+};
 use tavern_crypto::opaque::Password;
 use tavern_crypto::opaque::client::{Login, Registration};
 use tavern_crypto::recovery::RecoveryKey;
@@ -278,7 +280,8 @@ impl TestApp {
                 &canonical,
             )
             .unwrap();
-        let identity = AccountIdentityKey::generate();
+        let root = AccountRootSecret::generate();
+        let identity = root.identity_key().unwrap();
         let recovery_key = RecoveryKey::generate();
         let finish = RegisterFinishRequest {
             invite_code: invite_code.to_owned(),
@@ -286,10 +289,10 @@ impl TestApp {
             display_name: "Test User".to_owned(),
             registration_upload: B64(output.upload),
             identity_key: B64::from(identity.public().to_bytes()),
-            wrapped_password_copy: B64(identity
+            wrapped_password_copy: B64(root
                 .wrap(&WrappingKey::from_export_key(&output.export_key).unwrap())
                 .unwrap()),
-            wrapped_recovery_copy: B64(identity
+            wrapped_recovery_copy: B64(root
                 .wrap(&WrappingKey::from_recovery_key(&recovery_key).unwrap())
                 .unwrap()),
         };

@@ -126,7 +126,7 @@ The authoritative description is the OpenAPI document served at `GET /v1/openapi
 | `GET /version` | Server version, protocol versions, MLS external sender public key, source link, build commit (`commit`, when the build recorded it; `-dirty` suffix for uncommitted changes) | none |
 | `GET /v1/openapi.json` | OpenAPI description | none |
 | `POST /v1/auth/register/start` | Invite code, handle, OPAQUE `RegistrationRequest` → `RegistrationResponse`, suite | none |
-| `POST /v1/auth/register/finish` | Invite code, handle, display name, OPAQUE `RegistrationUpload`, AIK public key, two wrapped AIK copies → user id | none |
+| `POST /v1/auth/register/finish` | Invite code, handle, display name, OPAQUE `RegistrationUpload`, AIK public key, two wrapped copies of the account root secret → user id | none |
 | `POST /v1/auth/login/start` | Handle, OPAQUE `CredentialRequest` → login id, `CredentialResponse`, suite | none |
 | `POST /v1/auth/login/finish` | Login id, OPAQUE `CredentialFinalization` → grant, or `totp_required` | none |
 | `POST /v1/auth/login/totp` | Login id, TOTP code or recovery code → grant | none |
@@ -137,7 +137,7 @@ The authoritative description is the OpenAPI document served at `GET /v1/openapi
 | `DELETE /v1/devices/{id}` | Revoke a device and its session | session |
 | `GET /v1/users/me` | The signed-in account | session |
 | `POST /v1/account/totp/enable`, `/confirm`, `/disable` | TOTP enrolment | session |
-| `POST /v1/auth/reauth/start`, `/finish` | A full OPAQUE login from an existing session (plus the TOTP code when enabled) → re-authentication token, challenge, wrapped AIK | session |
+| `POST /v1/auth/reauth/start`, `/finish` | A full OPAQUE login from an existing session (plus the TOTP code when enabled) → re-authentication token, challenge, wrapped root secret | session |
 | `POST /v1/account/password/start`, `/finish` | Change the password: OPAQUE registration of the new one, new "password" wrapped copy, AIK signature | session + re-authentication token |
 | `POST /v1/account/recovery-key` | Replace the recovery key: new "recovery" wrapped copy, AIK signature | session + re-authentication token |
 | `POST /v1/auth/recover/start` | Handle, OPAQUE `RegistrationRequest` for the new password → challenge, AIK public key, "recovery" wrapped copy, `RegistrationResponse` | none |
@@ -157,7 +157,8 @@ Credential changes are described in [ADR 0003](adr/0003-opaque-authentication.md
 
 Notes:
 
-- A **grant** is what a completed login returns: an enrolment token and a session nonce (both single use, five minutes), the account's public identity key and the wrapped "password" copy of its private key. The wrapped copy is never returned before the TOTP step when TOTP is enabled.
+- A **grant** is what a completed login returns: an enrolment token and a session nonce (both single use, five minutes), the account's public identity key and the wrapped "password" copy of its account root secret. The wrapped copy is never returned before the TOTP step when TOTP is enabled.
+- The two routes that open a session (`POST /v1/devices`, `POST /v1/devices/{id}/session`) answer with the session token, its expiry and, since REST 1.2, `local_store_share`: the server's 32-byte part of the key that wraps this device's local store. It is created with the device's first session, never changes, is returned to that device only, and is erased when the device is revoked ([ADR 0017](adr/0017-device-identity-and-sign-out.md)). The wrapped copies hold the account root secret (format version 2) since REST 1.2.
 - The enrolment token is sent as `Authorization: Bearer`, like a session token. It is consumed by the request that uses it, successful or not.
 - A session always belongs to a device. A device whose session ended logs in again and reopens it with `POST /v1/devices/{id}/session`; it is not enrolled a second time.
 - Handles must be sent in canonical form (lower case ASCII `a–z 0–9 _ .`, 2 to 32 characters, no leading, trailing or double dot). The server refuses anything else with `INVALID_HANDLE`; it never lower-cases or trims. A handle cannot be changed in v1.

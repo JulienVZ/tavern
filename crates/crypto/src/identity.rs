@@ -4,27 +4,38 @@
 //!
 //! # Keys
 //!
-//! - The **account identity key** (AIK) is an Ed25519 key pair generated at
-//!   registration. Its public half is the account's identity: contacts compare
-//!   it as a safety number. Its private half exists in clear only in the
-//!   memory of a client, for the time needed to certify a device or authorise
-//!   a credential change, and is erased when dropped.
-//! - Two **wrapped copies** of the AIK private key are stored by the server:
-//!   one under a key derived from the OPAQUE export key (so from the
-//!   password), one under a key derived from the recovery key. The server can
-//!   open neither.
+//! - The **account root secret** is 32 random bytes generated at
+//!   registration. Every long-term secret of the account is derived from it
+//!   with HKDF-SHA512 and a label of its own, so that each has one use:
+//!   - the seed of the account identity key;
+//!   - the account's part of the key that wraps a device's local store
+//!     (ADR 0017);
+//!   - later, the keys of encrypted profiles and history backup.
+//!
+//!   It exists in clear only in the memory of a client, for the time of a
+//!   sign-in or a credential change, and is erased when dropped.
+//! - The **account identity key** (AIK) is the Ed25519 key pair derived from
+//!   the root secret. Its public half is the account's identity: contacts
+//!   compare it as a safety number.
+//! - Two **wrapped copies** of the root secret are stored by the server: one
+//!   under a key derived from the OPAQUE export key (so from the password),
+//!   one under a key derived from the recovery key. The server can open
+//!   neither.
 //! - Each device has its own Ed25519 **device key**, certified by the AIK.
 //!
-//! # Wrapped key format (version 1, 73 bytes)
+//! # Wrapped root secret format (version 2, 73 bytes)
 //!
 //! ```text
-//! 0x01 || nonce (24 bytes) || XChaCha20-Poly1305(seed, 32 bytes) || tag (16 bytes)
+//! 0x02 || nonce (24 bytes) || XChaCha20-Poly1305(root secret, 32 bytes) || tag (16 bytes)
 //! ```
 //!
 //! The wrapping key is `HKDF-SHA512(secret, info = label)`, with a different
 //! label for each kind of copy. The associated data binds the ciphertext to
 //! its kind and to the AIK public key, so the server cannot swap a copy
 //! between accounts or between the two kinds.
+//!
+//! Version 1 wrapped the AIK seed itself. It was used by test accounts only
+//! and is no longer read.
 //!
 //! # Signatures
 //!
@@ -57,18 +68,20 @@ pub const SIGNATURE_LEN: usize = 64;
 pub const ID_LEN: usize = 16;
 /// Length of a server challenge, in bytes.
 pub const CHALLENGE_LEN: usize = 32;
-/// Length of a wrapped account identity key, in bytes.
+/// Length of a wrapped account root secret, in bytes.
 pub const WRAPPED_KEY_LEN: usize = 1 + NONCE_LEN + SEED_LEN + TAG_LEN;
 
 const SEED_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
-const WRAPPED_KEY_VERSION: u8 = 1;
+const WRAPPED_KEY_VERSION: u8 = 2;
 const CERTIFICATE_VERSION: u32 = 1;
 
-const LABEL_WRAP_PASSWORD: &[u8] = b"tavern aik wrap v1 password";
-const LABEL_WRAP_RECOVERY: &[u8] = b"tavern aik wrap v1 recovery";
-const LABEL_WRAP_AAD: &[u8] = b"tavern aik wrapped v1";
+const LABEL_WRAP_PASSWORD: &[u8] = b"tavern account root wrap v2 password";
+const LABEL_WRAP_RECOVERY: &[u8] = b"tavern account root wrap v2 recovery";
+const LABEL_WRAP_AAD: &[u8] = b"tavern account root wrapped v2";
+const LABEL_ROOT_IDENTITY: &[u8] = b"tavern account root v1 identity key";
+const LABEL_ROOT_LOCAL_STORE: &[u8] = b"tavern account root v1 local store";
 const LABEL_DECOY: &[u8] = b"tavern aik decoy v1";
 const LABEL_CERTIFICATE: &[u8] = b"tavern device certificate v1";
 const LABEL_SESSION: &[u8] = b"tavern device session v1";
@@ -182,7 +195,7 @@ impl std::fmt::Debug for IdentityPublicKey {
     }
 }
 
-/// Which wrapped copy of the account identity key.
+/// Which wrapped copy of the account root secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrapKind {
     /// The copy opened with the password (through the OPAQUE export key).
@@ -200,7 +213,7 @@ impl WrapKind {
     }
 }
 
-/// A key that wraps the account identity key.
+/// A key that wraps the account root secret.
 #[derive(Debug)]
 pub struct WrappingKey {
     key: Secret<32>,
@@ -247,39 +260,68 @@ fn wrap_aad(kind: WrapKind, public: &IdentityPublicKey) -> Vec<u8> {
     signing_input(LABEL_WRAP_AAD, &[kind.tag(), &public.to_bytes()])
 }
 
-/// An account identity key, private half included. Erased when dropped.
-pub struct AccountIdentityKey(SigningKey);
+/// The secret every long-term key of an account derives from. Erased when
+/// dropped.
+pub struct AccountRootSecret(Secret<SEED_LEN>);
 
-impl AccountIdentityKey {
-    /// Generates a new account identity key.
+impl AccountRootSecret {
+    /// Generates the root secret of a new account.
     pub fn generate() -> Self {
-        Self(SigningKey::generate(&mut OsRng))
+        Self(Secret::random())
     }
 
-    /// The public half.
-    pub fn public(&self) -> IdentityPublicKey {
-        IdentityPublicKey(self.0.verifying_key())
+    fn derive(&self, info: &[&[u8]]) -> Result<Secret<32>, CryptoError> {
+        let mut out = Zeroizing::new([0u8; 32]);
+        Hkdf::<Sha512>::new(None, self.0.expose())
+            .expand_multi_info(info, out.as_mut())
+            .map_err(|_| CryptoError::Internal)?;
+        Ok(Secret::new(*out))
     }
 
-    /// Encrypts the private half under `key`. The result is what the server
+    /// The account identity key.
+    pub fn identity_key(&self) -> Result<AccountIdentityKey, CryptoError> {
+        let seed = self.derive(&[LABEL_ROOT_IDENTITY])?;
+        Ok(AccountIdentityKey(SigningKey::from_bytes(seed.expose())))
+    }
+
+    /// The account's part of the key that wraps the local store of one
+    /// device (ADR 0017). The other part is held by the server; neither
+    /// opens the store alone.
+    pub fn local_store_part(
+        &self,
+        user_id: &[u8; ID_LEN],
+        device_id: &[u8; ID_LEN],
+    ) -> Result<Secret<32>, CryptoError> {
+        // Fixed-length fields after a label without a zero byte: unambiguous.
+        self.derive(&[LABEL_ROOT_LOCAL_STORE, &[0], user_id, device_id])
+    }
+
+    /// Encrypts the root secret under `key`. The result is what the server
     /// stores; it can be opened only with the same key, for the same account
     /// and the same kind of copy.
     pub fn wrap(&self, key: &WrappingKey) -> Result<Vec<u8>, CryptoError> {
-        let nonce: [u8; NONCE_LEN] = random_bytes();
-        let seed = Zeroizing::new(self.0.to_bytes());
+        self.wrap_with_nonce(key, &random_bytes())
+    }
+
+    fn wrap_with_nonce(
+        &self,
+        key: &WrappingKey,
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let public = self.identity_key()?.public();
         let ciphertext = XChaCha20Poly1305::new(key.key.expose().into())
             .encrypt(
-                XNonce::from_slice(&nonce),
+                XNonce::from_slice(nonce),
                 Payload {
-                    msg: seed.as_slice(),
-                    aad: &wrap_aad(key.kind, &self.public()),
+                    msg: self.0.expose().as_slice(),
+                    aad: &wrap_aad(key.kind, &public),
                 },
             )
             .map_err(|_| CryptoError::Internal)?;
 
         let mut out = Vec::with_capacity(WRAPPED_KEY_LEN);
         out.push(WRAPPED_KEY_VERSION);
-        out.extend_from_slice(&nonce);
+        out.extend_from_slice(nonce);
         out.extend_from_slice(&ciphertext);
         Ok(out)
     }
@@ -303,7 +345,7 @@ impl AccountIdentityKey {
         }
         let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
 
-        let seed = Zeroizing::new(
+        let opened = Zeroizing::new(
             XChaCha20Poly1305::new(key.key.expose().into())
                 .decrypt(
                     XNonce::from_slice(nonce),
@@ -314,16 +356,28 @@ impl AccountIdentityKey {
                 )
                 .map_err(|_| CryptoError::InvalidWrappedKey)?,
         );
-        let seed: &[u8; SEED_LEN] = seed
-            .as_slice()
-            .try_into()
-            .map_err(|_| CryptoError::InvalidWrappedKey)?;
-
-        let identity = Self(SigningKey::from_bytes(seed));
-        if identity.public() != *expected {
+        let root = Self(Secret::from_slice(&opened).ok_or(CryptoError::InvalidWrappedKey)?);
+        if root.identity_key()?.public() != *expected {
             return Err(CryptoError::InvalidWrappedKey);
         }
-        Ok(identity)
+        Ok(root)
+    }
+}
+
+impl std::fmt::Debug for AccountRootSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccountRootSecret(<redacted>)")
+    }
+}
+
+/// An account identity key, private half included, derived from the
+/// [`AccountRootSecret`]. Erased when dropped.
+pub struct AccountIdentityKey(SigningKey);
+
+impl AccountIdentityKey {
+    /// The public half.
+    pub fn public(&self) -> IdentityPublicKey {
+        IdentityPublicKey(self.0.verifying_key())
     }
 
     /// Issues the certificate that binds a device key to this account.
@@ -626,20 +680,25 @@ mod tests {
 
     #[test]
     fn a_wrapped_key_opens_with_the_same_key() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate();
         let (_, key) = recovery_wrapping_key();
 
         let wrapped = identity.wrap(&key).unwrap();
-        let opened = AccountIdentityKey::unwrap(&wrapped, &key, &identity.public()).unwrap();
+        let opened =
+            AccountRootSecret::unwrap(&wrapped, &key, &identity.identity_key().unwrap().public())
+                .unwrap();
 
         assert_eq!(wrapped.len(), WRAPPED_KEY_LEN);
         assert_eq!(wrapped[0], WRAPPED_KEY_VERSION);
-        assert_eq!(opened.public(), identity.public());
+        assert_eq!(
+            opened.identity_key().unwrap().public(),
+            identity.identity_key().unwrap().public()
+        );
     }
 
     #[test]
     fn wrapping_twice_gives_different_ciphertexts() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate();
         let (_, key) = recovery_wrapping_key();
 
         assert_ne!(identity.wrap(&key).unwrap(), identity.wrap(&key).unwrap());
@@ -647,33 +706,35 @@ mod tests {
 
     #[test]
     fn a_wrapped_key_does_not_open_with_another_key() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate();
         let (_, key) = recovery_wrapping_key();
         let (_, other) = recovery_wrapping_key();
         let wrapped = identity.wrap(&key).unwrap();
 
         assert_eq!(
-            AccountIdentityKey::unwrap(&wrapped, &other, &identity.public()).unwrap_err(),
+            AccountRootSecret::unwrap(&wrapped, &other, &identity.identity_key().unwrap().public())
+                .unwrap_err(),
             CryptoError::InvalidWrappedKey
         );
     }
 
     #[test]
     fn a_wrapped_key_cannot_be_moved_to_another_account() {
-        let alice = AccountIdentityKey::generate();
-        let mallory = AccountIdentityKey::generate();
+        let alice = AccountRootSecret::generate();
+        let mallory = AccountRootSecret::generate();
         let (_, key) = recovery_wrapping_key();
         let wrapped = alice.wrap(&key).unwrap();
 
         assert_eq!(
-            AccountIdentityKey::unwrap(&wrapped, &key, &mallory.public()).unwrap_err(),
+            AccountRootSecret::unwrap(&wrapped, &key, &mallory.identity_key().unwrap().public())
+                .unwrap_err(),
             CryptoError::InvalidWrappedKey
         );
     }
 
     #[test]
     fn the_two_kinds_of_copies_are_not_interchangeable() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate();
         let recovery = RecoveryKey::generate();
         let as_recovery = WrappingKey::from_recovery_key(&recovery).unwrap();
         // Same key bytes, declared as the other kind: the associated data differs.
@@ -685,14 +746,19 @@ mod tests {
 
         assert_eq!(as_recovery.kind(), WrapKind::Recovery);
         assert_eq!(
-            AccountIdentityKey::unwrap(&wrapped, &as_password, &identity.public()).unwrap_err(),
+            AccountRootSecret::unwrap(
+                &wrapped,
+                &as_password,
+                &identity.identity_key().unwrap().public()
+            )
+            .unwrap_err(),
             CryptoError::InvalidWrappedKey
         );
     }
 
     #[test]
     fn every_altered_byte_is_detected() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate();
         let (_, key) = recovery_wrapping_key();
         let wrapped = identity.wrap(&key).unwrap();
 
@@ -700,23 +766,39 @@ mod tests {
             let mut altered = wrapped.clone();
             altered[index] ^= 0x01;
             assert!(
-                AccountIdentityKey::unwrap(&altered, &key, &identity.public()).is_err(),
+                AccountRootSecret::unwrap(
+                    &altered,
+                    &key,
+                    &identity.identity_key().unwrap().public()
+                )
+                .is_err(),
                 "byte {index}"
             );
         }
-        assert!(AccountIdentityKey::unwrap(&wrapped[..72], &key, &identity.public()).is_err());
-        assert!(AccountIdentityKey::unwrap(&[], &key, &identity.public()).is_err());
+        assert!(
+            AccountRootSecret::unwrap(
+                &wrapped[..72],
+                &key,
+                &identity.identity_key().unwrap().public()
+            )
+            .is_err()
+        );
+        assert!(
+            AccountRootSecret::unwrap(&[], &key, &identity.identity_key().unwrap().public())
+                .is_err()
+        );
     }
 
     #[test]
     fn an_unknown_version_is_reported_as_such() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate();
         let (_, key) = recovery_wrapping_key();
         let mut wrapped = identity.wrap(&key).unwrap();
-        wrapped[0] = 2;
+        wrapped[0] = 1;
 
         assert_eq!(
-            AccountIdentityKey::unwrap(&wrapped, &key, &identity.public()).unwrap_err(),
+            AccountRootSecret::unwrap(&wrapped, &key, &identity.identity_key().unwrap().public())
+                .unwrap_err(),
             CryptoError::UnsupportedVersion
         );
     }
@@ -738,10 +820,11 @@ mod tests {
             decoy_wrapped_key(&Secret::random(), &nobody).unwrap()
         );
 
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate();
         let (_, key) = recovery_wrapping_key();
         assert_eq!(
-            AccountIdentityKey::unwrap(&decoy, &key, &identity.public()).unwrap_err(),
+            AccountRootSecret::unwrap(&decoy, &key, &identity.identity_key().unwrap().public())
+                .unwrap_err(),
             CryptoError::InvalidWrappedKey
         );
     }
@@ -770,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_device_certificate_verifies_and_exposes_its_content() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate().identity_key().unwrap();
         let device = DeviceKey::generate();
 
         let certificate =
@@ -793,8 +876,8 @@ mod tests {
 
     #[test]
     fn a_certificate_from_another_account_is_rejected() {
-        let identity = AccountIdentityKey::generate();
-        let other = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate().identity_key().unwrap();
+        let other = AccountRootSecret::generate().identity_key().unwrap();
         let certificate =
             identity.certify_device(&USER, &DEVICE, &DeviceKey::generate().public(), 0);
 
@@ -809,7 +892,7 @@ mod tests {
 
     #[test]
     fn an_altered_certificate_is_rejected() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate().identity_key().unwrap();
         let certificate =
             identity.certify_device(&USER, &DEVICE, &DeviceKey::generate().public(), 7);
 
@@ -828,7 +911,7 @@ mod tests {
 
     #[test]
     fn a_certificate_with_an_unknown_version_is_rejected() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate().identity_key().unwrap();
         let payload = proto::DeviceCertificatePayload {
             version: 2,
             user_id: USER.to_vec(),
@@ -920,7 +1003,7 @@ mod tests {
 
     #[test]
     fn a_credential_update_signature_covers_every_field() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate().identity_key().unwrap();
         let alice = Handle::parse_canonical("alice").unwrap();
         let bob = Handle::parse_canonical("bob").unwrap();
         let challenge = [3u8; CHALLENGE_LEN];
@@ -986,7 +1069,7 @@ mod tests {
                 CryptoError::InvalidSignature
             );
         }
-        let stranger = AccountIdentityKey::generate();
+        let stranger = AccountRootSecret::generate().identity_key().unwrap();
         assert!(
             stranger
                 .public()
@@ -1009,13 +1092,44 @@ mod tests {
 
     #[test]
     fn debug_output_of_private_keys_is_redacted() {
-        let identity = AccountIdentityKey::generate();
+        let identity = AccountRootSecret::generate().identity_key().unwrap();
         let device = DeviceKey::generate();
         let (_, key) = recovery_wrapping_key();
 
         assert_eq!(format!("{identity:?}"), "AccountIdentityKey(<redacted>)");
+        assert_eq!(
+            format!("{:?}", AccountRootSecret::generate()),
+            "AccountRootSecret(<redacted>)"
+        );
         assert_eq!(format!("{device:?}"), "DeviceKey(<redacted>)");
         assert!(format!("{key:?}").contains("redacted"));
+    }
+
+    #[test]
+    fn the_root_secret_derives_separate_stable_secrets() {
+        let root = AccountRootSecret::generate();
+        let other = AccountRootSecret::generate();
+        let part = |root: &AccountRootSecret, user: [u8; ID_LEN], device: [u8; ID_LEN]| {
+            *root.local_store_part(&user, &device).unwrap().expose()
+        };
+
+        // Stable for one account and device, different for anything else.
+        assert_eq!(part(&root, USER, DEVICE), part(&root, USER, DEVICE));
+        assert_ne!(part(&root, USER, DEVICE), part(&root, USER, USER));
+        assert_ne!(part(&root, USER, DEVICE), part(&root, DEVICE, DEVICE));
+        assert_ne!(part(&root, USER, DEVICE), part(&other, USER, DEVICE));
+        assert_eq!(
+            root.identity_key().unwrap().public(),
+            root.identity_key().unwrap().public()
+        );
+        assert_ne!(
+            root.identity_key().unwrap().public(),
+            other.identity_key().unwrap().public()
+        );
+        // Neither derived secret is the root or the other one.
+        let seed = root.identity_key().unwrap().0.to_bytes();
+        assert_ne!(&seed, root.0.expose());
+        assert_ne!(seed, part(&root, USER, DEVICE));
     }
 
     proptest! {
@@ -1023,13 +1137,14 @@ mod tests {
 
         #[test]
         fn wrap_then_unwrap_round_trips(seed in any::<[u8; 32]>(), wrapping in any::<[u8; 32]>()) {
-            let identity = AccountIdentityKey(SigningKey::from_bytes(&seed));
+            let root = AccountRootSecret(Secret::new(seed));
+            let public = root.identity_key().unwrap().public();
             let key = WrappingKey { key: Secret::new(wrapping), kind: WrapKind::Password };
 
-            let wrapped = identity.wrap(&key).unwrap();
-            let opened = AccountIdentityKey::unwrap(&wrapped, &key, &identity.public()).unwrap();
+            let wrapped = root.wrap(&key).unwrap();
+            let opened = AccountRootSecret::unwrap(&wrapped, &key, &public).unwrap();
 
-            prop_assert_eq!(opened.public(), identity.public());
+            prop_assert!(opened.0.ct_eq(&root.0));
         }
 
         #[test]
@@ -1047,12 +1162,15 @@ mod frozen_vectors {
     use super::*;
 
     const IDENTITY_SEED: [u8; 32] = [7; 32];
-    const IDENTITY_PUBLIC: &str =
-        "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+    const ROOT_SECRET: [u8; 32] = [6; 32];
+    const ROOT_IDENTITY_PUBLIC: &str =
+        "ee6804f3fb0936e7457734bc80b43b53bb9a41fa6db1f5c5b7653dac4cc00311";
+    const ROOT_LOCAL_STORE_PART: &str =
+        "dadb2ba3139874d8948447b77ef6a7f962ed5fea2941d6b60c78e6b3f1e477d1";
     const RECOVERY_KEY: &str = "144G-J289-144G-J289-144G-J289-144G-J289-144G-J289-144G-J289-144G";
-    const WRAPPED_RECOVERY_COPY: &str = "01030303030303030303030303030303030303030303030303\
-        faeba636039561338c99c60f1e4c5e5f2fc03a8d69ecd52a3520ad26c961f19b\
-        05d3f45912bea7fa40d758eb1583d30f";
+    const WRAPPED_RECOVERY_COPY: &str = "02030303030303030303030303030303030303030303030303\
+        c394c6a439d2b573b39de4c359de18cc8815458bbad071b48575b1d40e1ebcc9\
+        273269fe085e0b57c411186f16e659bf";
     const CERTIFICATE: &str = "0a4f08011210010101010101010101010101010101011a10020202020202020202\
         02020202020202222013\
         98f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca2880d095ffbc3112408cc8f2\
@@ -1068,15 +1186,36 @@ mod frozen_vectors {
     }
 
     #[test]
+    fn root_secret_derivations_are_stable() {
+        let root = AccountRootSecret(Secret::new(ROOT_SECRET));
+
+        assert_eq!(
+            root.identity_key().unwrap().public().to_bytes().to_vec(),
+            unhex(ROOT_IDENTITY_PUBLIC)
+        );
+        assert_eq!(
+            root.local_store_part(&[1; 16], &[2; 16])
+                .unwrap()
+                .expose()
+                .to_vec(),
+            unhex(ROOT_LOCAL_STORE_PART)
+        );
+    }
+
+    #[test]
     fn recovery_copy_format_is_stable() {
-        let public = IdentityPublicKey::from_bytes(&unhex(IDENTITY_PUBLIC)).unwrap();
+        let root = AccountRootSecret(Secret::new(ROOT_SECRET));
+        let public = IdentityPublicKey::from_bytes(&unhex(ROOT_IDENTITY_PUBLIC)).unwrap();
         let key =
             WrappingKey::from_recovery_key(&RecoveryKey::parse(RECOVERY_KEY).unwrap()).unwrap();
 
+        assert_eq!(
+            root.wrap_with_nonce(&key, &[3; NONCE_LEN]).unwrap(),
+            unhex(WRAPPED_RECOVERY_COPY)
+        );
         let opened =
-            AccountIdentityKey::unwrap(&unhex(WRAPPED_RECOVERY_COPY), &key, &public).unwrap();
-
-        assert_eq!(opened.0.to_bytes(), IDENTITY_SEED);
+            AccountRootSecret::unwrap(&unhex(WRAPPED_RECOVERY_COPY), &key, &public).unwrap();
+        assert_eq!(opened.0.expose(), &ROOT_SECRET);
     }
 
     #[test]

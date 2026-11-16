@@ -1,6 +1,6 @@
 # ADR 0003 — OPAQUE for password authentication
 
-- Status: accepted
+- Status: accepted; since [ADR 0017](0017-device-identity-and-sign-out.md) the wrapped copies hold an account root secret from which the AIK is derived, instead of the AIK itself
 - Date: 2026-11-13
 
 ## Context

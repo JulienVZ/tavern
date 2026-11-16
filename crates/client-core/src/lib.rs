@@ -29,4 +29,6 @@ pub use gateway::{
 pub use instance::{
     Compatibility, InstanceUrl, InstanceUrlError, compatibility, fetch_health, fetch_version,
 };
-pub use store::{KeychainStore, MemoryStore, SecretStore, StoredDevice};
+pub use store::{
+    KeychainStore, KnownAccount, KnownAccounts, MemoryStore, SecretStore, StoredDevice,
+};

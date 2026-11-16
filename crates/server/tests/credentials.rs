@@ -15,7 +15,7 @@ mod common;
 use common::{Account, PASSWORD, TestApp, random_handle};
 use reqwest::StatusCode;
 use tavern_crypto::identity::{
-    AccountIdentityKey, CredentialUpdate, CredentialUpdatePurpose, IdentityPublicKey, WrappingKey,
+    AccountRootSecret, CredentialUpdate, CredentialUpdatePurpose, IdentityPublicKey, WrappingKey,
 };
 use tavern_crypto::opaque::Password;
 use tavern_crypto::opaque::client::{Login, Registration};
@@ -58,13 +58,14 @@ fn recover_finish(
         )
         .unwrap();
     let expected = IdentityPublicKey::from_bytes(start.identity_key.as_slice()).unwrap();
-    let identity = AccountIdentityKey::unwrap(
+    let root = AccountRootSecret::unwrap(
         start.wrapped_recovery_copy.as_slice(),
         &WrappingKey::from_recovery_key(&account.recovery_key).unwrap(),
         &expected,
     )
     .unwrap();
-    let wrapped = identity
+    let identity = root.identity_key().unwrap();
+    let wrapped = root
         .wrap(&WrappingKey::from_export_key(&output.export_key).unwrap())
         .unwrap();
     let challenge: [u8; 32] = start.challenge.as_slice().try_into().unwrap();
@@ -165,7 +166,7 @@ async fn a_recovery_cannot_be_replayed_or_altered() {
     // Signed by a key that is not the account's.
     let (state, start) = recover_start(&app, account.handle.as_str()).await;
     let mut request = recover_finish(&account, state, &start);
-    let stranger = AccountIdentityKey::generate();
+    let stranger = AccountRootSecret::generate().identity_key().unwrap();
     let challenge: [u8; 32] = start.challenge.as_slice().try_into().unwrap();
     request.signature = B64::from(stranger.sign_credential_update(&CredentialUpdate {
         purpose: CredentialUpdatePurpose::Recovery,
