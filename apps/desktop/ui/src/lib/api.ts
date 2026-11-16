@@ -164,7 +164,8 @@ export const api = {
   login: (handle: string, password: string) => invoke<LoginResult>("login", { handle, password }),
   submitTotp: (code: string) => invoke<LoginResult>("submit_totp", { code }),
   logout: () => invoke<void>("logout"),
-  eraseDevice: () => invoke<void>("erase_device"),
+  /** Returns the accounts still known on this computer. */
+  eraseDevice: () => invoke<string[]>("erase_device"),
   sessionEnded: () => invoke<void>("session_ended"),
   account: () => invoke<Account>("account"),
   devices: () => invoke<Device[]>("devices"),

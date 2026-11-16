@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Device } from "../lib/api";
 import { setLocale } from "../lib/i18n";
-import { session } from "../lib/session.svelte";
+import { handleGatewayEvent, session } from "../lib/session.svelte";
 import { callsTo, onCommand, resetCommands } from "../test/tauri";
 import Devices from "./Devices.svelte";
 
@@ -102,7 +102,7 @@ describe("erasing this device", () => {
   });
 
   it("signs out and forgets the account on this computer", async () => {
-    onCommand("erase_device", () => undefined);
+    onCommand("erase_device", () => ["bob"]);
     const dialog = await askToErase();
     await fireEvent.click(within(dialog).getByRole("button", { name: "Erase this device" }));
 
@@ -110,8 +110,28 @@ describe("erasing this device", () => {
       expect(session.screen).toBe("auth");
     });
     expect(callsTo("erase_device")).toHaveLength(1);
-    expect(session.endedMessage).toBe("ended.erased");
+    expect(session.endedMessage).toEqual({ key: "ended.erased", params: { handle: "ann" } });
     expect(session.account).toBeNull();
+    expect(session.knownHandles).toEqual(["bob"]);
+    expect(session.rememberedHandle).toBeNull();
+  });
+
+  it("forgets the account even when the revocation notice arrives first", async () => {
+    // The instance tells the device it is revoked before it answers the
+    // request that revoked it: the window is signed out by then.
+    onCommand("session_ended", () => undefined);
+    onCommand("erase_device", () => {
+      handleGatewayEvent({ type: "session_ended", reason: "revoked" });
+      return ["bob"];
+    });
+    const dialog = await askToErase();
+    await fireEvent.click(within(dialog).getByRole("button", { name: "Erase this device" }));
+
+    await vi.waitFor(() => {
+      expect(session.endedMessage?.key).toBe("ended.erased");
+    });
+    expect(session.endedMessage?.params).toEqual({ handle: "ann" });
+    expect(session.screen).toBe("auth");
     expect(session.knownHandles).toEqual(["bob"]);
     expect(session.rememberedHandle).toBeNull();
   });

@@ -16,6 +16,12 @@ import type { MessageKey } from "./i18n";
 
 export type Screen = "instance" | "auth" | "recovery" | "totp" | "home";
 
+/** Why the user is back on the sign-in screen. */
+export interface EndedMessage {
+  key: MessageKey;
+  params?: Record<string, string>;
+}
+
 interface PendingRegistration {
   handle: string;
   password: string;
@@ -44,8 +50,8 @@ export const session = $state({
   offline: false,
   /** Security notices of the account that this device has not acknowledged. */
   securityNotices: [] as SecurityNotice[],
-  /** Why the user is back on the sign-in screen, if the instance ended the session. */
-  endedMessage: null as MessageKey | null,
+  /** Why the user is back on the sign-in screen, if the session ended. */
+  endedMessage: null as EndedMessage | null,
 });
 
 /** Applies the result of `login` or `submit_totp`. */
@@ -69,7 +75,7 @@ export function applyLogin(result: LoginResult): void {
 }
 
 /** Returns to the sign-in screen, forgetting everything about the account. */
-export function signedOut(reason: MessageKey | null): void {
+export function signedOut(reason: MessageKey | null, params?: Record<string, string>): void {
   if (session.account !== null) {
     session.rememberedHandle = session.account.handle;
   }
@@ -80,7 +86,8 @@ export function signedOut(reason: MessageKey | null): void {
   session.showStoreResetNotice = false;
   session.securityNotices = [];
   session.offline = false;
-  session.endedMessage = reason;
+  session.endedMessage =
+    reason === null ? null : params === undefined ? { key: reason } : { key: reason, params };
   session.screen = session.instanceUrl === "" ? "instance" : "auth";
 }
 
@@ -94,13 +101,14 @@ function addNewDevices(ids: readonly string[]): void {
 }
 
 /**
- * Returns to the sign-in screen after this device was erased: the account is
- * no longer known on this computer.
+ * Returns to the sign-in screen after the device of `handle` was erased.
+ * `remaining` are the accounts still known on this computer, as the keychain
+ * lists them: the instance's revocation notice may have signed the window out
+ * already, so its own state no longer says which account was erased.
  */
-export function erased(): void {
-  const handle = session.account?.handle;
-  signedOut("ended.erased");
-  session.knownHandles = session.knownHandles.filter((known) => known !== handle);
+export function erased(handle: string, remaining: string[]): void {
+  signedOut("ended.erased", { handle });
+  session.knownHandles = remaining;
   if (session.rememberedHandle === handle) {
     session.rememberedHandle = null;
   }

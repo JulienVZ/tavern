@@ -208,7 +208,7 @@ const en = {
   "ended.invalid": "Your session expired. Sign in again.",
   "ended.replaced": "This account is now connected from another window of this device.",
   "ended.erased":
-    "This device was erased. Signing in here again will enrol a new device, without history.",
+    "The account @{handle} was erased from this device. Signing in to it here again will enrol a new device, without history.",
   "ended.logout_unconfirmed":
     "You are signed out on this computer, but the instance could not be reached: the session stays valid there until it expires. To end it now, revoke this device from another one.",
 
@@ -481,7 +481,7 @@ const fr: Catalogue = {
   "ended.invalid": "Votre session a expiré. Reconnectez-vous.",
   "ended.replaced": "Ce compte est maintenant connecté depuis une autre fenêtre de cet appareil.",
   "ended.erased":
-    "Cet appareil a été effacé. Une nouvelle connexion ici enrôlera un nouvel appareil, sans historique.",
+    "Le compte @{handle} a été effacé de cet appareil. S'y reconnecter ici enrôlera un nouvel appareil, sans historique.",
   "ended.logout_unconfirmed":
     "Vous êtes déconnecté sur cet ordinateur, mais l'instance n'a pas pu être jointe : la session y reste valide jusqu'à son expiration. Pour y mettre fin maintenant, révoquez cet appareil depuis un autre.",
 

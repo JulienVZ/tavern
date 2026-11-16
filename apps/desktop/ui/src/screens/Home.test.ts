@@ -118,7 +118,7 @@ describe("signing out", () => {
     await vi.waitFor(() => {
       expect(session.screen).toBe("auth");
     });
-    expect(session.endedMessage).toBe("ended.logout_unconfirmed");
+    expect(session.endedMessage).toEqual({ key: "ended.logout_unconfirmed" });
   });
 });
 

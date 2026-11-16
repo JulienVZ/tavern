@@ -111,3 +111,13 @@ describe("a sign-in that the keys of the account stop", () => {
     expect(text).not.toContain("too old");
   });
 });
+
+describe("the reason for being back here", () => {
+  it("names the account whose device was erased", () => {
+    session.endedMessage = { key: "ended.erased", params: { handle: "ann" } };
+    render(Auth);
+
+    const notice = screen.getByText(/was erased from this device/);
+    expect(notice.textContent).toContain("@ann");
+  });
+});

@@ -302,12 +302,7 @@ async fn probe_instance(
     let mut session = shell.session.lock().await;
     *session = Session::default();
     let remembered_handle = instance.remembered_handle()?;
-    let known_handles = instance
-        .known_accounts()?
-        .accounts
-        .into_iter()
-        .map(|account| account.handle)
-        .collect();
+    let known_handles = known_handles(&instance)?;
     let account = match instance.resume().await? {
         Some(resumed) => {
             let view = account_view(&resumed).await?;
@@ -327,6 +322,16 @@ async fn probe_instance(
         known_handles,
         account,
     })
+}
+
+/// The accounts that have a device on this computer for this instance.
+fn known_handles(instance: &InstanceClient) -> Result<Vec<String>> {
+    Ok(instance
+        .known_accounts()?
+        .accounts
+        .into_iter()
+        .map(|account| account.handle)
+        .collect())
 }
 
 // --- Registration and login -------------------------------------------------------
@@ -417,8 +422,12 @@ async fn logout(shell: State<'_, Shell>) -> Result<()> {
 /// Signs out and erases this device: it is revoked on the instance and its
 /// keys are deleted from this computer. The next sign-in enrols a new device,
 /// without history.
+///
+/// Returns the accounts still known on this computer. The window cannot work
+/// them out itself: the instance's revocation notice reaches it through the
+/// gateway, often before this answer, and signs it out first.
 #[tauri::command]
-async fn erase_device(shell: State<'_, Shell>) -> Result<()> {
+async fn erase_device(shell: State<'_, Shell>) -> Result<Vec<String>> {
     let mut session = shell.session.lock().await;
     let client = session
         .client
@@ -430,7 +439,10 @@ async fn erase_device(shell: State<'_, Shell>) -> Result<()> {
     session.gateway = None;
     session.pending_totp = None;
     session.client = None;
-    Ok(())
+    match session.instance.as_ref() {
+        Some(instance) => known_handles(instance),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Forgets the local session after the instance ended it.

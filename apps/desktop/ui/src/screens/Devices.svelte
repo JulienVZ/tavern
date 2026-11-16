@@ -18,13 +18,19 @@
 
   async function erase(): Promise<void> {
     erasing = false;
+    // Read now: the instance's revocation notice can sign the window out
+    // before the command returns.
+    const handle = session.account?.handle;
+    if (handle === undefined) {
+      return;
+    }
     working = true;
     error = null;
     revoked = false;
     const result = await guarded(() => api.eraseDevice());
     working = false;
     if (result.ok) {
-      erased();
+      erased(handle, result.value);
     } else {
       // Nothing was erased: the device is still signed in and can retry.
       error = result.error;

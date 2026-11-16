@@ -164,7 +164,9 @@
       <p class="alert warn" role="status">{t("instance.outdated")}</p>
     {/if}
     {#if session.endedMessage !== null}
-      <p class="alert warn" role="status">{t(session.endedMessage)}</p>
+      <p class="alert warn" role="status">
+        {t(session.endedMessage.key, session.endedMessage.params)}
+      </p>
     {/if}
     {#if notice !== null}
       <p class="alert" role="status">{t(notice)}</p>
