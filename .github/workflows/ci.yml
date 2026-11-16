@@ -118,6 +118,21 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      # openmls_memory_storage is for tests only (docs/adr/0019). It is in the
+      # graph through openmls_rust_crypto, which also re-exports it, so the
+      # graph test of crates/crypto/tests is not enough: nothing of it may be
+      # linked into the server. The crypto tests, which use it, show that the
+      # search does find its symbols.
+      - name: No test-only MLS storage in the server binary
+        run: |
+          tests=$(cargo test --locked --package tavern-crypto --lib --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' | head -n 1)
+          found=$(nm "$tests" | grep -c openmls_memory_storage || true)
+          echo "openmls_memory_storage symbols in the crypto tests: $found"
+          test "$found" -gt 0
+          count=$(nm target/debug/tavern-server | grep -c openmls_memory_storage || true)
+          echo "openmls_memory_storage symbols in the server: $count"
+          test "$count" -eq 0
       # OpenSSL is allowed in one place: inside SQLCipher, the client's local
       # store (docs/adr/0018). deny.toml limits who may depend on it; this
       # keeps the server free of it, and of SQLite. The image is checked too.
@@ -237,6 +252,10 @@ jobs:
           grep -aq "OpenSSL $vendored" "$binary"
           echo "Loaded at run time (informative):"
           ldd "$binary" | grep -E 'lib(ssl|crypto)' || echo "  no libssl or libcrypto"
+          # And no test-only MLS storage (docs/adr/0019).
+          count=$(nm "$binary" | grep -c openmls_memory_storage || true)
+          echo "openmls_memory_storage symbols in the client: $count"
+          test "$count" -eq 0
       # The local store's tests (docs/adr/0018) on the systems that the Rust
       # job does not cover: CommonCrypto on macOS, OpenSSL on Windows, the
       # same file format everywhere.
