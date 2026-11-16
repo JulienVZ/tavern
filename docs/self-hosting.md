@@ -168,7 +168,13 @@ What the secrets protect, and why they must be backed up together with the datab
 
 What a backup does **not** contain: readable messages. The server only stores ciphertext waiting for delivery; message history lives on your users' devices.
 
-The database does hold, for each device, the server's part of the key of that device's local history ([ADR 0017](adr/0017-device-identity-and-sign-out.md)). It is useless on its own, but a device cannot open its local history without it. **Back up often:** after restoring a backup, devices enrolled since that backup are unknown to the instance. Their users must sign in again, and those devices start over as new devices, without their local history. Devices that existed at the time of the backup keep everything. Restoring an older backup also has consequences for encrypted conversations, described in the M2 documentation.
+The database does hold, for each device, the server's part of the key of that device's local history ([ADR 0017](adr/0017-device-identity-and-sign-out.md)). It is useless on its own, but a device cannot open its local history without it. **Back up often:** after restoring a backup, devices enrolled since that backup are unknown to the instance. Their users must sign in again, and those devices start over as new devices, without their local history. Devices that existed at the time of the backup keep everything.
+
+What restoring does to users, once milestone M2 is complete (until then, restore only test instances; see [ADR 0019](adr/0019-mls-direct-messages.md), section 15):
+
+- **Everyone signs in again.** The server revokes every session the first time it starts on the restored database. Each device must sign in again with the password, and the TOTP code if it is enabled, before it can do anything. This matters because the backup lists as active the devices that were revoked after it, a stolen one included: without the password, such a device can do nothing.
+- **Everyone is told.** After signing in, each user sees a notice with the date of the backup, asking them to check their list of devices and to **revoke again** those they had revoked since.
+- **Conversations are recreated** with the same members. Encrypted messages sent after the backup and not yet delivered are lost; history already on the devices is kept.
 
 `restore.sh --db-only` restores the database and keeps the current configuration files. Uploaded files (attachments) will be added to both scripts when they exist (milestone M5).
 
