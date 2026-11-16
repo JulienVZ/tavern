@@ -34,6 +34,12 @@ ignore = [
     # docs/adr/0011-account-identity-and-primitives.md, "Known advisory".
     # Re-evaluate on every opaque-ke upgrade and at M9.
     { id = "RUSTSEC-2026-0387", reason = "affected code is not linked: ristretto255 arithmetic uses curve25519-dalek; verified in CI" },
+    # proc-macro-error2 (unmaintained, no vulnerability) is a procedural
+    # macro run at compile time only, reached through openmls -> hpke-rs ->
+    # libcrux-sha3 -> libcrux-intrinsics -> core-models -> hax-lib ->
+    # hax-lib-macros. No upgrade exists. Approved on 2026-11-16 (ADR 0019).
+    # Remove this entry as soon as cargo deny reports it as not encountered.
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained compile-time proc macro under OpenMLS's HPKE (libcrux); no runtime code, no fix available" },
 ]
 
 [licenses]

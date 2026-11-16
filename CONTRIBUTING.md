@@ -102,6 +102,7 @@ pnpm client alice-2    # a third one, and so on
 4. Some crates come with extra steps:
    - **sqlx**: `third_party/sqlx-sqlite-unused` must carry the version and the features of the `sqlx-sqlite` that the new sqlx requires (see its README). CI fails (`still-needed.sh`) once a sqlx release accepts our `libsqlite3-sys`: then upgrade sqlx, delete that directory and the `[patch.crates-io]` entry.
    - **rusqlite, libsqlite3-sys, sqlcipher-src, openssl-src**: run the three systems on demand (`gh workflow run ci.yml --ref <branch>`). The local store committed in `crates/client-core/fixtures/` must still open everywhere. An OpenSSL advisory means a client release ([ADR 0018](docs/adr/0018-local-store-encryption.md)).
+   - **openmls, openmls_traits, openmls_rust_crypto**: pinned to exact versions, upgraded together. An upgrade can change the storage format of the MLS state: it needs the compatibility test of [ADR 0019](docs/adr/0019-mls-direct-messages.md) (section 13). The `RUSTSEC-2026-0173` entry of `deny.toml` goes as soon as `cargo deny` reports it as not encountered. `openmls_memory_storage` stays in `[dev-dependencies]` (a test enforces it).
    - **opaque-ke** and its curve crates: the `crypto-bigint is not linked` check of CI must stay green ([ADR 0011](docs/adr/0011-account-identity-and-primitives.md)).
 
 ## Code conventions
