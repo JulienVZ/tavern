@@ -117,6 +117,8 @@ Registration is closed by default: accounts are created with invitation codes is
 
 This prints a single-use invitation code, valid 24 hours and shown only once. Register with it in the Tavern client: that account becomes an administrator and can then create invitations for everyone else. The server never creates an account with a password itself, so that it never sees one.
 
+The code is created by the server that is already running (`docker compose exec`): start the stack with `docker compose up -d` first. The script never builds, pulls or starts anything, so it works offline and never replaces the image you are running.
+
 Run the script again if you need another administrator, or if the code expired before you used it.
 
 ### Trying it on your own computer

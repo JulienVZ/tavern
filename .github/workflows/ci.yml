@@ -281,6 +281,14 @@ jobs:
             | jq -e '.services.server.environment.TAVERN_TRUST_FORWARDED_FOR == "false"'
           docker compose config --format json \
             | jq -e '[.services.server.ports[].host_ip] | all(. == "127.0.0.1")'
+      - name: Refuse to create an invitation while the server is stopped
+        working-directory: deploy
+        run: |
+          # create-admin.sh runs in the running server; it never builds or
+          # starts anything itself.
+          if ./scripts/create-admin.sh 2> refusal.txt; then exit 1; fi
+          cat refusal.txt
+          grep -q "the Tavern server is not running" refusal.txt
       - name: Start the stack and query it through Caddy
         working-directory: deploy
         run: |
