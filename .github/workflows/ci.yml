@@ -122,15 +122,24 @@ jobs:
       # graph through openmls_rust_crypto, which also re-exports it, so the
       # graph test of crates/crypto/tests is not enough: nothing of it may be
       # linked into the server. The crypto tests, which use it, show that the
-      # search does find its symbols.
+      # search does find its symbols. Every binary searched must exist and
+      # have symbols of its own: a search in nothing finds nothing.
       - name: No test-only MLS storage in the server binary
         run: |
           tests=$(cargo test --locked --package tavern-crypto --lib --no-run --message-format=json \
             | jq -r 'select(.executable != null) | .executable' | head -n 1)
-          found=$(nm "$tests" | grep -c openmls_memory_storage || true)
+          test -f "$tests"
+          nm "$tests" > "$RUNNER_TEMP/crypto-tests.nm"
+          found=$(grep -c openmls_memory_storage "$RUNNER_TEMP/crypto-tests.nm" || true)
           echo "openmls_memory_storage symbols in the crypto tests: $found"
           test "$found" -gt 0
-          count=$(nm target/debug/tavern-server | grep -c openmls_memory_storage || true)
+          binary=target/debug/tavern-server
+          test -f "$binary"
+          nm "$binary" > "$RUNNER_TEMP/server.nm"
+          own=$(grep -c tavern_server "$RUNNER_TEMP/server.nm" || true)
+          echo "tavern_server symbols in the server: $own"
+          test "$own" -gt 0
+          count=$(grep -c openmls_memory_storage "$RUNNER_TEMP/server.nm" || true)
           echo "openmls_memory_storage symbols in the server: $count"
           test "$count" -eq 0
       # OpenSSL is allowed in one place: inside SQLCipher, the client's local
@@ -147,7 +156,13 @@ jobs:
         run: |
           CARGO_PROFILE_RELEASE_STRIP=none cargo build --release --locked \
             --package tavern-crypto --example argon2_memory
-          count=$(nm target/release/examples/argon2_memory | grep -c crypto_bigint || true)
+          binary=target/release/examples/argon2_memory
+          test -f "$binary"
+          nm "$binary" > "$RUNNER_TEMP/argon2_memory.nm"
+          own=$(grep -c argon2_memory "$RUNNER_TEMP/argon2_memory.nm" || true)
+          echo "argon2_memory symbols in the example: $own"
+          test "$own" -gt 0
+          count=$(grep -c crypto_bigint "$RUNNER_TEMP/argon2_memory.nm" || true)
           echo "crypto_bigint symbols: $count"
           test "$count" -eq 0
       - name: Free disk space
@@ -242,6 +257,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           binary=target/debug/tavern-desktop
+          test -f "$binary"
           readelf --dynamic "$binary" | grep NEEDED
           if readelf --dynamic "$binary" | grep -E 'lib(ssl|crypto)\.so'; then
             echo "the client links the system's OpenSSL"; exit 1
@@ -252,8 +268,13 @@ jobs:
           grep -aq "OpenSSL $vendored" "$binary"
           echo "Loaded at run time (informative):"
           ldd "$binary" | grep -E 'lib(ssl|crypto)' || echo "  no libssl or libcrypto"
-          # And no test-only MLS storage (docs/adr/0019).
-          count=$(nm "$binary" | grep -c openmls_memory_storage || true)
+          # And no test-only MLS storage (docs/adr/0019), searched in symbols
+          # that are there (the client's own).
+          nm "$binary" > "$RUNNER_TEMP/client.nm"
+          own=$(grep -c tavern_desktop "$RUNNER_TEMP/client.nm" || true)
+          echo "tavern_desktop symbols in the client: $own"
+          test "$own" -gt 0
+          count=$(grep -c openmls_memory_storage "$RUNNER_TEMP/client.nm" || true)
           echo "openmls_memory_storage symbols in the client: $count"
           test "$count" -eq 0
       # The local store's tests (docs/adr/0018) on the systems that the Rust
