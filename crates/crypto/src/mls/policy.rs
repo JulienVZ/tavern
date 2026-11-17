@@ -62,7 +62,7 @@ pub enum PolicyError {
 
 /// Something in a commit or a Welcome that must raise the alarm of section
 /// 11: the commit is not merged, the conversation is marked broken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Alarm {
     /// A leaf is not a verified device of a participant.
     #[error("{0}")]
@@ -74,6 +74,12 @@ pub enum Alarm {
     /// earlier or never received.
     #[error("the commit refers to a proposal this device refused or never received")]
     UnknownProposal,
+    /// OpenMLS refuses a commit the server accepted, for a reason the server
+    /// could check on the group's public state, or that no state of this
+    /// device explains (ADR 0019, section 11). OpenMLS's message, which
+    /// carries no secret.
+    #[error("the server accepted an invalid commit: {0}")]
+    InvalidCommit(String),
 }
 
 fn is_server_remove(queued: &QueuedProposal) -> bool {

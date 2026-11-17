@@ -148,7 +148,14 @@ What the user can do, from the alarm:
 2. shows the gap in the conversation, like a return after inactivity (15);
 3. if the resync fails (refused by the server, or the group fails the checks of 4), marks the conversation broken as above, with the actions listed there. A group that fails the checks raises the alarm itself.
 
-A commit that refers to a refused proposal stays an alarm; a failure of the device's own storage is retried, not a desynchronisation.
+**Which refusals mean out of sync** (corrected 2026-11-17, after the check of the counter-review corrections). Every error OpenMLS can return for such a commit is classified explicitly, with no default (`CommitFault` in `crates/crypto/src/mls/mod.rs`, tested one by one):
+
+- **Alarm**: everything the server can check on the group's public state, against which it validates every commit (framing, wire format, senders, proposals, leaves and their signatures, the path's shape and parent hashes, KeyPackages, extensions, PSKs), and a commit that refers to a refused proposal. A server that accepts such a commit misbehaves. A device whose state forked never reaches these checks: it fails those below first. A variant added by an OpenMLS upgrade does not compile until it is classified.
+- **Out of sync**: what depends on what only this device holds. The membership tag is computed with the epoch's membership key, which the server does not have. The signature covers the group context as this device holds it, so a forked context fails it even though the server verified it against the true one; both stay "out of sync" for that reason. Also the confirmation tag of the new epoch, the decryption of the path with this device's keys, its own leaf, its own pending commit. A dishonest server or member can produce some of these too (a wrong membership tag, a path secret that does not match), which is why resyncs are bounded.
+- **Local**: this device's storage, a bug of OpenMLS, a group it has left. Retried; neither an alarm nor a resync.
+
+**Resyncs are bounded**: a second `OutOfSync` in the same conversation within 24 hours of an automatic resync marks the conversation broken, with the alarm above, and so does an `OutOfSync` once the conversation has had 3 automatic resyncs in 30 days. A server cannot keep a device resyncing silently. (Values proposed with this correction, to be confirmed in the plan of task 10.)
+
 
 ### 12. Ciphertext retention on the server
 

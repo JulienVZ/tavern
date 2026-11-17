@@ -269,7 +269,7 @@ fn own_commit_error(alarm: Alarm) -> MlsError {
     match alarm {
         Alarm::Leaf(error) => MlsError::Leaf(error),
         Alarm::Policy(error) => MlsError::Policy(error),
-        Alarm::UnknownProposal => MlsError::Malformed,
+        Alarm::UnknownProposal | Alarm::InvalidCommit(_) => MlsError::Malformed,
     }
 }
 

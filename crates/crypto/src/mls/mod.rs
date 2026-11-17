@@ -107,7 +107,8 @@ pub enum MlsError {
 impl MlsError {
     /// Whether this must raise the alarm of section 11: a leaf that is not a
     /// verified device of a participant, a policy violation in a commit the
-    /// server accepted, or a commit that refers to a refused proposal.
+    /// server accepted, a commit that refers to a refused proposal, or a
+    /// commit the server should have refused.
     pub fn is_alarm(&self) -> bool {
         matches!(self, Self::Alarm(_))
     }
@@ -181,24 +182,152 @@ pub(crate) fn processing_error<E: std::fmt::Display>(
         ))) => MlsError::Refused(Refusal::AlreadyRead),
         P::ValidationError(V::UnableToDecrypt(_)) => MlsError::Refused(Refusal::UnableToDecrypt),
         P::ValidationError(V::UnknownMember) => MlsError::Refused(Refusal::UnknownMember),
+        // A proposal from a joining device other than an `Add`.
+        P::UnsupportedProposalType => PolicyError::ExternalJoinProposal.into(),
         other => library(other),
     }
 }
 
-/// Classifies OpenMLS's refusal of a commit of the conversation's sequence,
-/// once the wrapper has checked that it is for this group and this epoch.
-/// The server accepted it, so the other devices can process it: unless it
-/// refers to a proposal this device refused (an alarm), or fails for this
-/// device's own reasons (its storage, a bug, a group it has left), this
-/// device is out of sync.
+/// What OpenMLS's refusal of a commit of the conversation's sequence means
+/// (section 11). The commit is for this group and this epoch (the wrapper
+/// checks that first), and the server accepted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitFault {
+    /// Checkable on the group's public state, which the server holds and
+    /// validates commits against, or explained by no state of this device:
+    /// the server accepted an invalid commit. Also every error not reviewed
+    /// here: the matches below are exhaustive, so a new OpenMLS variant
+    /// fails to compile until it is classified.
+    Alarm,
+    /// The commit refers to a proposal this device refused or never
+    /// received: an alarm too.
+    UnknownProposal,
+    /// Depends on what only this device holds (its secrets, its pending
+    /// commit, its own view of the group context): it may be out of sync.
+    OutOfSync,
+    /// This device's own trouble: its storage, a bug, a group it has left.
+    Local,
+    /// Another group or epoch, which the wrapper rules out before OpenMLS.
+    Refused(Refusal),
+}
+
+impl CommitFault {
+    fn of<E>(error: &openmls::prelude::ProcessMessageError<E>) -> Self {
+        use openmls::prelude::ProcessMessageError as P;
+        match error {
+            P::LibraryError(_) | P::StorageError(_) | P::GroupStateError(_) => Self::Local,
+            // The wire format and the sender are public: the server sees them.
+            P::IncompatibleWireFormat
+            | P::UnauthorizedExternalApplicationMessage
+            | P::UnauthorizedExternalCommitMessage
+            | P::UnsupportedProposalType => Self::Alarm,
+            P::ValidationError(error) => Self::of_validation(error),
+            P::InvalidCommit(error) => Self::of_staging(error),
+        }
+    }
+
+    fn of_validation(error: &openmls::prelude::ValidationError) -> Self {
+        use openmls::prelude::ValidationError as V;
+        match error {
+            V::LibraryError(_) => Self::Local,
+            V::WrongGroupId => Self::Refused(Refusal::WrongGroup),
+            V::WrongEpoch => Self::Refused(Refusal::WrongEpoch),
+            V::NoPastEpochData => Self::Refused(Refusal::PastEpoch),
+            // The membership tag is computed with the epoch's membership key,
+            // a secret the server does not have; the signed content includes
+            // the group context as this device holds it. A device whose state
+            // forked fails both, while the server verified the signature
+            // against the true context.
+            V::InvalidMembershipTag | V::InvalidSignature => Self::OutOfSync,
+            // Framing, senders, leaves, KeyPackages, extensions: all public.
+            // A commit is never encrypted, so it cannot fail to decrypt.
+            V::NotACommit
+            | V::NotAnExternalAddProposal
+            | V::NoPath
+            | V::UnencryptedApplicationMessage
+            | V::UnknownMember
+            | V::MissingMembershipTag
+            | V::MissingConfirmationTag
+            | V::WrongWireFormat
+            | V::NonMemberApplicationMessage
+            | V::UnableToDecrypt(_)
+            | V::UnauthorizedExternalSender
+            | V::NoExternalSendersExtension
+            | V::KeyPackageVerifyError(_)
+            | V::UpdatePathError(_)
+            | V::InvalidLeafNodeSignature
+            | V::InvalidLeafNodeSourceType
+            | V::InvalidSenderType
+            | V::CommitterIncludedOwnUpdate
+            | V::InvalidAddProposalCiphersuite
+            | V::ExternalCommitValidation(_)
+            | V::InvalidExtension(_) => Self::Alarm,
+        }
+    }
+
+    fn of_staging(error: &openmls::prelude::StageCommitError) -> Self {
+        use openmls::prelude::StageCommitError as S;
+        match error {
+            S::LibraryError(_) => Self::Local,
+            S::EpochMismatch => Self::Refused(Refusal::WrongEpoch),
+            S::MissingProposal => Self::UnknownProposal,
+            // The new epoch's secrets, this device's private keys and its own
+            // pending commit: only this device has them.
+            S::ConfirmationTagMismatch
+            | S::OwnCommitMismatch
+            | S::OwnKeyNotFound
+            | S::MissingDecryptionKey => Self::OutOfSync,
+            S::UpdatePathError(error) => Self::of_path(error),
+            // Proposals, path leaves, PSKs (which Tavern never uses), senders:
+            // all checkable on the public state.
+            S::WrongPlaintextContentType
+            | S::PathLeafNodeVerificationFailure
+            | S::RequiredPathNotFound
+            | S::ConfirmationTagMissing
+            | S::AttemptedSelfRemoval
+            | S::InconsistentSenderIndex
+            | S::SenderTypeExternal
+            | S::SenderTypeNewMemberProposal
+            | S::TooManyNewMembers
+            | S::ProposalValidationError(_)
+            | S::PskError(_)
+            | S::ExternalCommitValidation(_)
+            | S::VerifiedUpdatePathError(_)
+            | S::GroupContextExtensionsProposalValidationError(_)
+            | S::LeafNodeValidation(_)
+            | S::DuplicatePskId(_) => Self::Alarm,
+        }
+    }
+
+    fn of_path(error: &openmls::prelude::ApplyUpdatePathError) -> Self {
+        use openmls::prelude::ApplyUpdatePathError as A;
+        match error {
+            A::LibraryError(_) => Self::Local,
+            // What this device decrypts with its own keys, and its own leaf.
+            A::UnableToDecrypt | A::PathMismatch | A::MissingOwnLeaf => Self::OutOfSync,
+            // The path's shape and public keys.
+            A::PathLengthMismatch
+            | A::ParentHashMismatch
+            | A::MissingParentHash
+            | A::MissingSender
+            | A::TreeFull
+            | A::InconsistentSenderIndex
+            | A::MissingCiphertext => Self::Alarm,
+        }
+    }
+}
+
+/// Classifies OpenMLS's refusal of a commit of the conversation's sequence
+/// ([`CommitFault`]).
 pub(crate) fn commit_processing_error<E: std::fmt::Display>(
     error: openmls::prelude::ProcessMessageError<E>,
 ) -> MlsError {
-    use openmls::prelude::{ProcessMessageError as P, StageCommitError};
-    match error {
-        P::InvalidCommit(StageCommitError::MissingProposal) => Alarm::UnknownProposal.into(),
-        P::LibraryError(_) | P::StorageError(_) | P::GroupStateError(_) => library(error),
-        other => MlsError::OutOfSync(other.to_string()),
+    match CommitFault::of(&error) {
+        CommitFault::Alarm => Alarm::InvalidCommit(error.to_string()).into(),
+        CommitFault::UnknownProposal => Alarm::UnknownProposal.into(),
+        CommitFault::OutOfSync => MlsError::OutOfSync(error.to_string()),
+        CommitFault::Local => library(error),
+        CommitFault::Refused(refusal) => MlsError::Refused(refusal),
     }
 }
 

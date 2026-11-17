@@ -1601,6 +1601,186 @@ fn a_device_out_of_sync_resyncs_by_external_commit() {
     dm.send(2, b"good");
 }
 
+/// Every OpenMLS error that can refuse a commit, one by one, with its class
+/// (ADR 0019, section 11). Most cannot be produced through OpenMLS's API, so
+/// they are built here. The matches of `CommitFault` are exhaustive: a
+/// variant added by an OpenMLS upgrade fails to compile there first.
+#[test]
+fn every_error_refusing_a_commit_is_classified() {
+    use openmls::extensions::errors::InvalidExtensionError;
+    use openmls::framing::errors::MessageDecryptionError;
+    use openmls::key_packages::errors::KeyPackageVerifyError;
+    use openmls::prelude::{
+        ApplyUpdatePathError as A, ExternalCommitValidationError,
+        GroupContextExtensionsProposalValidationError, MlsGroupStateError,
+        ProcessMessageError as P, ProposalValidationError, StageCommitError as S,
+        ValidationError as V,
+    };
+    use openmls::schedule::errors::PskError;
+    use openmls::schedule::{ExternalPsk, PreSharedKeyId, Psk};
+    use openmls::treesync::errors::{LeafNodeValidationError, UpdatePathError};
+
+    let psk = PreSharedKeyId::new(
+        CIPHERSUITE,
+        TestProvider::default().rand(),
+        Psk::External(ExternalPsk::new(b"psk".to_vec())),
+    )
+    .unwrap();
+    let alarms: Vec<P<&str>> = vec![
+        P::IncompatibleWireFormat,
+        P::UnauthorizedExternalApplicationMessage,
+        P::UnauthorizedExternalCommitMessage,
+        P::UnsupportedProposalType,
+        P::ValidationError(V::NotACommit),
+        P::ValidationError(V::NotAnExternalAddProposal),
+        P::ValidationError(V::NoPath),
+        P::ValidationError(V::UnencryptedApplicationMessage),
+        P::ValidationError(V::UnknownMember),
+        P::ValidationError(V::MissingMembershipTag),
+        P::ValidationError(V::MissingConfirmationTag),
+        P::ValidationError(V::WrongWireFormat),
+        P::ValidationError(V::NonMemberApplicationMessage),
+        P::ValidationError(V::UnableToDecrypt(
+            MessageDecryptionError::GenerationOutOfBound,
+        )),
+        P::ValidationError(V::UnauthorizedExternalSender),
+        P::ValidationError(V::NoExternalSendersExtension),
+        P::ValidationError(V::KeyPackageVerifyError(
+            KeyPackageVerifyError::MissingLifetime,
+        )),
+        P::ValidationError(V::UpdatePathError(UpdatePathError::InvalidType)),
+        P::ValidationError(V::InvalidLeafNodeSignature),
+        P::ValidationError(V::InvalidLeafNodeSourceType),
+        P::ValidationError(V::InvalidSenderType),
+        P::ValidationError(V::CommitterIncludedOwnUpdate),
+        P::ValidationError(V::InvalidAddProposalCiphersuite),
+        P::ValidationError(V::ExternalCommitValidation(
+            ExternalCommitValidationError::NoExternalInitProposals,
+        )),
+        P::ValidationError(V::InvalidExtension(InvalidExtensionError::Duplicate)),
+        P::InvalidCommit(S::WrongPlaintextContentType),
+        P::InvalidCommit(S::PathLeafNodeVerificationFailure),
+        P::InvalidCommit(S::RequiredPathNotFound),
+        P::InvalidCommit(S::ConfirmationTagMissing),
+        P::InvalidCommit(S::AttemptedSelfRemoval),
+        P::InvalidCommit(S::InconsistentSenderIndex),
+        P::InvalidCommit(S::SenderTypeExternal),
+        P::InvalidCommit(S::SenderTypeNewMemberProposal),
+        P::InvalidCommit(S::TooManyNewMembers),
+        P::InvalidCommit(S::ProposalValidationError(
+            ProposalValidationError::UnknownMember,
+        )),
+        P::InvalidCommit(S::PskError(PskError::TooManyKeys)),
+        P::InvalidCommit(S::ExternalCommitValidation(
+            ExternalCommitValidationError::NoExternalInitProposals,
+        )),
+        P::InvalidCommit(S::VerifiedUpdatePathError(UpdatePathError::InvalidType)),
+        P::InvalidCommit(S::GroupContextExtensionsProposalValidationError(
+            GroupContextExtensionsProposalValidationError::TooManyGCEProposals,
+        )),
+        P::InvalidCommit(S::LeafNodeValidation(
+            LeafNodeValidationError::UnsupportedExtensions,
+        )),
+        P::InvalidCommit(S::DuplicatePskId(psk)),
+        P::InvalidCommit(S::UpdatePathError(A::PathLengthMismatch)),
+        P::InvalidCommit(S::UpdatePathError(A::ParentHashMismatch)),
+        P::InvalidCommit(S::UpdatePathError(A::MissingParentHash)),
+        P::InvalidCommit(S::UpdatePathError(A::MissingSender)),
+        P::InvalidCommit(S::UpdatePathError(A::TreeFull)),
+        P::InvalidCommit(S::UpdatePathError(A::InconsistentSenderIndex)),
+        P::InvalidCommit(S::UpdatePathError(A::MissingCiphertext)),
+    ];
+    // 4 + 21 + 16 + 7: the alarm arms of `CommitFault`.
+    assert_eq!(alarms.len(), 48);
+    for error in alarms {
+        assert_eq!(CommitFault::of(&error), CommitFault::Alarm, "{error:?}");
+        let text = error.to_string();
+        let mapped = commit_processing_error(error);
+        assert!(mapped.is_alarm(), "{mapped:?}");
+        assert!(
+            matches!(&mapped, MlsError::Alarm(Alarm::InvalidCommit(said)) if *said == text),
+            "{mapped:?}"
+        );
+    }
+
+    let out_of_sync: Vec<P<&str>> = vec![
+        P::ValidationError(V::InvalidMembershipTag),
+        P::ValidationError(V::InvalidSignature),
+        P::InvalidCommit(S::ConfirmationTagMismatch),
+        P::InvalidCommit(S::OwnCommitMismatch),
+        P::InvalidCommit(S::OwnKeyNotFound),
+        P::InvalidCommit(S::MissingDecryptionKey),
+        P::InvalidCommit(S::UpdatePathError(A::UnableToDecrypt)),
+        P::InvalidCommit(S::UpdatePathError(A::PathMismatch)),
+        P::InvalidCommit(S::UpdatePathError(A::MissingOwnLeaf)),
+    ];
+    for error in out_of_sync {
+        assert_eq!(CommitFault::of(&error), CommitFault::OutOfSync, "{error:?}");
+        assert!(commit_processing_error(error).is_out_of_sync());
+    }
+
+    // OpenMLS's own errors (`LibraryError`) have no public constructor; they
+    // are `Local` like these.
+    for error in [
+        P::StorageError("disk full"),
+        P::GroupStateError(MlsGroupStateError::UseAfterEviction),
+    ] {
+        assert_eq!(CommitFault::of(&error), CommitFault::Local, "{error:?}");
+        assert!(matches!(
+            commit_processing_error(error),
+            MlsError::Library(_)
+        ));
+    }
+
+    for (error, refusal) in [
+        (P::ValidationError(V::WrongGroupId), Refusal::WrongGroup),
+        (P::ValidationError(V::WrongEpoch), Refusal::WrongEpoch),
+        (P::ValidationError(V::NoPastEpochData), Refusal::PastEpoch),
+        (P::InvalidCommit(S::EpochMismatch), Refusal::WrongEpoch),
+    ] {
+        assert!(matches!(
+            commit_processing_error::<&str>(error),
+            MlsError::Refused(got) if got == refusal
+        ));
+    }
+    assert!(matches!(
+        commit_processing_error::<&str>(P::InvalidCommit(S::MissingProposal)),
+        MlsError::Alarm(Alarm::UnknownProposal)
+    ));
+
+    // On their own, an external proposal other than an `Add` is dropped.
+    assert!(matches!(
+        processing_error::<&str>(P::UnsupportedProposalType),
+        MlsError::Policy(PolicyError::ExternalJoinProposal)
+    ));
+}
+
+/// A commit sent as a `PrivateMessage`: the server sees the wire format, and
+/// Tavern's handshake is in the clear (section 1). An alarm, not a resync.
+#[test]
+fn an_encrypted_commit_raises_the_alarm() {
+    let mut dm = Dm::new();
+    let device = &dm.devices[2];
+    let ciphertext = openmls::prelude::MlsGroupJoinConfig::builder()
+        .wire_format_policy(openmls::prelude::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+        .build();
+    dm.groups[2]
+        .inner_mut()
+        .set_configuration(device.provider.storage(), &ciphertext)
+        .unwrap();
+    let commit = dm.groups[2]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    assert_eq!(wire_format(&commit.commit), WireFormat::PrivateMessage);
+
+    let result = dm.deliver(0, &commit.commit);
+    assert!(
+        matches!(result, Err(MlsError::Alarm(Alarm::InvalidCommit(_)))),
+        "{result:?}"
+    );
+    assert_eq!(dm.groups[0].epoch(), 1, "not merged");
+}
+
 // --- Serialization round trips ------------------------------------------------------------
 
 proptest! {
