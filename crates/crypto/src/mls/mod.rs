@@ -18,8 +18,10 @@ pub mod credential;
 pub mod group;
 pub mod group_id;
 pub mod key_package;
+mod no_storage;
 pub mod padding;
 mod policy;
+pub mod public;
 pub mod safety_number;
 mod signer;
 
@@ -36,6 +38,7 @@ pub use credential::{LeafError, Roster, VerifiedLeaf};
 pub use group::{Commit, ExpectedGroup, Group, Incoming, Joined, MembershipChanges, Plaintext};
 pub use key_package::ClaimedKeyPackage;
 pub use policy::{Alarm, PolicyError};
+pub use public::{MergedCommit, PublicEntries, PublicState, ValidatedCommit};
 pub use signer::{DeviceSigner, ServerSigner};
 
 /// The only ciphersuite of Tavern's groups.
@@ -91,6 +94,24 @@ pub enum MlsError {
     /// by external commit if it is still active (section 15).
     #[error("the server asked to remove this device from the group")]
     BeingRemoved,
+    /// On the server: a member's commit leaves out a removal the server
+    /// asked for. Refused with `REMOVAL_PENDING`: the member commits again,
+    /// with it (section 6).
+    #[error("the commit leaves out a removal the server asked for")]
+    RemovalPending,
+    /// On the server: the commit is not the submitting device's own (it is
+    /// signed by another leaf, or joins another device).
+    #[error("the commit is not the submitting device's own")]
+    WrongSender,
+    /// On the server: the GroupInfo submitted with a commit is not the one
+    /// of its new epoch with its ratchet tree, signed by the committer.
+    #[error("the GroupInfo is not the new epoch's, signed by the committer")]
+    GroupInfo,
+    /// On the server: OpenMLS finds the message invalid against the group's
+    /// public state (signature, proposals, path...). OpenMLS's message,
+    /// which carries no secret.
+    #[error("invalid against the group's public state: {0}")]
+    Invalid(String),
     /// The padded content is malformed.
     #[error("malformed padding: {0}")]
     Padding(#[from] padding::PaddingError),

@@ -9,7 +9,7 @@
     reason = "tests panic on failure"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
 use openmls::prelude::{
@@ -170,6 +170,8 @@ struct Dm {
     devices: Vec<Device>,
     groups: Vec<Group>,
     pins: Pins,
+    /// The GroupInfo submitted with the first commit (epoch 1).
+    first_group_info: Vec<u8>,
 }
 
 impl Dm {
@@ -203,6 +205,7 @@ impl Dm {
         assert_eq!(wire_format(&commit.commit), WireFormat::PublicMessage);
         first.merge_pending_commit(&creator.provider).unwrap();
 
+        let first_group_info = commit.group_info.clone();
         let welcome = commit.welcome.unwrap();
         let mut groups = vec![first];
         for device in &devices[1..] {
@@ -225,6 +228,7 @@ impl Dm {
             devices,
             groups,
             pins,
+            first_group_info,
         }
     }
 
@@ -1854,6 +1858,725 @@ fn an_encrypted_commit_raises_the_alarm() {
         "{result:?}"
     );
     assert_eq!(dm.groups[0].epoch(), 1, "not merged");
+}
+
+// --- Section 14: the server's public state ----------------------------------------------
+
+/// What the server trusts: the participants' identity keys from its
+/// database, and their active devices.
+#[derive(Clone)]
+struct ServerRoster {
+    pins: Pins,
+    revoked: HashSet<VerifiedLeaf>,
+}
+
+impl ServerRoster {
+    fn of(dm: &Dm) -> Self {
+        Self {
+            pins: dm.pins.clone(),
+            revoked: HashSet::new(),
+        }
+    }
+
+    fn revoking(mut self, device: VerifiedLeaf) -> Self {
+        self.revoked.insert(device);
+        self
+    }
+}
+
+impl Roster for ServerRoster {
+    fn identity_key(&self, user_id: &[u8; ID_LEN]) -> Option<IdentityPublicKey> {
+        self.pins.identity_key(user_id)
+    }
+
+    fn accepts_device(&self, device: &VerifiedLeaf) -> bool {
+        !self.revoked.contains(device)
+    }
+}
+
+/// The server's state of the DM, from the GroupInfo of its first commit.
+fn public_state(dm: &Dm) -> PublicState {
+    let (state, devices) = PublicState::create(
+        &dm.first_group_info,
+        &expected(),
+        dm.devices[0].leaf(),
+        &ServerRoster::of(dm),
+        &dm.server.public_bytes(),
+    )
+    .unwrap();
+    assert_eq!(devices.len(), 4);
+    state
+}
+
+/// The server checks `commit`, submitted by device `from`, against `state`.
+fn submit(
+    state: &PublicState,
+    from: &Device,
+    commit: &[u8],
+    group_info: &[u8],
+    roster: &ServerRoster,
+) -> Result<ValidatedCommit, MlsError> {
+    state.validate_commit(commit, group_info, from.leaf(), &expected(), roster)
+}
+
+/// The server accepts `commit` from device `from` and merges it.
+fn accept(dm: &Dm, state: &mut PublicState, from: &Device, commit: &Commit) -> MergedCommit {
+    let validated = submit(
+        state,
+        from,
+        &commit.commit,
+        &commit.group_info,
+        &ServerRoster::of(dm),
+    )
+    .unwrap();
+    state
+        .merge(validated, &ServerSigner::new(&dm.server))
+        .unwrap()
+}
+
+/// Device `index` commits an update of its leaf, accepted by its own group.
+fn update(dm: &mut Dm, index: usize) -> Commit {
+    let device = &dm.devices[index];
+    let commit = dm.groups[index]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    dm.groups[index]
+        .merge_pending_commit(&dm.devices[index].provider)
+        .unwrap();
+    commit
+}
+
+fn reload(state: &PublicState) -> PublicState {
+    let identity = state.identity().unwrap();
+    PublicState::load(
+        identity,
+        PublicEntries::load(identity, state.entries().entries()).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_server_builds_the_public_state_from_the_first_group_info() {
+    let mut dm = Dm::new();
+    let state = public_state(&dm);
+    assert_eq!(state.epoch(), 1);
+    assert_eq!(state.identity().unwrap(), identity());
+    let bob2 = dm.devices[3].leaf();
+    assert_eq!(
+        state.leaf_of(bob2),
+        dm.groups[0].leaf_of(&bob2.user_id, &bob2.device_id)
+    );
+
+    // Stored as rows and loaded again, it checks the next commit.
+    let mut loaded = reload(&state);
+    assert_eq!(loaded.epoch(), 1);
+    assert_eq!(loaded.devices(), state.devices());
+    let commit = update(&mut dm, 2);
+    let merged = accept(&dm, &mut loaded, &dm.devices[2], &commit);
+    assert_eq!(merged.epoch, 2);
+
+    // Rows of another group are not this group's.
+    let other = GroupIdentity {
+        conversation_id: [0xc1; ID_LEN],
+        generation: 0,
+    };
+    let rows = PublicEntries::load(other, state.entries().entries()).unwrap();
+    assert!(PublicState::load(identity(), rows).is_err());
+    let unknown = super::public::Entry {
+        kind: 99,
+        key: Vec::new(),
+        value: Vec::new(),
+    };
+    assert!(matches!(
+        PublicEntries::load(identity(), [unknown]),
+        Err(MlsError::Malformed)
+    ));
+}
+
+#[test]
+fn the_server_refuses_a_first_group_info_that_is_not_the_expected_group() {
+    let mut dm = Dm::new();
+    let alice1 = dm.devices[0].leaf();
+    let create = |info: &[u8],
+                  expected: &ExpectedGroup<'_>,
+                  submitter: VerifiedLeaf,
+                  roster: &ServerRoster,
+                  key: &[u8; 32]| {
+        PublicState::create(info, expected, submitter, roster, key).map(|_| ())
+    };
+    let roster = ServerRoster::of(&dm);
+    let key = dm.server.public_bytes();
+    let info = dm.first_group_info.clone();
+
+    let next_generation = ExpectedGroup {
+        identity: identity().next().unwrap(),
+        participants: &PARTICIPANTS,
+    };
+    let result = create(&info, &next_generation, alice1, &roster, &key);
+    assert!(
+        matches!(result, Err(MlsError::UnexpectedGroup)),
+        "{result:?}"
+    );
+    let other_key = ExternalSenderKey::generate().public_bytes();
+    let result = create(&info, &expected(), alice1, &roster, &other_key);
+    assert!(matches!(result, Err(MlsError::Parameters)), "{result:?}");
+    let alice_only = ExpectedGroup {
+        identity: identity(),
+        participants: &[ALICE],
+    };
+    let result = create(&info, &alice_only, alice1, &roster, &key);
+    assert!(
+        matches!(result, Err(MlsError::Leaf(LeafError::NotParticipant))),
+        "{result:?}"
+    );
+    let revoked = roster.clone().revoking(dm.devices[3].leaf());
+    let result = create(&info, &expected(), alice1, &revoked, &key);
+    assert!(
+        matches!(result, Err(MlsError::Leaf(LeafError::InactiveDevice))),
+        "{result:?}"
+    );
+    // Submitted by a member that did not sign it.
+    let result = create(&info, &expected(), dm.devices[2].leaf(), &roster, &key);
+    assert!(matches!(result, Err(MlsError::WrongSender)), "{result:?}");
+    let result = create(&info[..info.len() - 1], &expected(), alice1, &roster, &key);
+    assert!(matches!(result, Err(MlsError::Malformed)), "{result:?}");
+    // The GroupInfo of a later epoch.
+    let commit = update(&mut dm, 0);
+    let result = create(&commit.group_info, &expected(), alice1, &roster, &key);
+    assert!(
+        matches!(result, Err(MlsError::UnexpectedGroup)),
+        "{result:?}"
+    );
+
+    // A participant with no device is not a reason to refuse (section 4).
+    let alone = dm.alice.device(0xa7);
+    let (_, created) = Group::create(
+        &alone.provider,
+        &alone.signer(),
+        alone.credential(),
+        &expected(),
+        &key,
+        &[],
+        &dm.pins,
+    )
+    .unwrap();
+    let (_, devices) = PublicState::create(
+        &created.group_info,
+        &expected(),
+        alone.leaf(),
+        &roster,
+        &key,
+    )
+    .unwrap();
+    assert_eq!(devices, [alone.leaf()]);
+}
+
+#[test]
+fn the_server_validates_and_merges_the_commit_of_each_epoch() {
+    let mut dm = Dm::new();
+    let mut state = public_state(&dm);
+
+    let commit = update(&mut dm, 2);
+    let merged = accept(&dm, &mut state, &dm.devices[2], &commit);
+    assert_eq!(merged.epoch, 2);
+    assert_eq!(merged.changes, MembershipChanges::default());
+    assert!(merged.reissued.is_empty());
+    assert_eq!(merged.group_info, commit.group_info);
+    dm.deliver_all(&commit.commit, &[2]);
+
+    let bob3 = dm.bob.device(0xb3);
+    let device = &dm.devices[0];
+    let added = dm.groups[0]
+        .add(
+            &device.provider,
+            &device.signer(),
+            &[bob3.claimed(&dm.pins)],
+            &dm.pins,
+        )
+        .unwrap();
+    dm.groups[0]
+        .merge_pending_commit(&dm.devices[0].provider)
+        .unwrap();
+    let before = reload(&state);
+    let merged = accept(&dm, &mut state, &dm.devices[0], &added);
+    assert_eq!(merged.changes.added, [bob3.leaf()]);
+    assert_eq!(state.epoch(), 3);
+    dm.deliver_all(&added.commit, &[0]);
+
+    // Two commits for epoch 3: the first wins, the second is stale.
+    let first = update(&mut dm, 1);
+    let device = &dm.devices[3];
+    let second = dm.groups[3]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    accept(&dm, &mut state, &dm.devices[1], &first);
+    let roster = ServerRoster::of(&dm);
+    let result = submit(
+        &state,
+        &dm.devices[3],
+        &second.commit,
+        &second.group_info,
+        &roster,
+    );
+    assert!(
+        matches!(result, Err(MlsError::Refused(Refusal::PastEpoch))),
+        "{result:?}"
+    );
+    // A server state behind the commit: a later epoch.
+    let result = submit(
+        &before,
+        &dm.devices[1],
+        &first.commit,
+        &first.group_info,
+        &roster,
+    );
+    assert!(
+        matches!(result, Err(MlsError::Refused(Refusal::WrongEpoch))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_device_submits_only_its_own_commits() {
+    let mut dm = Dm::new();
+    let state = public_state(&dm);
+    let commit = update(&mut dm, 2);
+    let roster = ServerRoster::of(&dm);
+    let result = submit(
+        &state,
+        &dm.devices[3],
+        &commit.commit,
+        &commit.group_info,
+        &roster,
+    );
+    assert!(matches!(result, Err(MlsError::WrongSender)), "{result:?}");
+    assert!(
+        submit(
+            &state,
+            &dm.devices[2],
+            &commit.commit,
+            &commit.group_info,
+            &roster
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn the_group_info_must_be_the_new_epoch_s_signed_by_the_committer() {
+    let mut dm = Dm::new();
+    let state = public_state(&dm);
+    let commit = update(&mut dm, 2);
+    let roster = ServerRoster::of(&dm);
+    let bob1 = &dm.devices[2];
+
+    // The GroupInfo of the epoch before.
+    let result = submit(&state, bob1, &commit.commit, &dm.first_group_info, &roster);
+    assert!(matches!(result, Err(MlsError::GroupInfo)), "{result:?}");
+    // The new epoch's, signed by another member.
+    dm.deliver(0, &commit.commit).unwrap();
+    let by_alice = group_info(&mut dm, 0);
+    let bob1 = &dm.devices[2];
+    let result = submit(&state, bob1, &commit.commit, &by_alice, &roster);
+    assert!(matches!(result, Err(MlsError::GroupInfo)), "{result:?}");
+    let result = submit(
+        &state,
+        bob1,
+        &commit.commit,
+        &commit.group_info[1..],
+        &roster,
+    );
+    assert!(matches!(result, Err(MlsError::Malformed)), "{result:?}");
+    assert!(submit(&state, bob1, &commit.commit, &commit.group_info, &roster).is_ok());
+}
+
+#[test]
+fn the_server_applies_the_clients_policy() {
+    let mut dm = Dm::new();
+    let state = public_state(&dm);
+    let roster = ServerRoster::of(&dm);
+    let bob2_leaf = dm.devices[3].leaf();
+    let bob2 = state.leaf_of(bob2_leaf).unwrap();
+
+    // A member removes a device of another user on its own.
+    let device = &dm.devices[0];
+    let (commit, _, info) = dm.groups[0]
+        .inner_mut()
+        .remove_members(&device.provider, &device.signer(), &[bob2])
+        .unwrap();
+    let result = submit(
+        &state,
+        &dm.devices[0],
+        &commit.tls_serialize_detached().unwrap(),
+        &info_bytes(info),
+        &roster,
+    );
+    assert!(
+        matches!(result, Err(MlsError::Policy(PolicyError::RemoveNotAllowed))),
+        "{result:?}"
+    );
+    dm.groups[0]
+        .discard_pending_commit(&dm.devices[0].provider)
+        .unwrap();
+
+    // Adds: an identity the server does not have for Bob, a revoked device,
+    // a device of someone outside the conversation.
+    let impostor = Account::new(2).device(0xb7);
+    let bob3 = dm.bob.device(0xb3);
+    let carol = Account::new(3).device(0xc1);
+    for (key_package, roster, expected_error) in [
+        (impostor.key_package(), roster.clone(), LeafError::Untrusted),
+        (
+            bob3.key_package(),
+            roster.clone().revoking(bob3.leaf()),
+            LeafError::InactiveDevice,
+        ),
+        (
+            carol.key_package(),
+            roster.clone(),
+            LeafError::NotParticipant,
+        ),
+    ] {
+        let device = &dm.devices[0];
+        let (commit, _, info) = dm.groups[0]
+            .inner_mut()
+            .add_members(&device.provider, &device.signer(), &[key_package])
+            .unwrap();
+        let result = submit(
+            &state,
+            &dm.devices[0],
+            &commit.tls_serialize_detached().unwrap(),
+            &info_bytes(info),
+            &roster,
+        );
+        assert!(
+            matches!(result, Err(MlsError::Leaf(error)) if error == expected_error),
+            "{result:?}"
+        );
+        dm.groups[0]
+            .discard_pending_commit(&dm.devices[0].provider)
+            .unwrap();
+    }
+
+    // External commits: removing another device of the joiner's user, and
+    // a revoked device joining.
+    let joiner = device_with_key_of(&dm.bob, 0xb3, &dm.devices[2]);
+    let (_, commit) = join_externally(&mut dm, &joiner).unwrap();
+    let result = submit(&state, &joiner, &commit.commit, &commit.group_info, &roster);
+    assert!(
+        matches!(
+            result,
+            Err(MlsError::Policy(PolicyError::ExternalCommitContent))
+        ),
+        "{result:?}"
+    );
+    let bob4 = dm.bob.device(0xb4);
+    let (_, commit) = join_externally(&mut dm, &bob4).unwrap();
+    let revoked = roster.clone().revoking(bob4.leaf());
+    let result = submit(&state, &bob4, &commit.commit, &commit.group_info, &revoked);
+    assert!(
+        matches!(result, Err(MlsError::Leaf(LeafError::InactiveDevice))),
+        "{result:?}"
+    );
+    assert!(submit(&state, &bob4, &commit.commit, &commit.group_info, &roster).is_ok());
+}
+
+/// The GroupInfo OpenMLS returns with a commit, as submitted.
+fn info_bytes(info: Option<openmls::messages::group_info::GroupInfo>) -> Vec<u8> {
+    openmls::prelude::MlsMessageOut::from(info.unwrap())
+        .tls_serialize_detached()
+        .unwrap()
+}
+
+#[test]
+fn the_server_s_removals_are_signed_stored_and_committed() {
+    let mut dm = Dm::new();
+    let mut state = public_state(&dm);
+    let bob2 = state.leaf_of(dm.devices[3].leaf()).unwrap();
+
+    let proposal = state
+        .remove(bob2, &ServerSigner::new(&dm.server))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.remove(bob2, &ServerSigner::new(&dm.server)).unwrap(),
+        None,
+        "asked once per epoch"
+    );
+    assert_eq!(state.pending_removals().unwrap(), [bob2]);
+    // Stored with the state.
+    assert_eq!(reload(&state).pending_removals().unwrap(), [bob2]);
+    for incoming in dm.deliver_all(&proposal, &[]) {
+        assert_eq!(incoming, Incoming::Proposal);
+    }
+
+    let device = &dm.devices[0];
+    let commit = dm.groups[0]
+        .commit_pending_proposals(&device.provider, &device.signer(), &dm.pins)
+        .unwrap()
+        .unwrap();
+    dm.groups[0]
+        .merge_pending_commit(&dm.devices[0].provider)
+        .unwrap();
+    let merged = accept(&dm, &mut state, &dm.devices[0], &commit);
+    assert_eq!(merged.changes.removed, [dm.devices[3].leaf()]);
+    assert!(merged.reissued.is_empty());
+    assert!(state.pending_removals().unwrap().is_empty());
+    assert!(matches!(
+        state.remove(bob2, &ServerSigner::new(&dm.server)),
+        Err(MlsError::Leaf(LeafError::Malformed))
+    ));
+}
+
+/// Question 6 of the review, option (a): a member's commit must carry the
+/// server's pending removals (section 6).
+#[test]
+fn a_member_commit_that_leaves_out_a_pending_removal_is_refused() {
+    let mut dm = Dm::new();
+    let mut state = public_state(&dm);
+    let bob2 = state.leaf_of(dm.devices[3].leaf()).unwrap();
+    let proposal = state
+        .remove(bob2, &ServerSigner::new(&dm.server))
+        .unwrap()
+        .unwrap();
+    dm.deliver_all(&proposal, &[]);
+
+    // An update that leaves the removal out (an older client would).
+    let device = &dm.devices[2];
+    let bundle = dm.groups[2]
+        .inner_mut()
+        .commit_builder()
+        .consume_proposal_store(false)
+        .force_self_update(true)
+        .load_psks(device.provider.storage())
+        .unwrap()
+        .create_group_info(true)
+        .build(
+            device.provider.rand(),
+            device.provider.crypto(),
+            &device.signer(),
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&device.provider)
+        .unwrap();
+    let (commit, _, info) = bundle.into_contents();
+    let roster = ServerRoster::of(&dm);
+    let result = submit(
+        &state,
+        &dm.devices[2],
+        &commit.tls_serialize_detached().unwrap(),
+        &info_bytes(info),
+        &roster,
+    );
+    assert!(
+        matches!(result, Err(MlsError::RemovalPending)),
+        "{result:?}"
+    );
+    dm.groups[2]
+        .discard_pending_commit(&dm.devices[2].provider)
+        .unwrap();
+
+    // The same update through the wrapper carries it: accepted.
+    let commit = update(&mut dm, 2);
+    let merged = accept(&dm, &mut state, &dm.devices[2], &commit);
+    assert_eq!(merged.changes.removed, [dm.devices[3].leaf()]);
+}
+
+/// Option (a): after an external commit, which cannot carry them, the
+/// server asks again for its removals in the new epoch, in the same
+/// transaction.
+#[test]
+fn the_server_asks_again_for_the_removals_an_external_commit_leaves_out() {
+    let mut dm = Dm::new();
+    let mut state = public_state(&dm);
+    let bob2 = state.leaf_of(dm.devices[3].leaf()).unwrap();
+    let proposal = state
+        .remove(bob2, &ServerSigner::new(&dm.server))
+        .unwrap()
+        .unwrap();
+    dm.deliver_all(&proposal, &[]);
+
+    let alice3 = dm.alice.device(0xa3);
+    let (group, commit) = join_externally(&mut dm, &alice3).unwrap();
+    let merged = accept(&dm, &mut state, &alice3, &commit);
+    assert_eq!(merged.changes.added, [alice3.leaf()]);
+    assert_eq!(merged.reissued.len(), 1);
+    assert_eq!(state.pending_removals().unwrap(), [bob2]);
+    dm.deliver_all(&commit.commit, &[]);
+    dm.devices.push(alice3);
+    dm.groups.push(group);
+    let joined = dm.groups.len() - 1;
+    dm.groups[joined]
+        .merge_pending_commit(&dm.devices[joined].provider)
+        .unwrap();
+
+    // The removal again, for epoch 2: every member stores it, the newcomer
+    // too, and the first to commit carries it.
+    for incoming in dm.deliver_all(&merged.reissued[0], &[]) {
+        assert_eq!(incoming, Incoming::Proposal);
+    }
+    let device = &dm.devices[joined];
+    let commit = dm.groups[joined]
+        .commit_pending_proposals(&device.provider, &device.signer(), &dm.pins)
+        .unwrap()
+        .unwrap();
+    dm.groups[joined]
+        .merge_pending_commit(&dm.devices[joined].provider)
+        .unwrap();
+    let merged = accept(&dm, &mut state, &dm.devices[joined], &commit);
+    assert_eq!(merged.changes.removed, [dm.devices[3].leaf()]);
+    assert!(state.pending_removals().unwrap().is_empty());
+}
+
+/// Option (a): when the external commit is the resync of the very device the
+/// server asked to remove, it removes that leaf itself: nothing to ask again.
+#[test]
+fn nothing_is_asked_again_after_the_resync_of_the_removed_device() {
+    let mut dm = Dm::new();
+    let mut state = public_state(&dm);
+    let bob2 = state.leaf_of(dm.devices[3].leaf()).unwrap();
+    let proposal = state
+        .remove(bob2, &ServerSigner::new(&dm.server))
+        .unwrap()
+        .unwrap();
+    dm.deliver_all(&proposal, &[3]);
+
+    // Bob's second device comes back with no state and resyncs.
+    let lost = &dm.devices[3];
+    let fresh = Device {
+        user_id: lost.user_id,
+        device_id: lost.device_id,
+        certificate: lost.certificate.clone(),
+        key: DeviceKey::from_seed(&lost.key.seed()),
+        provider: TestProvider::default(),
+    };
+    let (_, commit) = join_externally(&mut dm, &fresh).unwrap();
+    let merged = accept(&dm, &mut state, &fresh, &commit);
+    assert_eq!(merged.changes.removed, [fresh.leaf()]);
+    assert_eq!(merged.changes.added, [fresh.leaf()]);
+    assert!(merged.reissued.is_empty());
+    assert!(state.pending_removals().unwrap().is_empty());
+    assert!(state.devices().contains(&fresh.leaf()));
+}
+
+#[test]
+fn public_entries_record_what_changed() {
+    let mut dm = Dm::new();
+    let mut state = public_state(&dm);
+    assert!(
+        state.entries().take_changes().is_empty(),
+        "stored whole at creation"
+    );
+    let kinds = |changes: &[super::public::Change]| {
+        let mut written = Vec::new();
+        let mut deleted = Vec::new();
+        for change in changes {
+            match change {
+                super::public::Change::Write(entry) => written.push(entry.kind),
+                super::public::Change::Delete { kind, .. } => deleted.push(*kind),
+            }
+        }
+        written.sort_unstable();
+        deleted.sort_unstable();
+        (written, deleted)
+    };
+
+    let bob2 = state.leaf_of(dm.devices[3].leaf()).unwrap();
+    let proposal = state
+        .remove(bob2, &ServerSigner::new(&dm.server))
+        .unwrap()
+        .unwrap();
+    dm.deliver_all(&proposal, &[]);
+    // The proposal queue (5) and the proposal (6).
+    assert_eq!(kinds(&state.entries().take_changes()), (vec![5, 6], vec![]));
+    assert!(state.entries().take_changes().is_empty());
+
+    // Applying the changes to the stored rows gives the state's rows.
+    let mut stored: HashMap<(i16, Vec<u8>), Vec<u8>> = state
+        .entries()
+        .entries()
+        .into_iter()
+        .map(|entry| ((entry.kind, entry.key), entry.value))
+        .collect();
+    let commit = update(&mut dm, 1);
+    let merged = accept(&dm, &mut state, &dm.devices[1], &commit);
+    assert!(merged.reissued.is_empty(), "a member's commit carried it");
+    let changes = state.entries().take_changes();
+    // Tree, context, transcript hash and tag written; the queue emptied.
+    assert_eq!(kinds(&changes), (vec![1, 2, 3, 4], vec![5, 6]));
+    for change in changes {
+        match change {
+            super::public::Change::Write(entry) => {
+                stored.insert((entry.kind, entry.key), entry.value);
+            }
+            super::public::Change::Delete { kind, key } => {
+                stored.remove(&(kind, key));
+            }
+        }
+    }
+    let rows: HashMap<_, _> = state
+        .entries()
+        .entries()
+        .into_iter()
+        .map(|entry| ((entry.kind, entry.key), entry.value))
+        .collect();
+    assert_eq!(stored, rows);
+}
+
+const PUBLIC_FIXTURE: &str = "fixtures/public-state-v1.txt";
+
+fn public_fixture_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PUBLIC_FIXTURE)
+}
+
+/// Section 13, on the server: rows written by the first release of the
+/// public state still load after an OpenMLS upgrade.
+#[test]
+fn a_public_state_written_by_the_first_release_still_loads() {
+    let text = std::fs::read_to_string(public_fixture_path()).unwrap();
+    let entries = text.lines().map(|line| {
+        let mut fields = line.split(' ');
+        let mut field = || fields.next().unwrap();
+        let kind = field().parse().unwrap();
+        let key = data_encoding::HEXLOWER.decode(field().as_bytes()).unwrap();
+        let value = data_encoding::HEXLOWER.decode(field().as_bytes()).unwrap();
+        super::public::Entry { kind, key, value }
+    });
+    let state = PublicState::load(
+        identity(),
+        PublicEntries::load(identity(), entries).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state.epoch(), 2);
+    assert_eq!(state.devices().len(), 4);
+    assert_eq!(state.pending_removals().unwrap().len(), 1);
+}
+
+/// Writes the fixture above. Run once, when the format of the rows is
+/// created; never to make the test above pass.
+#[test]
+#[ignore = "writes fixtures/public-state-v1.txt"]
+fn write_the_public_state_fixture_of_the_first_release() {
+    let path = public_fixture_path();
+    assert!(!path.exists(), "the fixture exists and is frozen");
+    let mut dm = Dm::new();
+    let mut state = public_state(&dm);
+    let commit = update(&mut dm, 2);
+    accept(&dm, &mut state, &dm.devices[2], &commit);
+    let bob2 = state.leaf_of(dm.devices[3].leaf()).unwrap();
+    state.remove(bob2, &ServerSigner::new(&dm.server)).unwrap();
+    let mut text = String::new();
+    for entry in state.entries().entries() {
+        text.push_str(&format!(
+            "{} {} {}\n",
+            entry.kind,
+            data_encoding::HEXLOWER.encode(&entry.key),
+            data_encoding::HEXLOWER.encode(&entry.value)
+        ));
+    }
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
 }
 
 // --- Serialization round trips ------------------------------------------------------------

@@ -18,12 +18,20 @@ use crate::identity::{DevicePublicKey, ID_LEN, IdentityPublicKey, certificate_cl
 /// Who may be in a conversation, and which identity key to trust for each.
 ///
 /// On a client: the participants of the conversation and their pinned keys
-/// (ADR 0019, section 10). On the server: the participants and
-/// `users.identity_key`.
+/// (ADR 0019, section 10). On the server: the participants,
+/// `users.identity_key`, and their active devices.
 pub trait Roster {
     /// The account identity key trusted for `user_id`, if that user takes
     /// part in the conversation; `None` otherwise.
     fn identity_key(&self, user_id: &[u8; ID_LEN]) -> Option<IdentityPublicKey>;
+
+    /// Whether `device`, certified by its user, may hold a leaf. A client
+    /// cannot know more than the certificate: any device. The server also
+    /// requires an active device of that user (ADR 0019, section 2).
+    fn accepts_device(&self, device: &VerifiedLeaf) -> bool {
+        let _ = device;
+        true
+    }
 }
 
 /// A leaf whose certificate was verified.
@@ -63,6 +71,10 @@ pub enum LeafError {
     /// A leaf was replaced by the leaf of another device.
     #[error("a leaf was replaced by another device")]
     DeviceChanged,
+    /// Certified, but not an active device of its user: revoked, or unknown
+    /// to the server ([`Roster::accepts_device`]).
+    #[error("the device is not an active device of its user")]
+    InactiveDevice,
 }
 
 /// The credential of this device, with its signature key.
@@ -102,10 +114,14 @@ pub fn verify_leaf(
     if verified.device_key.to_bytes().as_slice() != signature_key {
         return Err(LeafError::KeyMismatch);
     }
-    Ok(VerifiedLeaf {
+    let leaf = VerifiedLeaf {
         user_id: verified.user_id,
         device_id: verified.device_id,
-    })
+    };
+    if !roster.accepts_device(&leaf) {
+        return Err(LeafError::InactiveDevice);
+    }
+    Ok(leaf)
 }
 
 /// Checks every leaf of a group, and that no device (user id and device id)

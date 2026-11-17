@@ -1,0 +1,896 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! The server's view of a group (ADR 0019, sections 4 to 7 and 14).
+//!
+//! OpenMLS keeps a group's public state without any secret: the ratchet
+//! tree, the group context, the confirmation tag and the interim transcript
+//! hash, and the stored proposals. The server builds it from the GroupInfo
+//! submitted with a group's first commit, checks every later commit against
+//! it with the same policy as the clients, merges it once accepted, and
+//! signs its own `Remove` proposals. Nothing here decrypts anything.
+//!
+//! The state is made of rows ([`PublicEntries`]): the server loads a group's
+//! rows at the start of a request and writes back those that changed in the
+//! transaction that moves the epoch.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use openmls::messages::group_info::VerifiableGroupInfo;
+use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
+use openmls::prelude::{
+    ContentType, ExternalProposal, ExternalSendersExtension, LeafNodeIndex, MlsMessageBodyIn,
+    MlsMessageIn, MlsMessageOut, OpenMlsSignaturePublicKey, ProcessedMessageContent, ProposalStore,
+    ProtocolMessage, PublicGroup, PublicProcessMessageError, Sender, SenderExtensionIndex,
+    StagedCommit, Verifiable,
+};
+use openmls_rust_crypto::RustCrypto;
+use openmls_traits::public_storage::PublicStorageProvider;
+use openmls_traits::storage::CURRENT_VERSION;
+use openmls_traits::types::SignatureScheme;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use super::credential::{LeafError, Roster, VerifiedLeaf, name_leaf, verify_members};
+use super::group::{ExpectedGroup, check_context};
+use super::group_id::GroupIdentity;
+use super::no_storage::NoProvider;
+use super::policy::{self, Alarm, GroupView};
+use super::{MembershipChanges, MlsError, Refusal, ServerSigner, library};
+use crate::identity::PUBLIC_KEY_LEN;
+
+/// What a row holds. The numbers are stored: never change or reuse one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    Tree,
+    Context,
+    InterimTranscriptHash,
+    ConfirmationTag,
+    /// The references of the stored proposals, in order.
+    ProposalQueue,
+    /// One stored proposal, keyed by its reference.
+    Proposal,
+}
+
+impl Kind {
+    const ALL: [Self; 6] = [
+        Self::Tree,
+        Self::Context,
+        Self::InterimTranscriptHash,
+        Self::ConfirmationTag,
+        Self::ProposalQueue,
+        Self::Proposal,
+    ];
+
+    fn code(self) -> i16 {
+        match self {
+            Self::Tree => 1,
+            Self::Context => 2,
+            Self::InterimTranscriptHash => 3,
+            Self::ConfirmationTag => 4,
+            Self::ProposalQueue => 5,
+            Self::Proposal => 6,
+        }
+    }
+
+    fn from_code(code: i16) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.code() == code)
+    }
+}
+
+/// One row of a group's public state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// What the row holds: a small number, stable across releases.
+    pub kind: i16,
+    /// Within its kind: empty, or a proposal's reference.
+    pub key: Vec<u8>,
+    /// The value, as OpenMLS serialises it (JSON).
+    pub value: Vec<u8>,
+}
+
+/// A row to write back after an operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Insert the row, or replace it.
+    Write(Entry),
+    /// Delete the row.
+    Delete {
+        /// Its kind.
+        kind: i16,
+        /// Its key.
+        key: Vec<u8>,
+    },
+}
+
+/// Why OpenMLS could not read or write a row.
+#[derive(Debug, thiserror::Error)]
+pub enum EntriesError {
+    /// The row belongs to another group than these entries'.
+    #[error("an entry of another group")]
+    OtherGroup,
+    /// A value could not be encoded or decoded.
+    #[error("an entry cannot be encoded or decoded: {0}")]
+    Encoding(String),
+}
+
+fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, EntriesError> {
+    serde_json::to_vec(value).map_err(|error| EntriesError::Encoding(error.to_string()))
+}
+
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, EntriesError> {
+    serde_json::from_slice(bytes).map_err(|error| EntriesError::Encoding(error.to_string()))
+}
+
+/// A row's place: its kind and its key.
+type Place = (Kind, Vec<u8>);
+
+/// The rows of one group's public state, read and written by OpenMLS
+/// through [`PublicStorageProvider`]. They remember which rows changed, for
+/// the server to write back ([`PublicEntries::take_changes`]).
+#[derive(Debug)]
+pub struct PublicEntries {
+    /// The group id, as OpenMLS serialises it as a key.
+    group_key: Vec<u8>,
+    rows: RefCell<BTreeMap<Place, Vec<u8>>>,
+    changed: RefCell<BTreeSet<Place>>,
+}
+
+impl PublicEntries {
+    /// No rows yet: a group about to be created.
+    pub fn new(identity: GroupIdentity) -> Result<Self, MlsError> {
+        Ok(Self {
+            group_key: encode(&identity.to_group_id()).map_err(library)?,
+            rows: RefCell::default(),
+            changed: RefCell::default(),
+        })
+    }
+
+    /// The rows of a group, as the server stored them.
+    pub fn load(
+        identity: GroupIdentity,
+        entries: impl IntoIterator<Item = Entry>,
+    ) -> Result<Self, MlsError> {
+        let loaded = Self::new(identity)?;
+        {
+            let mut rows = loaded.rows.borrow_mut();
+            for entry in entries {
+                let kind = Kind::from_code(entry.kind).ok_or(MlsError::Malformed)?;
+                rows.insert((kind, entry.key), entry.value);
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Every row: for a group the server stores for the first time.
+    pub fn entries(&self) -> Vec<Entry> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|((kind, key), value)| Entry {
+                kind: kind.code(),
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    /// The rows written or deleted since the last call, to write back.
+    pub fn take_changes(&self) -> Vec<Change> {
+        let rows = self.rows.borrow();
+        std::mem::take(&mut *self.changed.borrow_mut())
+            .into_iter()
+            .map(|(kind, key)| match rows.get(&(kind, key.clone())) {
+                Some(value) => Change::Write(Entry {
+                    kind: kind.code(),
+                    key,
+                    value: value.clone(),
+                }),
+                None => Change::Delete {
+                    kind: kind.code(),
+                    key,
+                },
+            })
+            .collect()
+    }
+
+    fn check<T: Serialize + ?Sized>(&self, group_id: &T) -> Result<(), EntriesError> {
+        if encode(group_id)? == self.group_key {
+            Ok(())
+        } else {
+            Err(EntriesError::OtherGroup)
+        }
+    }
+
+    fn put(&self, kind: Kind, key: Vec<u8>, value: Vec<u8>) {
+        self.rows.borrow_mut().insert((kind, key.clone()), value);
+        self.changed.borrow_mut().insert((kind, key));
+    }
+
+    fn get<T: DeserializeOwned>(&self, kind: Kind, key: &[u8]) -> Result<Option<T>, EntriesError> {
+        self.rows
+            .borrow()
+            .get(&(kind, key.to_vec()))
+            .map(|value| decode(value))
+            .transpose()
+    }
+
+    fn remove(&self, kind: Kind, key: Vec<u8>) {
+        self.rows.borrow_mut().remove(&(kind, key.clone()));
+        self.changed.borrow_mut().insert((kind, key));
+    }
+
+    fn queue(&self) -> Result<Vec<serde_json::Value>, EntriesError> {
+        Ok(self.get(Kind::ProposalQueue, &[])?.unwrap_or_default())
+    }
+
+    fn set_queue(&self, queue: &[serde_json::Value]) -> Result<(), EntriesError> {
+        if queue.is_empty() {
+            self.remove(Kind::ProposalQueue, Vec::new());
+        } else {
+            self.put(Kind::ProposalQueue, Vec::new(), encode(queue)?);
+        }
+        Ok(())
+    }
+}
+
+impl PublicStorageProvider<CURRENT_VERSION> for PublicEntries {
+    type PublicError = EntriesError;
+
+    fn write_tree<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        TreeSync: openmls_traits::storage::traits::TreeSync<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        tree: &TreeSync,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.put(Kind::Tree, Vec::new(), encode(tree)?);
+        Ok(())
+    }
+
+    fn write_interim_transcript_hash<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        InterimTranscriptHash: openmls_traits::storage::traits::InterimTranscriptHash<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        interim_transcript_hash: &InterimTranscriptHash,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.put(
+            Kind::InterimTranscriptHash,
+            Vec::new(),
+            encode(interim_transcript_hash)?,
+        );
+        Ok(())
+    }
+
+    fn write_context<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        GroupContext: openmls_traits::storage::traits::GroupContext<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        group_context: &GroupContext,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.put(Kind::Context, Vec::new(), encode(group_context)?);
+        Ok(())
+    }
+
+    fn write_confirmation_tag<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        ConfirmationTag: openmls_traits::storage::traits::ConfirmationTag<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        confirmation_tag: &ConfirmationTag,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.put(Kind::ConfirmationTag, Vec::new(), encode(confirmation_tag)?);
+        Ok(())
+    }
+
+    fn queue_proposal<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<CURRENT_VERSION>,
+        QueuedProposal: openmls_traits::storage::traits::QueuedProposal<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        proposal_ref: &ProposalRef,
+        proposal: &QueuedProposal,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        let reference = serde_json::to_value(proposal_ref)
+            .map_err(|error| EntriesError::Encoding(error.to_string()))?;
+        self.put(Kind::Proposal, encode(proposal_ref)?, encode(proposal)?);
+        let mut queue = self.queue()?;
+        if !queue.contains(&reference) {
+            queue.push(reference);
+            self.set_queue(&queue)?;
+        }
+        Ok(())
+    }
+
+    fn queued_proposals<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<CURRENT_VERSION>,
+        QueuedProposal: openmls_traits::storage::traits::QueuedProposal<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(ProposalRef, QueuedProposal)>, EntriesError> {
+        self.check(group_id)?;
+        let references: Vec<ProposalRef> = self.get(Kind::ProposalQueue, &[])?.unwrap_or_default();
+        references
+            .into_iter()
+            .map(|reference| {
+                let proposal = self
+                    .get(Kind::Proposal, &encode(&reference)?)?
+                    .ok_or_else(|| EntriesError::Encoding("a queued proposal is missing".into()))?;
+                Ok((reference, proposal))
+            })
+            .collect()
+    }
+
+    fn tree<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        TreeSync: openmls_traits::storage::traits::TreeSync<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<TreeSync>, EntriesError> {
+        self.check(group_id)?;
+        self.get(Kind::Tree, &[])
+    }
+
+    fn group_context<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        GroupContext: openmls_traits::storage::traits::GroupContext<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<GroupContext>, EntriesError> {
+        self.check(group_id)?;
+        self.get(Kind::Context, &[])
+    }
+
+    fn interim_transcript_hash<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        InterimTranscriptHash: openmls_traits::storage::traits::InterimTranscriptHash<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<InterimTranscriptHash>, EntriesError> {
+        self.check(group_id)?;
+        self.get(Kind::InterimTranscriptHash, &[])
+    }
+
+    fn confirmation_tag<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        ConfirmationTag: openmls_traits::storage::traits::ConfirmationTag<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<ConfirmationTag>, EntriesError> {
+        self.check(group_id)?;
+        self.get(Kind::ConfirmationTag, &[])
+    }
+
+    fn delete_tree<GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.remove(Kind::Tree, Vec::new());
+        Ok(())
+    }
+
+    fn delete_confirmation_tag<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.remove(Kind::ConfirmationTag, Vec::new());
+        Ok(())
+    }
+
+    fn delete_context<GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.remove(Kind::Context, Vec::new());
+        Ok(())
+    }
+
+    fn delete_interim_transcript_hash<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        self.remove(Kind::InterimTranscriptHash, Vec::new());
+        Ok(())
+    }
+
+    fn remove_proposal<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        proposal_ref: &ProposalRef,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        let reference = serde_json::to_value(proposal_ref)
+            .map_err(|error| EntriesError::Encoding(error.to_string()))?;
+        let mut queue = self.queue()?;
+        queue.retain(|queued| *queued != reference);
+        self.set_queue(&queue)?;
+        self.remove(Kind::Proposal, encode(proposal_ref)?);
+        Ok(())
+    }
+
+    fn clear_proposal_queue<
+        GroupId: openmls_traits::storage::traits::GroupId<CURRENT_VERSION>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), EntriesError> {
+        self.check(group_id)?;
+        let stored: Vec<Vec<u8>> = self
+            .rows
+            .borrow()
+            .keys()
+            .filter(|(kind, _)| *kind == Kind::Proposal)
+            .map(|(_, key)| key.clone())
+            .collect();
+        for key in stored {
+            self.remove(Kind::Proposal, key);
+        }
+        self.remove(Kind::ProposalQueue, Vec::new());
+        Ok(())
+    }
+}
+
+/// The policy's view of a public group, with its stored proposals.
+struct PublicView<'a> {
+    group: &'a PublicGroup,
+    requested: HashSet<LeafNodeIndex>,
+}
+
+impl GroupView for PublicView<'_> {
+    fn device_at(&self, index: LeafNodeIndex) -> Option<VerifiedLeaf> {
+        self.group
+            .leaf(index)
+            .and_then(|leaf| name_leaf(leaf.credential()))
+    }
+
+    fn leaves(&self) -> Vec<(LeafNodeIndex, VerifiedLeaf)> {
+        policy::named_leaves(self.group.members())
+    }
+
+    fn external_senders(&self) -> Option<&ExternalSendersExtension> {
+        self.group.group_context().extensions().external_senders()
+    }
+
+    fn requested_removals(&self) -> HashSet<LeafNodeIndex> {
+        self.requested.clone()
+    }
+}
+
+/// A commit the server accepts, once checked: merged with
+/// [`PublicState::merge`] in the transaction that moves the epoch.
+#[derive(Debug)]
+pub struct ValidatedCommit {
+    staged: StagedCommit,
+    changes: MembershipChanges,
+    removed: HashSet<LeafNodeIndex>,
+    group_info: Vec<u8>,
+}
+
+impl ValidatedCommit {
+    /// Who joins and who leaves.
+    pub fn changes(&self) -> &MembershipChanges {
+        &self.changes
+    }
+
+    /// The epoch the commit starts.
+    pub fn epoch(&self) -> u64 {
+        self.staged.epoch().as_u64()
+    }
+}
+
+/// A commit merged into the public state.
+#[derive(Debug)]
+pub struct MergedCommit {
+    /// Who joined and who left.
+    pub changes: MembershipChanges,
+    /// The new epoch.
+    pub epoch: u64,
+    /// The GroupInfo of the new epoch, checked: the one to keep for devices
+    /// that join by external commit.
+    pub group_info: Vec<u8>,
+    /// The server's removals that the commit did not carry (an external
+    /// commit cannot), signed again for the new epoch: to append to the
+    /// conversation's sequence right after the commit (sections 5 and 6).
+    pub reissued: Vec<Vec<u8>>,
+}
+
+/// The public state of one group, on the server.
+pub struct PublicState {
+    group: PublicGroup,
+    entries: PublicEntries,
+    crypto: RustCrypto,
+}
+
+impl std::fmt::Debug for PublicState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicState")
+            .field("epoch", &self.epoch())
+            .field("devices", &self.devices().len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn parse_group_info(bytes: &[u8]) -> Result<VerifiableGroupInfo, MlsError> {
+    let (message, rest) =
+        MlsMessageIn::tls_deserialize_bytes(bytes).map_err(|_| MlsError::Malformed)?;
+    if !rest.is_empty() {
+        return Err(MlsError::Malformed);
+    }
+    match message.extract() {
+        MlsMessageBodyIn::GroupInfo(info) => Ok(info),
+        _ => Err(MlsError::Malformed),
+    }
+}
+
+/// A public group from a GroupInfo and its ratchet tree. OpenMLS checks the
+/// GroupInfo's signature by its signer's leaf, the tree against the group
+/// context's tree hash, and every leaf.
+fn group_from_info(
+    crypto: &RustCrypto,
+    entries: &PublicEntries,
+    info: VerifiableGroupInfo,
+) -> Result<PublicGroup, String> {
+    let tree = info
+        .extensions()
+        .ratchet_tree()
+        .ok_or_else(|| "the GroupInfo has no ratchet tree".to_owned())?
+        .ratchet_tree()
+        .clone();
+    PublicGroup::from_external(crypto, entries, tree, info, ProposalStore::new())
+        .map(|(group, _)| group)
+        .map_err(|error| error.to_string())
+}
+
+/// Whether `info` is signed by `device`'s leaf in `group`.
+fn signed_by(
+    crypto: &RustCrypto,
+    group: &PublicGroup,
+    info: VerifiableGroupInfo,
+    device: VerifiedLeaf,
+) -> bool {
+    let Some(key) = group
+        .members()
+        .find(|member| name_leaf(&member.credential) == Some(device))
+        .map(|member| member.signature_key)
+    else {
+        return false;
+    };
+    OpenMlsSignaturePublicKey::new(key.into(), SignatureScheme::ED25519)
+        .is_ok_and(|key| info.verify(crypto, &key).is_ok())
+}
+
+/// A commit the server refuses, as one of the client's alarms would say.
+fn refused(alarm: Alarm) -> MlsError {
+    match alarm {
+        Alarm::Leaf(error) => MlsError::Leaf(error),
+        Alarm::Policy(error) => MlsError::Policy(error),
+        Alarm::UnknownProposal => MlsError::Invalid(alarm.to_string()),
+        Alarm::InvalidCommit(text) => MlsError::Invalid(text),
+    }
+}
+
+fn public_error(error: PublicProcessMessageError) -> MlsError {
+    match error {
+        PublicProcessMessageError::LibraryError(error) => library(error),
+        other => MlsError::Invalid(other.to_string()),
+    }
+}
+
+fn to_bytes(message: &MlsMessageOut) -> Result<Vec<u8>, MlsError> {
+    message.tls_serialize_detached().map_err(library)
+}
+
+impl PublicState {
+    /// Builds the state from the GroupInfo submitted with a group's first
+    /// commit (epoch 1): the server has no state of epoch 0 to check that
+    /// commit against (section 4). The group must be the expected one with
+    /// Tavern's parameters; every leaf an active, certified device of a
+    /// participant (a participant may have none); the GroupInfo signed by
+    /// the submitting device, which is in the group. Returns its devices.
+    pub fn create(
+        group_info: &[u8],
+        expected: &ExpectedGroup<'_>,
+        submitter: VerifiedLeaf,
+        roster: &impl Roster,
+        external_sender: &[u8; PUBLIC_KEY_LEN],
+    ) -> Result<(Self, Vec<VerifiedLeaf>), MlsError> {
+        let crypto = RustCrypto::default();
+        let info = parse_group_info(group_info)?;
+        let context = info.group_context();
+        check_context(
+            context.ciphersuite(),
+            context.group_id(),
+            context.extensions(),
+            expected,
+            external_sender,
+        )?;
+        if info.epoch().as_u64() != 1 {
+            return Err(MlsError::UnexpectedGroup);
+        }
+        let entries = PublicEntries::new(expected.identity)?;
+        let group = group_from_info(&crypto, &entries, info).map_err(MlsError::Invalid)?;
+        let members: Vec<_> = group.members().collect();
+        let devices = verify_members(
+            members
+                .iter()
+                .map(|member| (&member.credential, member.signature_key.as_slice())),
+            roster,
+        )?;
+        expected.check_members(&devices)?;
+        if !signed_by(&crypto, &group, parse_group_info(group_info)?, submitter) {
+            return Err(MlsError::WrongSender);
+        }
+        // `from_external` wrote the state into the entries: they are to be
+        // stored whole ([`PublicEntries::entries`]), not as changes.
+        entries.take_changes();
+        Ok((
+            Self {
+                group,
+                entries,
+                crypto,
+            },
+            devices,
+        ))
+    }
+
+    /// The state the server stored for `identity`.
+    pub fn load(identity: GroupIdentity, entries: PublicEntries) -> Result<Self, MlsError> {
+        let group = PublicGroup::load(&entries, &identity.to_group_id())
+            .map_err(library)?
+            .ok_or(MlsError::Malformed)?;
+        Ok(Self {
+            group,
+            entries,
+            crypto: RustCrypto::default(),
+        })
+    }
+
+    /// The rows, to store or to write back.
+    pub fn entries(&self) -> &PublicEntries {
+        &self.entries
+    }
+
+    /// Which conversation and generation.
+    pub fn identity(&self) -> Result<GroupIdentity, MlsError> {
+        GroupIdentity::from_group_id(self.group.group_id())
+    }
+
+    /// The current epoch.
+    pub fn epoch(&self) -> u64 {
+        self.group.group_context().epoch().as_u64()
+    }
+
+    /// The devices in the group.
+    pub fn devices(&self) -> Vec<VerifiedLeaf> {
+        policy::named_leaves(self.group.members())
+            .into_iter()
+            .map(|(_, leaf)| leaf)
+            .collect()
+    }
+
+    /// The leaf of a device, if it is in the group.
+    pub fn leaf_of(&self, device: VerifiedLeaf) -> Option<LeafNodeIndex> {
+        policy::named_leaves(self.group.members())
+            .into_iter()
+            .find_map(|(index, leaf)| (leaf == device).then_some(index))
+    }
+
+    fn view(&self) -> Result<PublicView<'_>, MlsError> {
+        let queued = self
+            .group
+            .queued_proposals(&self.entries)
+            .map_err(library)?;
+        Ok(PublicView {
+            group: &self.group,
+            requested: policy::requested_by_server(queued.iter().map(|(_, proposal)| proposal)),
+        })
+    }
+
+    /// The leaves the server has asked to remove, not committed yet.
+    pub fn pending_removals(&self) -> Result<Vec<LeafNodeIndex>, MlsError> {
+        let mut pending: Vec<_> = self.view()?.requested.into_iter().collect();
+        pending.sort_by_key(LeafNodeIndex::u32);
+        Ok(pending)
+    }
+
+    /// Checks a commit submitted by `submitter` for the current epoch, with
+    /// the GroupInfo of its new epoch. Refused: another epoch (`STALE_EPOCH`
+    /// for a past one), a commit that is not the submitter's own, anything
+    /// OpenMLS finds invalid against the public state, anything the clients'
+    /// policy refuses (sections 2, 5 and 6), a device of anyone but the
+    /// participants, a member's commit that leaves out a removal the server
+    /// asked for (`REMOVAL_PENDING`), and a GroupInfo that is not the new
+    /// epoch's, signed by the committer.
+    pub fn validate_commit(
+        &self,
+        commit: &[u8],
+        group_info: &[u8],
+        submitter: VerifiedLeaf,
+        expected: &ExpectedGroup<'_>,
+        roster: &impl Roster,
+    ) -> Result<ValidatedCommit, MlsError> {
+        let (message, rest) =
+            MlsMessageIn::tls_deserialize_bytes(commit).map_err(|_| MlsError::Malformed)?;
+        if !rest.is_empty() {
+            return Err(MlsError::Malformed);
+        }
+        let protocol: ProtocolMessage = message
+            .try_into_protocol_message()
+            .map_err(|_| MlsError::Malformed)?;
+        if !matches!(protocol, ProtocolMessage::PublicMessage(_))
+            || protocol.content_type() != ContentType::Commit
+        {
+            return Err(MlsError::Malformed);
+        }
+        if protocol.group_id() != self.group.group_id() {
+            return Err(MlsError::Refused(Refusal::WrongGroup));
+        }
+        let (epoch, current) = (protocol.epoch(), self.group.group_context().epoch());
+        if epoch < current {
+            return Err(MlsError::Refused(Refusal::PastEpoch));
+        }
+        if epoch > current {
+            return Err(MlsError::Refused(Refusal::WrongEpoch));
+        }
+
+        let processed = self
+            .group
+            .process_message(&self.crypto, protocol)
+            .map_err(public_error)?;
+        let sender = processed.sender().clone();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Err(MlsError::Malformed);
+        };
+        let view = self.view()?;
+        // A device submits its own commits only.
+        let committer = match &sender {
+            Sender::Member(index) => view.device_at(*index),
+            Sender::NewMemberCommit => staged
+                .update_path_leaf_node()
+                .and_then(|leaf| name_leaf(leaf.credential())),
+            Sender::External(_) | Sender::NewMemberProposal => None,
+        };
+        if committer != Some(submitter) {
+            return Err(MlsError::WrongSender);
+        }
+        let changes = policy::check_commit(&view, &staged, &sender, roster).map_err(refused)?;
+        expected.check_members(&changes.added)?;
+
+        let removed: HashSet<LeafNodeIndex> = staged
+            .remove_proposals()
+            .map(|remove| remove.remove_proposal().removed())
+            .collect();
+        let external = matches!(sender, Sender::NewMemberCommit);
+        if !external && !view.requested.is_subset(&removed) {
+            return Err(MlsError::RemovalPending);
+        }
+
+        let info = parse_group_info(group_info)?;
+        if info.group_context() != staged.group_context() {
+            return Err(MlsError::GroupInfo);
+        }
+        let scratch = PublicEntries::new(GroupIdentity::from_group_id(self.group.group_id())?)?;
+        let next =
+            group_from_info(&self.crypto, &scratch, info).map_err(|_| MlsError::GroupInfo)?;
+        if !signed_by(
+            &self.crypto,
+            &next,
+            parse_group_info(group_info)?,
+            submitter,
+        ) {
+            return Err(MlsError::GroupInfo);
+        }
+
+        Ok(ValidatedCommit {
+            staged: *staged,
+            changes,
+            removed,
+            group_info: group_info.to_vec(),
+        })
+    }
+
+    /// Merges a commit [`PublicState::validate_commit`] accepted, in the
+    /// transaction that moves the epoch. The server's removals the commit
+    /// did not carry are signed again for the new epoch (section 6): after a
+    /// member's commit there are none (it had to carry them), after an
+    /// external commit there are all but the joining device's own earlier
+    /// leaf, which the commit removed (a resync).
+    pub fn merge(
+        &mut self,
+        validated: ValidatedCommit,
+        signer: &ServerSigner<'_>,
+    ) -> Result<MergedCommit, MlsError> {
+        let pending = self.pending_removals()?;
+        self.group
+            .merge_commit(&self.entries, validated.staged)
+            .map_err(library)?;
+        let mut reissued = Vec::new();
+        for leaf in pending {
+            if !validated.removed.contains(&leaf)
+                && let Some(proposal) = self.remove(leaf, signer)?
+            {
+                reissued.push(proposal);
+            }
+        }
+        Ok(MergedCommit {
+            changes: validated.changes,
+            epoch: self.epoch(),
+            group_info: validated.group_info,
+            reissued,
+        })
+    }
+
+    /// The server's `Remove` of the leaf `leaf` for the current epoch,
+    /// signed with the external sender key and stored, to deliver in the
+    /// conversation's sequence (section 6). `None` if the server already
+    /// asked for it in this epoch.
+    pub fn remove(
+        &mut self,
+        leaf: LeafNodeIndex,
+        signer: &ServerSigner<'_>,
+    ) -> Result<Option<Vec<u8>>, MlsError> {
+        if self.group.leaf(leaf).is_none() {
+            return Err(MlsError::Leaf(LeafError::Malformed));
+        }
+        if self.view()?.requested.contains(&leaf) {
+            return Ok(None);
+        }
+        let message = ExternalProposal::new_remove::<NoProvider>(
+            leaf,
+            self.group.group_id().clone(),
+            self.group.group_context().epoch(),
+            signer,
+            SenderExtensionIndex::new(0),
+        )
+        .map_err(library)?;
+        let bytes = to_bytes(&message)?;
+        // Through OpenMLS's own checks, like any proposal, then stored.
+        let (incoming, _) =
+            MlsMessageIn::tls_deserialize_bytes(&bytes).map_err(|_| MlsError::Malformed)?;
+        let protocol = incoming
+            .try_into_protocol_message()
+            .map_err(|_| MlsError::Malformed)?;
+        let processed = self
+            .group
+            .process_message(&self.crypto, protocol)
+            .map_err(public_error)?;
+        let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content() else {
+            return Err(MlsError::Malformed);
+        };
+        self.group
+            .add_proposal(&self.entries, *queued)
+            .map_err(library)?;
+        Ok(Some(bytes))
+    }
+}

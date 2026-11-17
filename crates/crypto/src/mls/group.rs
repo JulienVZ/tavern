@@ -116,7 +116,7 @@ pub struct ExpectedGroup<'a> {
 }
 
 impl ExpectedGroup<'_> {
-    fn check_members(&self, members: &[VerifiedLeaf]) -> Result<(), LeafError> {
+    pub(crate) fn check_members(&self, members: &[VerifiedLeaf]) -> Result<(), LeafError> {
         if members
             .iter()
             .any(|leaf| !self.participants.contains(&leaf.user_id))
@@ -166,7 +166,7 @@ fn own_key_package<P: OpenMlsProvider>(
 
 /// Checks the parameters of a group to join: ciphersuite, id, the
 /// instance's key as the only external sender, required capabilities.
-fn check_context(
+pub(crate) fn check_context(
     ciphersuite: openmls::prelude::Ciphersuite,
     group_id: &openmls::prelude::GroupId,
     extensions: &openmls::prelude::Extensions<openmls::prelude::GroupContext>,
