@@ -1883,10 +1883,33 @@ fn creating_a_group_writes_nothing_when_a_device_is_refused() {
     );
     assert!(storage_is_empty(&creator));
 
-    // Bob missing.
-    let result = create(&[], &expected());
+    // A device of a user outside the conversation, even a pinned one.
+    let carol = Account::new(3);
+    let carol1 = carol.device(0xc1);
+    let pins_with_carol = Pins::of(&[&alice, &bob, &carol]);
+    let result = Group::create(
+        &creator.provider,
+        &creator.signer(),
+        creator.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[bob1.claimed(&pins), carol1.claimed(&pins_with_carol)],
+        &pins_with_carol,
+    );
     assert!(
-        matches!(result, Err(MlsError::UnexpectedGroup)),
+        matches!(result, Err(MlsError::Leaf(LeafError::NotParticipant))),
+        "{result:?}"
+    );
+    assert!(storage_is_empty(&creator));
+
+    // The creator itself outside the conversation.
+    let between_bob_and_carol = ExpectedGroup {
+        identity: identity(),
+        participants: &[BOB, [3; ID_LEN]],
+    };
+    let result = create(&[bob1.claimed(&pins)], &between_bob_and_carol);
+    assert!(
+        matches!(result, Err(MlsError::Leaf(LeafError::NotParticipant))),
         "{result:?}"
     );
     assert!(storage_is_empty(&creator));
@@ -1894,6 +1917,143 @@ fn creating_a_group_writes_nothing_when_a_device_is_refused() {
     // And when everything is right, the group is written.
     create(&[bob1.claimed(&pins)], &expected()).unwrap();
     assert!(!storage_is_empty(&creator));
+}
+
+/// A participant may have no device in the group: Bob, away for longer than
+/// the inactivity period or with no active device, does not stop Alice from
+/// creating the DM, from joining it with a new device (by Welcome or by
+/// external commit), or from recreating it (sections 4, 15, 17).
+#[test]
+fn a_dm_lives_while_a_participant_has_no_device() {
+    let alice = Account::new(1);
+    let bob = Account::new(2);
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let (alice1, alice2, alice3) = (alice.device(0xa1), alice.device(0xa2), alice.device(0xa3));
+
+    // Created with no KeyPackage at all: Alice's only active device.
+    let (mut group1, created) = Group::create(
+        &alice1.provider,
+        &alice1.signer(),
+        alice1.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[],
+        &pins,
+    )
+    .unwrap();
+    assert!(created.welcome.is_none(), "nobody to welcome");
+    group1.merge_pending_commit(&alice1.provider).unwrap();
+    assert_eq!(group1.participants_without_devices(&PARTICIPANTS), [BOB]);
+
+    // Alice's new computer joins by external commit.
+    let (mut group2, joined, members) = Group::join_by_external_commit(
+        &alice2.provider,
+        &alice2.signer(),
+        alice2.credential(),
+        &created.group_info,
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    assert_eq!(members.len(), 2);
+    group2.merge_pending_commit(&alice2.provider).unwrap();
+    assert!(matches!(
+        group1
+            .process(&alice1.provider, &joined.commit, &pins)
+            .unwrap(),
+        Incoming::Commit { .. }
+    ));
+    let message = group1
+        .encrypt(&alice1.provider, &alice1.signer(), b"note to self")
+        .unwrap();
+    assert!(matches!(
+        group2.process(&alice2.provider, &message, &pins).unwrap(),
+        Incoming::Application { .. }
+    ));
+
+    // Another one, added by Welcome.
+    let added = group1
+        .add(
+            &alice1.provider,
+            &alice1.signer(),
+            &[alice3.claimed(&pins)],
+            &pins,
+        )
+        .unwrap();
+    group1.merge_pending_commit(&alice1.provider).unwrap();
+    group2
+        .process(&alice2.provider, &added.commit, &pins)
+        .unwrap();
+    let group3 = Group::join(
+        &alice3.provider,
+        &added.welcome.unwrap(),
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap()
+    .group;
+    assert_eq!(group3.participants_without_devices(&PARTICIPANTS), [BOB]);
+
+    // Bob comes back and joins by external commit: nobody is missing now.
+    let bob1 = bob.device(0xb1);
+    let (mut group_bob, bob_joined, _) = Group::join_by_external_commit(
+        &bob1.provider,
+        &bob1.signer(),
+        bob1.credential(),
+        &added.group_info,
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    group_bob.merge_pending_commit(&bob1.provider).unwrap();
+    group1
+        .process(&alice1.provider, &bob_joined.commit, &pins)
+        .unwrap();
+    assert!(
+        group1
+            .participants_without_devices(&PARTICIPANTS)
+            .is_empty()
+    );
+    let message = group1
+        .encrypt(&alice1.provider, &alice1.signer(), b"welcome back")
+        .unwrap();
+    match group_bob.process(&bob1.provider, &message, &pins).unwrap() {
+        Incoming::Application { content, .. } => assert_eq!(content.expose(), b"welcome back"),
+        other => panic!("{other:?}"),
+    }
+
+    // Recreated (generation 1) while Bob has no active device again.
+    let generation_1 = ExpectedGroup {
+        identity: identity().next().unwrap(),
+        participants: &PARTICIPANTS,
+    };
+    let (mut recreated, commit) = Group::create(
+        &alice1.provider,
+        &alice1.signer(),
+        alice1.credential(),
+        &generation_1,
+        &server.public_bytes(),
+        &[alice2.claimed(&pins)],
+        &pins,
+    )
+    .unwrap();
+    recreated.merge_pending_commit(&alice1.provider).unwrap();
+    let joined = Group::join(
+        &alice2.provider,
+        &commit.welcome.unwrap(),
+        &generation_1,
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        joined.group.participants_without_devices(&PARTICIPANTS),
+        [BOB]
+    );
 }
 
 #[test]
@@ -1925,7 +2085,13 @@ fn a_welcome_is_accepted_only_for_the_expected_group() {
             roster,
             &server.public_bytes(),
         )
-        .map(|joined| joined.group.delete(&joiner.provider).unwrap())
+        .map(|joined| {
+            let without = joined
+                .group
+                .participants_without_devices(expected.participants);
+            joined.group.delete(&joiner.provider).unwrap();
+            without
+        })
     };
 
     let next_generation = ExpectedGroup {
@@ -1959,14 +2125,12 @@ fn a_welcome_is_accepted_only_for_the_expected_group() {
         ),
         "{result:?}"
     );
+    // A participant with no device in the group is not a reason to refuse.
     let with_carol = ExpectedGroup {
         identity: identity(),
         participants: &[ALICE, BOB, [3; ID_LEN]],
     };
-    assert!(matches!(
-        attempt(&with_carol, &pins),
-        Err(MlsError::UnexpectedGroup)
-    ));
+    assert_eq!(attempt(&with_carol, &pins).unwrap(), [[3; ID_LEN]]);
     // A member outside the roster.
     let result = attempt(&expected(), &Pins::of(&[&bob]));
     assert!(
@@ -1977,7 +2141,7 @@ fn a_welcome_is_accepted_only_for_the_expected_group() {
         "{result:?}"
     );
     // The right one.
-    attempt(&expected(), &pins).unwrap();
+    assert!(attempt(&expected(), &pins).unwrap().is_empty());
 }
 
 #[test]

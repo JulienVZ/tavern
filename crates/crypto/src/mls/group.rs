@@ -99,25 +99,27 @@ pub enum Incoming {
 }
 
 /// The group a device expects to create or join: which conversation and
-/// generation, and which users take part. Anything else is refused, such as
-/// an old Welcome replayed after the group was recreated.
+/// generation, and which users take part. Another conversation or
+/// generation is refused (an old Welcome replayed after the group was
+/// recreated), and so is a device of anyone else.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpectedGroup<'a> {
     /// The conversation and generation.
     pub identity: GroupIdentity,
-    /// The users of the conversation; each must have a device in the group,
-    /// and nobody else may.
+    /// The users of the conversation: nobody else may have a device in the
+    /// group. A participant may have none (no active device when the group
+    /// was made, or all removed since): it joins later by external commit,
+    /// and until then [`Group::participants_without_devices`] names it.
     pub participants: &'a [[u8; ID_LEN]],
 }
 
 impl ExpectedGroup<'_> {
-    fn check_members(&self, members: &[VerifiedLeaf]) -> Result<(), MlsError> {
-        let users: HashSet<_> = members.iter().map(|leaf| leaf.user_id).collect();
-        if users.iter().any(|user| !self.participants.contains(user)) {
-            return Err(Alarm::Leaf(LeafError::NotParticipant).into());
-        }
-        if self.participants.iter().any(|user| !users.contains(user)) {
-            return Err(MlsError::UnexpectedGroup);
+    fn check_members(&self, members: &[VerifiedLeaf]) -> Result<(), LeafError> {
+        if members
+            .iter()
+            .any(|leaf| !self.participants.contains(&leaf.user_id))
+        {
+            return Err(LeafError::NotParticipant);
         }
         Ok(())
     }
@@ -263,11 +265,12 @@ fn own_commit_error(alarm: Alarm) -> MlsError {
 
 impl Group {
     /// Creates the group of a conversation and adds `key_packages` (the
-    /// other devices of this user and the peer's devices) in one commit,
-    /// which stays pending. Everything is checked before anything is written:
-    /// every device passes the roster (the server hands the packages out,
-    /// and could slip in a device of its own), no device appears twice, and
-    /// the devices are exactly those of the expected participants.
+    /// other devices of this user and the peer's devices, possibly none) in
+    /// one commit, which stays pending. Everything is checked before anything
+    /// is written: every device passes the roster (the server hands the
+    /// packages out, and could slip in a device of its own), no device
+    /// appears twice, and every device, this one included, is a device of
+    /// an expected participant.
     pub fn create<P: OpenMlsProvider>(
         provider: &P,
         signer: &DeviceSigner<'_>,
@@ -284,12 +287,7 @@ impl Group {
         )?;
         let mut members = vec![own];
         members.extend(check_key_packages(key_packages, roster, &[own])?);
-        expected
-            .check_members(&members)
-            .map_err(|error| match error {
-                MlsError::Alarm(Alarm::Leaf(leaf)) => MlsError::Leaf(leaf),
-                other => other,
-            })?;
+        expected.check_members(&members)?;
 
         let config = create_config(external_sender)?;
         let inner = MlsGroup::new_with_group_id(
@@ -389,7 +387,7 @@ impl Group {
             roster,
         )
         .map_err(Alarm::from)?;
-        expected.check_members(&members)?;
+        expected.check_members(&members).map_err(Alarm::from)?;
         let inner = staged.into_group(provider).map_err(library)?;
         let last_resort_used = match own {
             Some((reference, true)) => {
@@ -458,7 +456,12 @@ impl Group {
             )
             .map_err(|error| MlsError::Alarm(error.into()))
         })
-        .and_then(|members| expected.check_members(&members).map(|()| members));
+        .and_then(|members| {
+            expected
+                .check_members(&members)
+                .map_err(|error| MlsError::Alarm(error.into()))
+                .map(|()| members)
+        });
         match checked {
             Ok(verified) => Ok((group, commit_from_bundle(bundle)?, verified)),
             Err(error) => {
@@ -490,6 +493,22 @@ impl Group {
         self.inner
             .members()
             .filter_map(|member| name_leaf(&member.credential))
+            .collect()
+    }
+
+    /// The participants that have no device in the group (section 4): what
+    /// is sent now will not be readable by them, which the conversation
+    /// says. They join later by external commit.
+    pub fn participants_without_devices(&self, participants: &[[u8; ID_LEN]]) -> Vec<[u8; ID_LEN]> {
+        let present: HashSet<_> = self
+            .devices()
+            .into_iter()
+            .map(|leaf| leaf.user_id)
+            .collect();
+        participants
+            .iter()
+            .filter(|user| !present.contains(*user))
+            .copied()
             .collect()
     }
 
