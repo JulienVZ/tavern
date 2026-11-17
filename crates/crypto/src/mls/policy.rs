@@ -8,24 +8,24 @@
 //! commit, only these proposals may appear:
 //!
 //! - from a member committer, by value: `Add` (every new leaf a verified
-//!   device of a participant), `Remove` of a device of the committer's own
-//!   user or of a leaf the server asked to remove, and a group context change
-//!   that keeps the external senders;
+//!   device of a participant), and `Remove` of a device of the committer's
+//!   own user or of a leaf the server asked to remove;
 //! - from a member committer, by reference: the server's `Remove` proposals;
 //! - in an external commit: the `ExternalInit`, and at most one `Remove`, by
 //!   value, of an earlier leaf of the joining device itself (a resync).
 //!   Nothing by reference, not even the server's removals.
 //!
-//! Everything else (`Update` proposals, `PreSharedKey`, `ReInit`, custom
-//! proposals, member proposals by reference) is refused. A committer's new
-//! path keeps its leaf on the same device, and no device has two leaves.
-//! A device is the pair (user id, device id).
+//! Everything else (`Update` proposals, group context changes, which Tavern
+//! never makes, `PreSharedKey`, `ReInit`, custom proposals, member proposals
+//! by reference) is refused. A committer's new path keeps its leaf on the
+//! same device, no device has two leaves, and a device never changes its
+//! signature key. A device is the pair (user id, device id).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use openmls::prelude::{
-    ExternalSendersExtension, LeafNodeIndex, Member, MlsGroup, Proposal, ProposalOrRefType,
-    QueuedProposal, Sender, StagedCommit,
+    LeafNodeIndex, Member, MlsGroup, Proposal, ProposalOrRefType, QueuedProposal, Sender,
+    StagedCommit,
 };
 
 use super::MembershipChanges;
@@ -37,9 +37,6 @@ pub enum PolicyError {
     /// An external sender proposed something else than `Remove`.
     #[error("the server may only propose removals")]
     ExternalProposalNotRemove,
-    /// A proposal would change the group's external senders.
-    #[error("the group's external senders may not change")]
-    ExternalSendersChange,
     /// An external join proposal: Tavern devices join by external commit.
     #[error("external join proposals are not accepted")]
     ExternalJoinProposal,
@@ -47,8 +44,8 @@ pub enum PolicyError {
     /// only commit.
     #[error("members do not send proposals on their own")]
     MemberProposal,
-    /// A kind of proposal Tavern never uses (`Update`, `PreSharedKey`,
-    /// `ReInit`, custom ones...).
+    /// A kind of proposal Tavern never uses (`Update`, group context
+    /// changes, `PreSharedKey`, `ReInit`, custom ones...).
     #[error("this kind of proposal is not accepted")]
     ForbiddenProposal,
     /// A member removed a device of another user that the server had not
@@ -114,8 +111,8 @@ pub(crate) trait GroupView {
     fn device_at(&self, index: LeafNodeIndex) -> Option<VerifiedLeaf>;
     /// The devices of the group, with their leaves.
     fn leaves(&self) -> Vec<(LeafNodeIndex, VerifiedLeaf)>;
-    /// The group's external senders.
-    fn external_senders(&self) -> Option<&ExternalSendersExtension>;
+    /// The signature key of the leaf at `index`.
+    fn signature_key(&self, index: LeafNodeIndex) -> Option<Vec<u8>>;
     /// The leaves the server has asked to remove, from the stored proposals.
     fn requested_removals(&self) -> HashSet<LeafNodeIndex>;
 }
@@ -129,8 +126,8 @@ impl GroupView for MlsGroup {
         named_leaves(self.members())
     }
 
-    fn external_senders(&self) -> Option<&ExternalSendersExtension> {
-        self.extensions().external_senders()
+    fn signature_key(&self, index: LeafNodeIndex) -> Option<Vec<u8>> {
+        self.member_at(index).map(|member| member.signature_key)
     }
 
     fn requested_removals(&self) -> HashSet<LeafNodeIndex> {
@@ -194,12 +191,10 @@ enum Kind {
     },
     /// Adds a leaf: its device, or why the roster refuses it.
     Add(Result<VerifiedLeaf, LeafError>),
-    /// Changes the group context extensions, keeping the external senders
-    /// or not.
-    GroupContextExtensions { keeps_external_senders: bool },
     /// The `ExternalInit` of an external commit.
     ExternalInit,
-    /// Anything else: `Update`, `PreSharedKey`, `ReInit`, custom proposals...
+    /// Anything else: `Update`, group context changes, `PreSharedKey`,
+    /// `ReInit`, custom proposals...
     Other,
 }
 
@@ -217,10 +212,6 @@ fn entry(group: &impl GroupView, queued: &QueuedProposal, roster: &impl Roster) 
                 roster,
             ))
         }
-        Proposal::GroupContextExtensions(change) => Kind::GroupContextExtensions {
-            keeps_external_senders: change.extensions().external_senders()
-                == group.external_senders(),
-        },
         Proposal::ExternalInit(_) => Kind::ExternalInit,
         _ => Kind::Other,
     };
@@ -270,12 +261,6 @@ fn check_proposals(
                     removed.push(index);
                 }
                 Kind::Add(device) => added.push(device?),
-                Kind::GroupContextExtensions {
-                    keeps_external_senders: true,
-                } => {}
-                Kind::GroupContextExtensions {
-                    keeps_external_senders: false,
-                } => return Err(PolicyError::ExternalSendersChange.into()),
                 Kind::ExternalInit | Kind::Other => {
                     return Err(PolicyError::ForbiddenProposal.into());
                 }
@@ -283,6 +268,21 @@ fn check_proposals(
         }
     }
     Ok((added, removed))
+}
+
+/// A device never changes its signature key (section 2): every new leaf of a
+/// device the group holds before the commit carries the key it holds it
+/// with, a resync included. `before` maps the group's devices to their keys.
+fn check_keys(
+    before: &HashMap<VerifiedLeaf, Vec<u8>>,
+    new_leaves: &[(VerifiedLeaf, Vec<u8>)],
+) -> Result<(), LeafError> {
+    for (device, key) in new_leaves {
+        if before.get(device).is_some_and(|known| known != key) {
+            return Err(LeafError::KeyChanged);
+        }
+    }
+    Ok(())
 }
 
 /// Checks a commit before it is merged, whoever made it (this device's own
@@ -331,6 +331,26 @@ pub(crate) fn check_commit(
         .iter()
         .filter_map(|index| group.device_at(*index))
         .collect();
+
+    // The new leaves keep their devices' keys.
+    let before: HashMap<VerifiedLeaf, Vec<u8>> = group
+        .leaves()
+        .into_iter()
+        .filter_map(|(index, leaf)| group.signature_key(index).map(|key| (leaf, key)))
+        .collect();
+    let mut new_leaves = Vec::new();
+    if let (Some(device), Some(leaf)) = (path_leaf, staged.update_path_leaf_node()) {
+        new_leaves.push((device, leaf.signature_key().as_slice().to_vec()));
+    }
+    for queued in staged.queued_proposals() {
+        if let Proposal::Add(add) = queued.proposal() {
+            let leaf = add.key_package().leaf_node();
+            if let Some(device) = name_leaf(leaf.credential()) {
+                new_leaves.push((device, leaf.signature_key().as_slice().to_vec()));
+            }
+        }
+    }
+    check_keys(&before, &new_leaves)?;
 
     // After the commit, no device may have two leaves.
     let mut devices = HashSet::new();
@@ -462,9 +482,6 @@ mod tests {
                 device: None,
             }),
             by_value(Kind::Add(Ok(device(BOB, 0xb4)))),
-            by_value(Kind::GroupContextExtensions {
-                keeps_external_senders: true,
-            }),
             by_value(Kind::Other),
         ] {
             assert_eq!(
@@ -482,16 +499,12 @@ mod tests {
         let bob2 = device(BOB, 0xb2);
 
         // Allowed: the server's removals, its own user's devices, the
-        // leaves the server asked to remove, verified adds, a context change
-        // that keeps the senders.
+        // leaves the server asked to remove, verified adds.
         let entries = [
             from_server(remove(3, bob2)),
             by_value(remove(1, device(ALICE, 0xa2))),
             by_value(remove(2, device(BOB, 0xb1))),
             by_value(Kind::Add(Ok(device(BOB, 0xb3)))),
-            by_value(Kind::GroupContextExtensions {
-                keeps_external_senders: true,
-            }),
         ];
         assert_eq!(
             check(committer, &entries, &[2, 3]),
@@ -523,20 +536,34 @@ mod tests {
             refused(by_value(Kind::Add(Err(LeafError::Untrusted))), &[]),
             Alarm::Leaf(LeafError::Untrusted)
         );
-        assert_eq!(
-            refused(
-                by_value(Kind::GroupContextExtensions {
-                    keeps_external_senders: false,
-                }),
-                &[]
-            ),
-            Alarm::Policy(PolicyError::ExternalSendersChange)
-        );
+        // Anything else, group context changes included (`entry` makes
+        // them `Other`).
         for forbidden in [Kind::Other, Kind::ExternalInit] {
             assert_eq!(
                 refused(by_value(forbidden), &[]),
                 Alarm::Policy(PolicyError::ForbiddenProposal)
             );
         }
+    }
+
+    #[test]
+    fn a_device_keeps_its_key_in_the_group_a_resync_included() {
+        let d = device(ALICE, 0xa2);
+        let before: HashMap<_, _> = [(d, vec![1; 32]), (device(BOB, 0xb1), vec![2; 32])]
+            .into_iter()
+            .collect();
+        // The resync the review describes: the commit removes D's leaf and
+        // adds D again under another key. `before` is the group before the
+        // commit, so D is in it whatever the commit removes.
+        assert_eq!(
+            check_keys(&before, &[(d, vec![9; 32])]),
+            Err(LeafError::KeyChanged)
+        );
+        // An honest resync keeps the key; a new device has none yet.
+        assert_eq!(check_keys(&before, &[(d, vec![1; 32])]), Ok(()));
+        assert_eq!(
+            check_keys(&before, &[(device(ALICE, 0xa3), vec![9; 32])]),
+            Ok(())
+        );
     }
 }

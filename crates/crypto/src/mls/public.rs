@@ -19,10 +19,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
 use openmls::prelude::{
-    ContentType, ExternalProposal, ExternalSendersExtension, LeafNodeIndex, MlsMessageBodyIn,
-    MlsMessageIn, MlsMessageOut, OpenMlsSignaturePublicKey, ProcessedMessageContent, ProposalStore,
-    ProtocolMessage, PublicGroup, PublicProcessMessageError, Sender, SenderExtensionIndex,
-    StagedCommit, Verifiable,
+    ContentType, ExternalProposal, LeafNodeIndex, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    OpenMlsSignaturePublicKey, ProcessedMessageContent, ProposalStore, ProtocolMessage,
+    PublicGroup, PublicProcessMessageError, Sender, SenderExtensionIndex, StagedCommit, Verifiable,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::public_storage::PublicStorageProvider;
@@ -478,8 +477,10 @@ impl GroupView for PublicView<'_> {
         policy::named_leaves(self.group.members())
     }
 
-    fn external_senders(&self) -> Option<&ExternalSendersExtension> {
-        self.group.group_context().extensions().external_senders()
+    fn signature_key(&self, index: LeafNodeIndex) -> Option<Vec<u8>> {
+        self.group
+            .leaf(index)
+            .map(|leaf| leaf.signature_key().as_slice().to_vec())
     }
 
     fn requested_removals(&self) -> HashSet<LeafNodeIndex> {
@@ -516,19 +517,19 @@ pub struct MergedCommit {
     pub changes: MembershipChanges,
     /// The new epoch.
     pub epoch: u64,
-    /// The GroupInfo of the new epoch, checked: the one to keep for devices
-    /// that join by external commit.
-    pub group_info: Vec<u8>,
     /// The server's removals that the commit did not carry (an external
     /// commit cannot), signed again for the new epoch: to append to the
     /// conversation's sequence right after the commit (sections 5 and 6).
     pub reissued: Vec<Vec<u8>>,
 }
 
-/// The public state of one group, on the server.
+/// The public state of one group, on the server, with the latest GroupInfo
+/// it checked.
 pub struct PublicState {
     group: PublicGroup,
     entries: PublicEntries,
+    group_info: Vec<u8>,
+    loaded_epoch: Option<u64>,
     crypto: RustCrypto,
 }
 
@@ -570,6 +571,29 @@ fn group_from_info(
     PublicGroup::from_external(crypto, entries, tree, info, ProposalStore::new())
         .map(|(group, _)| group)
         .map_err(|error| error.to_string())
+}
+
+/// Checks a GroupInfo to keep for devices that join by external commit: its
+/// ratchet tree matches its group context (OpenMLS builds a public group
+/// from it, checking the tree hash, every leaf and the signature by its
+/// signer), it carries the `ExternalPub` they need, and it is signed by
+/// `signer`'s leaf. Returns the public group it describes.
+fn check_group_info(
+    crypto: &RustCrypto,
+    bytes: &[u8],
+    identity: GroupIdentity,
+    signer: VerifiedLeaf,
+) -> Result<PublicGroup, MlsError> {
+    let info = parse_group_info(bytes)?;
+    if info.extensions().external_pub().is_none() {
+        return Err(MlsError::GroupInfo);
+    }
+    let scratch = PublicEntries::new(identity)?;
+    let group = group_from_info(crypto, &scratch, info).map_err(|_| MlsError::GroupInfo)?;
+    if !signed_by(crypto, &group, parse_group_info(bytes)?, signer) {
+        return Err(MlsError::GroupInfo);
+    }
+    Ok(group)
 }
 
 /// Whether `info` is signed by `device`'s leaf in `group`.
@@ -617,7 +641,9 @@ impl PublicState {
     /// commit against (section 4). The group must be the expected one with
     /// Tavern's parameters; every leaf an active, certified device of a
     /// participant (a participant may have none); the GroupInfo signed by
-    /// the submitting device, which is in the group. Returns its devices.
+    /// the submitting device, which is in the group, and carrying the
+    /// `ExternalPub` that devices joining by external commit need. Returns
+    /// the state, which keeps that GroupInfo, and its devices.
     pub fn create(
         group_info: &[u8],
         expected: &ExpectedGroup<'_>,
@@ -651,6 +677,7 @@ impl PublicState {
         if !signed_by(&crypto, &group, parse_group_info(group_info)?, submitter) {
             return Err(MlsError::WrongSender);
         }
+        check_group_info(&crypto, group_info, expected.identity, submitter)?;
         // `from_external` wrote the state into the entries: they are to be
         // stored whole ([`PublicEntries::entries`]), not as changes.
         entries.take_changes();
@@ -658,20 +685,33 @@ impl PublicState {
             Self {
                 group,
                 entries,
+                group_info: group_info.to_vec(),
+                loaded_epoch: None,
                 crypto,
             },
             devices,
         ))
     }
 
-    /// The state the server stored for `identity`.
-    pub fn load(identity: GroupIdentity, entries: PublicEntries) -> Result<Self, MlsError> {
+    /// The state the server stored for `identity`, with the GroupInfo it
+    /// stored with it.
+    pub fn load(
+        identity: GroupIdentity,
+        entries: PublicEntries,
+        group_info: Vec<u8>,
+    ) -> Result<Self, MlsError> {
         let group = PublicGroup::load(&entries, &identity.to_group_id())
-            .map_err(library)?
+            .map_err(|error| match error {
+                EntriesError::OtherGroup => MlsError::UnexpectedGroup,
+                EntriesError::Encoding(_) => MlsError::Malformed,
+            })?
             .ok_or(MlsError::Malformed)?;
+        let loaded_epoch = Some(group.group_context().epoch().as_u64());
         Ok(Self {
             group,
             entries,
+            group_info,
+            loaded_epoch,
             crypto: RustCrypto::default(),
         })
     }
@@ -679,6 +719,18 @@ impl PublicState {
     /// The rows, to store or to write back.
     pub fn entries(&self) -> &PublicEntries {
         &self.entries
+    }
+
+    /// The latest GroupInfo, checked: the one to keep for devices that join
+    /// by external commit.
+    pub fn group_info(&self) -> &[u8] {
+        &self.group_info
+    }
+
+    /// The epoch the state had when it was loaded; `None` for a state that
+    /// [`PublicState::create`] built and that is not stored yet.
+    pub fn loaded_epoch(&self) -> Option<u64> {
+        self.loaded_epoch
     }
 
     /// Which conversation and generation.
@@ -731,7 +783,8 @@ impl PublicState {
     /// policy refuses (sections 2, 5 and 6), a device of anyone but the
     /// participants, a member's commit that leaves out a removal the server
     /// asked for (`REMOVAL_PENDING`), and a GroupInfo that is not the new
-    /// epoch's, signed by the committer.
+    /// epoch's (the same group context and confirmation tag as the commit's,
+    /// with `ExternalPub` and the ratchet tree), signed by the committer.
     pub fn validate_commit(
         &self,
         commit: &[u8],
@@ -748,11 +801,16 @@ impl PublicState {
         let protocol: ProtocolMessage = message
             .try_into_protocol_message()
             .map_err(|_| MlsError::Malformed)?;
-        if !matches!(protocol, ProtocolMessage::PublicMessage(_))
-            || protocol.content_type() != ContentType::Commit
-        {
+        let ProtocolMessage::PublicMessage(public) = &protocol else {
+            return Err(MlsError::Malformed);
+        };
+        if protocol.content_type() != ContentType::Commit {
             return Err(MlsError::Malformed);
         }
+        let confirmation_tag = public
+            .confirmation_tag()
+            .cloned()
+            .ok_or(MlsError::Malformed)?;
         if protocol.group_id() != self.group.group_id() {
             return Err(MlsError::Refused(Refusal::WrongGroup));
         }
@@ -796,19 +854,11 @@ impl PublicState {
             return Err(MlsError::RemovalPending);
         }
 
-        let info = parse_group_info(group_info)?;
-        if info.group_context() != staged.group_context() {
+        if parse_group_info(group_info)?.group_context() != staged.group_context() {
             return Err(MlsError::GroupInfo);
         }
-        let scratch = PublicEntries::new(GroupIdentity::from_group_id(self.group.group_id())?)?;
-        let next =
-            group_from_info(&self.crypto, &scratch, info).map_err(|_| MlsError::GroupInfo)?;
-        if !signed_by(
-            &self.crypto,
-            &next,
-            parse_group_info(group_info)?,
-            submitter,
-        ) {
+        let next = check_group_info(&self.crypto, group_info, self.identity()?, submitter)?;
+        if *next.confirmation_tag() != confirmation_tag {
             return Err(MlsError::GroupInfo);
         }
 
@@ -843,10 +893,10 @@ impl PublicState {
                 reissued.push(proposal);
             }
         }
+        self.group_info = validated.group_info;
         Ok(MergedCommit {
             changes: validated.changes,
             epoch: self.epoch(),
-            group_info: validated.group_info,
             reissued,
         })
     }

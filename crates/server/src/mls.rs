@@ -5,19 +5,20 @@
 //! A request that touches a group loads its rows ([`load`], which locks the
 //! group's row until the transaction ends), lets `tavern-crypto` check and
 //! merge what it must on a [`PublicState`], and writes back the rows that
-//! changed ([`save`]) in the transaction that moves the epoch. OpenMLS runs
+//! changed ([`save`]) in the transaction that moves the epoch. Both [`save`]
+//! and [`insert`] use the state up. OpenMLS runs
 //! on the loaded rows in memory, synchronously, between the two.
 //!
 //! The server never decrypts anything here: it holds the public tree, the
 //! group context and its own `Remove` proposals.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use sqlx::PgConnection;
 use tavern_crypto::identity::{ID_LEN, IdentityPublicKey};
 use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::public::{Change, Entry};
-use tavern_crypto::mls::{MlsError, PublicEntries, PublicState, Roster, VerifiedLeaf};
+use tavern_crypto::mls::{LeafError, MlsError, PublicEntries, PublicState, Roster, VerifiedLeaf};
 use uuid::Uuid;
 
 /// A group's state could not be read or written.
@@ -29,25 +30,24 @@ pub enum StateError {
     /// The stored state is not readable, or OpenMLS refused it.
     #[error(transparent)]
     Mls(#[from] MlsError),
-    /// The conversation already has this generation, or a later one.
+    /// The conversation already has this generation, or a later one: another
+    /// device created or recreated the group first (`STALE_EPOCH` for the
+    /// API, ADR 0019, sections 4 and 17).
     #[error("the conversation already has this group generation or a later one")]
     GenerationExists,
-    /// The stored epoch and the state's disagree.
-    #[error("the stored epoch does not match the group state")]
+    /// The stored group does not match the state: its epoch moved since the
+    /// state was loaded, or the row is gone, or its epoch disagrees with its
+    /// rows.
+    #[error("the stored group does not match the state")]
     Inconsistent,
-}
-
-/// A group as the server stored it.
-#[derive(Debug)]
-pub struct StoredGroup {
-    /// Its public state.
-    pub state: PublicState,
-    /// The latest GroupInfo, for devices joining by external commit.
-    pub group_info: Vec<u8>,
 }
 
 fn group_id(identity: GroupIdentity) -> Vec<u8> {
     identity.to_group_id().as_slice().to_vec()
+}
+
+fn epoch_of(state: &PublicState) -> Result<i64, StateError> {
+    i64::try_from(state.epoch()).map_err(|_| StateError::Inconsistent)
 }
 
 async fn write_entry(
@@ -68,20 +68,28 @@ async fn write_entry(
     Ok(())
 }
 
-/// Stores the state of a new group generation, built from its first
-/// GroupInfo, and deletes the conversation's earlier generations with their
-/// rows (ADR 0019, section 12: the server keeps the current state only).
-pub async fn insert(
-    conn: &mut PgConnection,
-    state: &PublicState,
-    group_info: &[u8],
-) -> Result<(), StateError> {
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(error) if error.code().as_deref() == Some("23505"))
+}
+
+/// Stores the state of a new group generation, built by
+/// [`PublicState::create`] with the GroupInfo it checked, and deletes the
+/// conversation's earlier generations with their rows (ADR 0019, section 12:
+/// the server keeps the current state only). Creations of one conversation
+/// take turns on a lock held until the transaction ends; the one that comes
+/// second gets [`StateError::GenerationExists`].
+pub async fn insert(conn: &mut PgConnection, state: PublicState) -> Result<(), StateError> {
     let identity = state.identity()?;
     let conversation = Uuid::from_bytes(identity.conversation_id);
     let generation = i64::from(identity.generation);
+    // Until the conversation's own row exists (M2, task 7).
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("tavern.mls_groups:{conversation}"))
+        .execute(&mut *conn)
+        .await?;
     let later: Option<i64> = sqlx::query_scalar(
         "SELECT generation FROM mls_groups WHERE conversation_id = $1 AND generation >= $2 \
-         LIMIT 1 FOR UPDATE",
+         LIMIT 1",
     )
     .bind(conversation)
     .bind(generation)
@@ -97,7 +105,6 @@ pub async fn insert(
         .await?;
 
     let id = group_id(identity);
-    let epoch = i64::try_from(state.epoch()).map_err(|_| StateError::Inconsistent)?;
     sqlx::query(
         "INSERT INTO mls_groups (group_id, conversation_id, generation, epoch, group_info) \
          VALUES ($1, $2, $3, $4, $5)",
@@ -105,15 +112,21 @@ pub async fn insert(
     .bind(&id)
     .bind(conversation)
     .bind(generation)
-    .bind(epoch)
-    .bind(group_info)
+    .bind(epoch_of(&state)?)
+    .bind(state.group_info())
     .execute(&mut *conn)
-    .await?;
+    .await
+    .map_err(|error| {
+        // A writer that did not take the lock: the same answer.
+        if is_unique_violation(&error) {
+            StateError::GenerationExists
+        } else {
+            StateError::Database(error)
+        }
+    })?;
     for entry in state.entries().entries() {
         write_entry(conn, &id, entry).await?;
     }
-    // Stored whole: nothing left to write back.
-    state.entries().take_changes();
     Ok(())
 }
 
@@ -122,7 +135,7 @@ pub async fn insert(
 pub async fn load(
     conn: &mut PgConnection,
     identity: GroupIdentity,
-) -> Result<Option<StoredGroup>, StateError> {
+) -> Result<Option<PublicState>, StateError> {
     let id = group_id(identity);
     let row: Option<(i64, Vec<u8>)> =
         sqlx::query_as("SELECT epoch, group_info FROM mls_groups WHERE group_id = $1 FOR UPDATE")
@@ -142,21 +155,37 @@ pub async fn load(
         rows.into_iter()
             .map(|(kind, key, value)| Entry { kind, key, value }),
     )?;
-    let state = PublicState::load(identity, entries)?;
-    if i64::try_from(state.epoch()).ok() != Some(epoch) {
+    let state = PublicState::load(identity, entries, group_info)?;
+    if epoch_of(&state)? != epoch {
         return Err(StateError::Inconsistent);
     }
-    Ok(Some(StoredGroup { state, group_info }))
+    Ok(Some(state))
 }
 
-/// Writes back what changed in a loaded state: its rows, its epoch, and the
-/// new GroupInfo when a commit was merged.
-pub async fn save(
-    conn: &mut PgConnection,
-    state: &PublicState,
-    group_info: Option<&[u8]>,
-) -> Result<(), StateError> {
+/// Writes back what changed in a state [`load`] returned: its epoch, its
+/// latest GroupInfo and the rows that changed. The state is used up: after a
+/// failure, the request loads the group again rather than reuse a state
+/// whose changes were taken. Refused if the stored group is no longer at the
+/// epoch the state was loaded at.
+pub async fn save(conn: &mut PgConnection, state: PublicState) -> Result<(), StateError> {
     let id = group_id(state.identity()?);
+    let loaded = state
+        .loaded_epoch()
+        .and_then(|epoch| i64::try_from(epoch).ok())
+        .ok_or(StateError::Inconsistent)?;
+    let updated = sqlx::query(
+        "UPDATE mls_groups SET epoch = $2, group_info = $3, updated_at = now() \
+         WHERE group_id = $1 AND epoch = $4",
+    )
+    .bind(&id)
+    .bind(epoch_of(&state)?)
+    .bind(state.group_info())
+    .bind(loaded)
+    .execute(&mut *conn)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(StateError::Inconsistent);
+    }
     for change in state.entries().take_changes() {
         match change {
             Change::Write(entry) => write_entry(conn, &id, entry).await?,
@@ -172,27 +201,21 @@ pub async fn save(
             }
         }
     }
-    let epoch = i64::try_from(state.epoch()).map_err(|_| StateError::Inconsistent)?;
-    sqlx::query(
-        "UPDATE mls_groups SET epoch = $2, group_info = COALESCE($3, group_info), \
-         updated_at = now() WHERE group_id = $1",
-    )
-    .bind(&id)
-    .bind(epoch)
-    .bind(group_info)
-    .execute(conn)
-    .await?;
     Ok(())
 }
 
 /// What the server trusts for a conversation's leaves (ADR 0019, section 2):
 /// the participants' identity keys from `users`, and their devices that are
-/// not revoked. Devices that stayed away longer than the inactivity period
-/// join this rule with `TAVERN_DEVICE_INACTIVE_DAYS` (M2, tasks 8 and 9).
+/// not revoked, each with the key and the certificate it enrolled with. A
+/// leaf must be one of those devices with exactly that key and certificate:
+/// the identity key could certify another key under a device's id, the
+/// server alone knows which key enrolled. Devices that stayed away longer
+/// than the inactivity period join this rule with
+/// `TAVERN_DEVICE_INACTIVE_DAYS` (M2, tasks 8 and 9).
 #[derive(Debug, Clone, Default)]
 pub struct ServerRoster {
     identity_keys: HashMap<[u8; ID_LEN], IdentityPublicKey>,
-    active: HashSet<VerifiedLeaf>,
+    enrolled: HashMap<VerifiedLeaf, (Vec<u8>, Vec<u8>)>,
 }
 
 impl ServerRoster {
@@ -204,8 +227,9 @@ impl ServerRoster {
                 .bind(participants)
                 .fetch_all(&mut *conn)
                 .await?;
-        let devices: Vec<(Uuid, Uuid)> = sqlx::query_as(
-            "SELECT d.user_id, d.id FROM devices d JOIN users u ON u.id = d.user_id \
+        let devices: Vec<(Uuid, Uuid, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT d.user_id, d.id, d.signature_key, d.certificate \
+             FROM devices d JOIN users u ON u.id = d.user_id \
              WHERE d.user_id = ANY($1) AND d.revoked_at IS NULL AND u.disabled_at IS NULL",
         )
         .bind(participants)
@@ -219,11 +243,16 @@ impl ServerRoster {
         }
         Ok(Self {
             identity_keys,
-            active: devices
+            enrolled: devices
                 .into_iter()
-                .map(|(user, device)| VerifiedLeaf {
-                    user_id: *user.as_bytes(),
-                    device_id: *device.as_bytes(),
+                .map(|(user, device, signature_key, certificate)| {
+                    (
+                        VerifiedLeaf {
+                            user_id: *user.as_bytes(),
+                            device_id: *device.as_bytes(),
+                        },
+                        (signature_key, certificate),
+                    )
                 })
                 .collect(),
         })
@@ -235,7 +264,19 @@ impl Roster for ServerRoster {
         self.identity_keys.get(user_id).copied()
     }
 
-    fn accepts_device(&self, device: &VerifiedLeaf) -> bool {
-        self.active.contains(device)
+    fn check_device(
+        &self,
+        device: &VerifiedLeaf,
+        signature_key: &[u8],
+        certificate: &[u8],
+    ) -> Result<(), LeafError> {
+        let (enrolled_key, enrolled_certificate) =
+            self.enrolled.get(device).ok_or(LeafError::InactiveDevice)?;
+        if enrolled_key.as_slice() != signature_key
+            || enrolled_certificate.as_slice() != certificate
+        {
+            return Err(LeafError::NotEnrolled);
+        }
+        Ok(())
     }
 }

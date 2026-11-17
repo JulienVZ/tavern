@@ -771,12 +771,19 @@ fn a_proposal_signed_by_an_unknown_external_key_is_refused() {
     assert_eq!(dm.groups[1].inner_mut().pending_proposals().count(), 0);
 }
 
+/// Tavern never changes a group's context (decided 2026-11-17): every
+/// `GroupContextExtensions` is refused, by the clients with the alarm and by
+/// the server. One that drops the required capabilities would stop every
+/// later join and resync; one that swaps the external sender would hand the
+/// removals to another key; even one that changes nothing is refused.
 #[test]
-fn nobody_may_change_the_external_senders() {
+fn group_context_changes_are_refused_by_clients_and_server() {
     let mut dm = Dm::new();
+    let state = public_state(&dm);
+    let roster = ServerRoster::of(&dm);
     let current = dm.groups[0].inner_mut().extensions().clone();
     let rogue = ExternalSenderKey::generate();
-    let changed = Extensions::from_vec(
+    let swapped = Extensions::from_vec(
         current
             .iter()
             .map(|extension| match extension {
@@ -788,41 +795,46 @@ fn nobody_may_change_the_external_senders() {
             .collect(),
     )
     .unwrap();
+    let without_requirements = Extensions::from_vec(
+        current
+            .iter()
+            .filter(|extension| !matches!(extension, Extension::RequiredCapabilities(_)))
+            .cloned()
+            .collect(),
+    )
+    .unwrap();
 
-    // A commit that changes them is an alarm, and is not merged.
-    let device = &dm.devices[0];
-    let (commit, _, _) = dm.groups[0]
-        .inner_mut()
-        .update_group_context_extensions(&device.provider, changed, &device.signer())
-        .unwrap();
-    let commit = commit.tls_serialize_detached().unwrap();
-    let before = dm.groups[2].epoch();
-    let result = dm.deliver(2, &commit);
-    assert!(
-        matches!(
-            result,
-            Err(MlsError::Alarm(Alarm::Policy(
-                PolicyError::ExternalSendersChange
-            )))
-        ),
-        "{result:?}"
-    );
-    assert_eq!(dm.groups[2].epoch(), before);
-
-    // One that keeps them is accepted.
-    let device = &dm.devices[0];
-    dm.groups[0]
-        .discard_pending_commit(&device.provider)
-        .unwrap();
-    let (commit, _, _) = dm.groups[0]
-        .inner_mut()
-        .update_group_context_extensions(&device.provider, current, &device.signer())
-        .unwrap();
-    let commit = commit.tls_serialize_detached().unwrap();
-    assert!(matches!(
-        dm.deliver(2, &commit).unwrap(),
-        Incoming::Commit { .. }
-    ));
+    for change in [swapped, without_requirements, current] {
+        let device = &dm.devices[0];
+        let (commit, _, info) = dm.groups[0]
+            .inner_mut()
+            .update_group_context_extensions(&device.provider, change, &device.signer())
+            .unwrap();
+        let commit = commit.tls_serialize_detached().unwrap();
+        let before = dm.groups[2].epoch();
+        let result = dm.deliver(2, &commit);
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::Alarm(Alarm::Policy(
+                    PolicyError::ForbiddenProposal
+                )))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(dm.groups[2].epoch(), before, "not merged");
+        let result = submit(&state, &dm.devices[0], &commit, &info_bytes(info), &roster);
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::Policy(PolicyError::ForbiddenProposal))
+            ),
+            "{result:?}"
+        );
+        dm.groups[0]
+            .discard_pending_commit(&dm.devices[0].provider)
+            .unwrap();
+    }
 }
 
 // --- Section 5: external commits ------------------------------------------------------------
@@ -1468,12 +1480,19 @@ fn a_welcome_for_a_group_id_that_is_not_tavern_s_is_refused() {
 #[test]
 fn a_commit_giving_a_device_two_leaves_raises_the_alarm() {
     let mut dm = Dm::new();
-    // Another leaf for Bob's first device (same user and device ids).
-    let twin = dm.bob.device(0xb1);
+    // Two leaves for one new device of Bob's, under two keys. (Another leaf
+    // for a device already in the group shows another key: `KeyChanged`,
+    // see `a_device_never_shows_up_with_another_key`.)
+    let first = dm.bob.device(0xb3);
+    let second = dm.bob.device(0xb3);
     let device = &dm.devices[0];
     let (commit, _, _) = dm.groups[0]
         .inner_mut()
-        .add_members(&device.provider, &device.signer(), &[twin.key_package()])
+        .add_members(
+            &device.provider,
+            &device.signer(),
+            &[first.key_package(), second.key_package()],
+        )
         .unwrap();
     let commit = commit.tls_serialize_detached().unwrap();
     let result = dm.deliver(3, &commit);
@@ -1863,11 +1882,15 @@ fn an_encrypted_commit_raises_the_alarm() {
 // --- Section 14: the server's public state ----------------------------------------------
 
 /// What the server trusts: the participants' identity keys from its
-/// database, and their active devices.
+/// database, their active devices, and the key each enrolled with. Here the
+/// DM's devices are enrolled; a device the tests make later is taken as
+/// enrolled with the key it shows (the PostgreSQL tests of the server check
+/// enrolment for real).
 #[derive(Clone)]
 struct ServerRoster {
     pins: Pins,
     revoked: HashSet<VerifiedLeaf>,
+    enrolled: HashMap<VerifiedLeaf, Vec<u8>>,
 }
 
 impl ServerRoster {
@@ -1875,6 +1898,11 @@ impl ServerRoster {
         Self {
             pins: dm.pins.clone(),
             revoked: HashSet::new(),
+            enrolled: dm
+                .devices
+                .iter()
+                .map(|device| (device.leaf(), device.key.public().to_bytes().to_vec()))
+                .collect(),
         }
     }
 
@@ -1889,8 +1917,23 @@ impl Roster for ServerRoster {
         self.pins.identity_key(user_id)
     }
 
-    fn accepts_device(&self, device: &VerifiedLeaf) -> bool {
-        !self.revoked.contains(device)
+    fn check_device(
+        &self,
+        device: &VerifiedLeaf,
+        signature_key: &[u8],
+        _certificate: &[u8],
+    ) -> Result<(), LeafError> {
+        if self.revoked.contains(device) {
+            return Err(LeafError::InactiveDevice);
+        }
+        if self
+            .enrolled
+            .get(device)
+            .is_some_and(|key| key != signature_key)
+        {
+            return Err(LeafError::NotEnrolled);
+        }
+        Ok(())
     }
 }
 
@@ -1951,6 +1994,7 @@ fn reload(state: &PublicState) -> PublicState {
     PublicState::load(
         identity,
         PublicEntries::load(identity, state.entries().entries()).unwrap(),
+        state.group_info().to_vec(),
     )
     .unwrap()
 }
@@ -1981,7 +2025,10 @@ fn the_server_builds_the_public_state_from_the_first_group_info() {
         generation: 0,
     };
     let rows = PublicEntries::load(other, state.entries().entries()).unwrap();
-    assert!(PublicState::load(identity(), rows).is_err());
+    assert!(matches!(
+        PublicState::load(identity(), rows, Vec::new()),
+        Err(MlsError::UnexpectedGroup)
+    ));
     let unknown = super::public::Entry {
         kind: 99,
         key: Vec::new(),
@@ -2081,7 +2128,7 @@ fn the_server_validates_and_merges_the_commit_of_each_epoch() {
     assert_eq!(merged.epoch, 2);
     assert_eq!(merged.changes, MembershipChanges::default());
     assert!(merged.reissued.is_empty());
-    assert_eq!(merged.group_info, commit.group_info);
+    assert_eq!(state.group_info(), commit.group_info);
     dm.deliver_all(&commit.commit, &[2]);
 
     let bob3 = dm.bob.device(0xb3);
@@ -2279,6 +2326,207 @@ fn the_server_applies_the_clients_policy() {
         "{result:?}"
     );
     assert!(submit(&state, &bob4, &commit.commit, &commit.group_info, &roster).is_ok());
+}
+
+/// An external commit built with OpenMLS directly, as a client that skips
+/// Tavern's checks would: the commit and the GroupInfo it submits.
+fn raw_external_commit(dm: &mut Dm, joiner: &Device) -> (Vec<u8>, Vec<u8>) {
+    let info = group_info(dm, 0);
+    let openmls::prelude::MlsMessageBodyIn::GroupInfo(info) =
+        MlsMessageIn::tls_deserialize_bytes(&info)
+            .unwrap()
+            .0
+            .extract()
+    else {
+        panic!("not a GroupInfo");
+    };
+    let (_, bundle) = openmls::prelude::MlsGroup::external_commit_builder()
+        .with_config(join_config())
+        .build_group(&joiner.provider, info, joiner.credential())
+        .unwrap()
+        .load_psks(joiner.provider.storage())
+        .unwrap()
+        .create_group_info(true)
+        .build(
+            joiner.provider.rand(),
+            joiner.provider.crypto(),
+            &joiner.signer(),
+            |_| true,
+        )
+        .unwrap()
+        .finalize(&joiner.provider)
+        .unwrap();
+    let (commit, _, info) = bundle.into_contents();
+    (commit.tls_serialize_detached().unwrap(), info_bytes(info))
+}
+
+/// Section 2: a device never changes its key. The attack of the review: with
+/// Alice's password, an attacker has her identity key and certifies another
+/// key under the id of her device D (her second device), whose own key it
+/// does not hold. Clients refuse the leaf with the alarm (another key for a
+/// device of the group), the server because it is not D's enrolled key.
+#[test]
+fn a_device_never_shows_up_with_another_key() {
+    let mut dm = Dm::new();
+    let state = public_state(&dm);
+    let roster = ServerRoster::of(&dm);
+    let forged = dm.alice.device(0xa2);
+    assert_eq!(forged.leaf(), dm.devices[1].leaf());
+    let refused_everywhere = |dm: &mut Dm, commit: &[u8], info: &[u8], submitter: VerifiedLeaf| {
+        let before = dm.groups[2].epoch();
+        let result = dm.deliver(2, commit);
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::Alarm(Alarm::Leaf(LeafError::KeyChanged)))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(dm.groups[2].epoch(), before, "not merged");
+        let result = state.validate_commit(commit, info, submitter, &expected(), &roster);
+        assert!(
+            matches!(result, Err(MlsError::Leaf(LeafError::NotEnrolled))),
+            "{result:?}"
+        );
+    };
+
+    // D joins again by external commit with the forged key.
+    let (commit, info) = raw_external_commit(&mut dm, &forged);
+    refused_everywhere(&mut dm, &commit, &info, forged.leaf());
+
+    // D's own leaf updated to the forged key and certificate.
+    let device = &dm.devices[1];
+    let bundle = dm.groups[1]
+        .inner_mut()
+        .self_update_with_new_signer(
+            &device.provider,
+            &device.signer(),
+            NewSignerBundle {
+                signer: &forged.signer(),
+                credential_with_key: forged.credential(),
+            },
+            LeafNodeParameters::default(),
+        )
+        .unwrap();
+    let (commit, _, info) = bundle.into_contents();
+    let commit = commit.tls_serialize_detached().unwrap();
+    let alice2 = dm.devices[1].leaf();
+    refused_everywhere(&mut dm, &commit, &info_bytes(info), alice2);
+    dm.groups[1]
+        .discard_pending_commit(&dm.devices[1].provider)
+        .unwrap();
+
+    // Alice's first device removes D and adds it again under the forged key.
+    let alice2 = dm.groups[0]
+        .leaf_of(&forged.user_id, &forged.device_id)
+        .unwrap();
+    let device = &dm.devices[0];
+    let bundle = dm.groups[0]
+        .inner_mut()
+        .commit_builder()
+        .propose_removals([alice2])
+        .propose_adds([forged.key_package()])
+        .load_psks(device.provider.storage())
+        .unwrap()
+        .create_group_info(true)
+        .build(
+            device.provider.rand(),
+            device.provider.crypto(),
+            &device.signer(),
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&device.provider)
+        .unwrap();
+    let (commit, _, info) = bundle.into_contents();
+    let commit = commit.tls_serialize_detached().unwrap();
+    let alice1 = dm.devices[0].leaf();
+    refused_everywhere(&mut dm, &commit, &info_bytes(info), alice1);
+}
+
+/// Decodes a GroupInfo message, lets `edit` change its extensions and its
+/// confirmation tag, and signs it again with `signer`: what a dishonest
+/// committer could submit.
+fn resigned_group_info(
+    bytes: &[u8],
+    signer: &DeviceSigner<'_>,
+    edit: impl FnOnce(&mut Vec<Extension>, &mut Vec<u8>),
+) -> Vec<u8> {
+    use openmls::messages::group_info::GroupInfo;
+    use openmls::prelude::tls_codec::{DeserializeBytes as _, VLBytes};
+    use openmls::prelude::{GroupContext, SignContent};
+    use openmls_traits::signatures::Signer as _;
+
+    let (header, rest) = bytes.split_at(4);
+    let (context, rest) = GroupContext::tls_deserialize_bytes(rest).unwrap();
+    let (extensions, rest) = Extensions::<GroupInfo>::tls_deserialize_bytes(rest).unwrap();
+    let (tag, rest) = VLBytes::tls_deserialize_bytes(rest).unwrap();
+    let (signer_index, rest) = u32::tls_deserialize_bytes(rest).unwrap();
+    let (_, rest) = VLBytes::tls_deserialize_bytes(rest).unwrap();
+    assert!(rest.is_empty());
+    let mut list: Vec<Extension> = extensions.iter().cloned().collect();
+    let mut tag = tag.as_slice().to_vec();
+    edit(&mut list, &mut tag);
+
+    let mut tbs = context.tls_serialize_detached().unwrap();
+    tbs.extend(
+        Extensions::<GroupInfo>::from_vec(list)
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap(),
+    );
+    tbs.extend(VLBytes::new(tag).tls_serialize_detached().unwrap());
+    tbs.extend(signer_index.tls_serialize_detached().unwrap());
+    let content = SignContent::new("GroupInfoTBS", tbs.clone().into())
+        .tls_serialize_detached()
+        .unwrap();
+    let signature = signer.sign(&content).unwrap();
+    [
+        header.to_vec(),
+        tbs,
+        VLBytes::new(signature).tls_serialize_detached().unwrap(),
+    ]
+    .concat()
+}
+
+/// The GroupInfo the server keeps must let devices join by external commit:
+/// it carries `ExternalPub` and the commit's confirmation tag, at creation
+/// and with every commit.
+#[test]
+fn the_kept_group_info_carries_external_pub_and_the_commit_s_tag() {
+    let mut dm = Dm::new();
+    let state = public_state(&dm);
+    let roster = ServerRoster::of(&dm);
+    let commit = update(&mut dm, 2);
+    let bob1 = &dm.devices[2];
+    let without_external_pub = |list: &mut Vec<Extension>, _: &mut Vec<u8>| {
+        list.retain(|extension| !matches!(extension, Extension::ExternalPub(_)));
+    };
+    let other_tag = |_: &mut Vec<Extension>, tag: &mut Vec<u8>| tag[0] ^= 1;
+
+    // Re-signed as it was: accepted, so the helper changes nothing else.
+    let same = resigned_group_info(&commit.group_info, &bob1.signer(), |_, _| ());
+    assert!(submit(&state, bob1, &commit.commit, &same, &roster).is_ok());
+    for edit in [
+        &without_external_pub as &dyn Fn(&mut Vec<Extension>, &mut Vec<u8>),
+        &other_tag,
+    ] {
+        let info = resigned_group_info(&commit.group_info, &bob1.signer(), edit);
+        let result = submit(&state, bob1, &commit.commit, &info, &roster);
+        assert!(matches!(result, Err(MlsError::GroupInfo)), "{result:?}");
+    }
+
+    // At creation too.
+    let alice1 = &dm.devices[0];
+    let first = resigned_group_info(&dm.first_group_info, &alice1.signer(), without_external_pub);
+    let result = PublicState::create(
+        &first,
+        &expected(),
+        alice1.leaf(),
+        &roster,
+        &dm.server.public_bytes(),
+    );
+    assert!(matches!(result, Err(MlsError::GroupInfo)), "{result:?}");
 }
 
 /// The GroupInfo OpenMLS returns with a commit, as submitted.
@@ -2546,6 +2794,7 @@ fn a_public_state_written_by_the_first_release_still_loads() {
     let state = PublicState::load(
         identity(),
         PublicEntries::load(identity(), entries).unwrap(),
+        Vec::new(),
     )
     .unwrap();
     assert_eq!(state.epoch(), 2);

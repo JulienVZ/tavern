@@ -25,12 +25,19 @@ pub trait Roster {
     /// part in the conversation; `None` otherwise.
     fn identity_key(&self, user_id: &[u8; ID_LEN]) -> Option<IdentityPublicKey>;
 
-    /// Whether `device`, certified by its user, may hold a leaf. A client
-    /// cannot know more than the certificate: any device. The server also
-    /// requires an active device of that user (ADR 0019, section 2).
-    fn accepts_device(&self, device: &VerifiedLeaf) -> bool {
-        let _ = device;
-        true
+    /// Whether `device`, certified by its user, may hold a leaf with this
+    /// signature key and this certificate. A client cannot know more than
+    /// the certificate: any device. The server also requires an active
+    /// device of that user, with the key and the certificate it enrolled
+    /// with (ADR 0019, section 2).
+    fn check_device(
+        &self,
+        device: &VerifiedLeaf,
+        signature_key: &[u8],
+        certificate: &[u8],
+    ) -> Result<(), LeafError> {
+        let _ = (device, signature_key, certificate);
+        Ok(())
     }
 }
 
@@ -72,9 +79,17 @@ pub enum LeafError {
     #[error("a leaf was replaced by another device")]
     DeviceChanged,
     /// Certified, but not an active device of its user: revoked, or unknown
-    /// to the server ([`Roster::accepts_device`]).
+    /// to the server ([`Roster::check_device`]).
     #[error("the device is not an active device of its user")]
     InactiveDevice,
+    /// An active device, but not with the key and certificate it enrolled
+    /// with: another key certified under its id ([`Roster::check_device`]).
+    #[error("the leaf is not the device's enrolled key and certificate")]
+    NotEnrolled,
+    /// A device already in the group shows up with another signature key: a
+    /// device never changes its key (ADR 0019, section 2).
+    #[error("a device of the group shows up with another key")]
+    KeyChanged,
 }
 
 /// The credential of this device, with its signature key.
@@ -118,9 +133,7 @@ pub fn verify_leaf(
         user_id: verified.user_id,
         device_id: verified.device_id,
     };
-    if !roster.accepts_device(&leaf) {
-        return Err(LeafError::InactiveDevice);
-    }
+    roster.check_device(&leaf, signature_key, certificate)?;
     Ok(leaf)
 }
 

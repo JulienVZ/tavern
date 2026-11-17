@@ -206,8 +206,10 @@ CREATE TABLE mls_groups (
     group_info      bytea NOT NULL,                          -- PUB   latest GroupInfo with its ratchet tree, for external commits
     updated_at      timestamptz NOT NULL DEFAULT now(),      -- META
     UNIQUE (conversation_id, generation),
-    CHECK (length(group_id) = 20),
     CHECK (generation BETWEEN 0 AND 4294967295),
+    -- The MLS group id: the conversation id, then the generation as 4
+    -- big-endian bytes (ADR 0019, section 17).
+    CHECK (group_id = uuid_send(conversation_id) || substring(int8send(generation) FROM 5 FOR 4)),
     CHECK (epoch >= 1)
 );
 
@@ -216,7 +218,8 @@ CREATE TABLE mls_group_entries (
     kind      smallint NOT NULL,                             -- META  1 tree, 2 context, 3 transcript hash, 4 tag, 5 proposal queue, 6 proposal
     key       bytea NOT NULL,                                -- PUB   empty, or a proposal reference
     value     bytea NOT NULL,                                -- PUB   public MLS state, as OpenMLS serialises it
-    PRIMARY KEY (group_id, kind, key)
+    PRIMARY KEY (group_id, kind, key),
+    CHECK (kind BETWEEN 1 AND 6)
 );
 
 CREATE TABLE dm_conversations (
