@@ -24,8 +24,8 @@
 use std::collections::HashSet;
 
 use openmls::prelude::{
-    LeafNodeIndex, Member, MlsGroup, Proposal, ProposalOrRefType, QueuedProposal, Sender,
-    StagedCommit,
+    ExternalSendersExtension, LeafNodeIndex, Member, MlsGroup, Proposal, ProposalOrRefType,
+    QueuedProposal, Sender, StagedCommit,
 };
 
 use super::MembershipChanges;
@@ -87,15 +87,62 @@ fn is_server_remove(queued: &QueuedProposal) -> bool {
         && matches!(queued.proposal(), Proposal::Remove(_))
 }
 
-/// The leaves the server has asked to remove, from the stored proposals.
-pub(crate) fn server_requested_removals(group: &MlsGroup) -> HashSet<LeafNodeIndex> {
-    group
-        .pending_proposals()
+/// The leaves the server has asked to remove, among stored proposals.
+pub(crate) fn requested_by_server<'a>(
+    proposals: impl IntoIterator<Item = &'a QueuedProposal>,
+) -> HashSet<LeafNodeIndex> {
+    proposals
+        .into_iter()
         .filter(|queued| is_server_remove(queued))
         .filter_map(|queued| match queued.proposal() {
             Proposal::Remove(remove) => Some(remove.removed()),
             _ => None,
         })
+        .collect()
+}
+
+/// The leaves the server has asked to remove, from a member's stored
+/// proposals.
+pub(crate) fn server_requested_removals(group: &MlsGroup) -> HashSet<LeafNodeIndex> {
+    group.requested_removals()
+}
+
+/// What the policy reads of a group: a member's `MlsGroup` on a client, the
+/// `PublicGroup` on the server, which applies the same rules.
+pub(crate) trait GroupView {
+    /// The device of the leaf at `index`, if the leaf is not blank.
+    fn device_at(&self, index: LeafNodeIndex) -> Option<VerifiedLeaf>;
+    /// The devices of the group, with their leaves.
+    fn leaves(&self) -> Vec<(LeafNodeIndex, VerifiedLeaf)>;
+    /// The group's external senders.
+    fn external_senders(&self) -> Option<&ExternalSendersExtension>;
+    /// The leaves the server has asked to remove, from the stored proposals.
+    fn requested_removals(&self) -> HashSet<LeafNodeIndex>;
+}
+
+impl GroupView for MlsGroup {
+    fn device_at(&self, index: LeafNodeIndex) -> Option<VerifiedLeaf> {
+        self.member_at(index).as_ref().and_then(member_leaf)
+    }
+
+    fn leaves(&self) -> Vec<(LeafNodeIndex, VerifiedLeaf)> {
+        named_leaves(self.members())
+    }
+
+    fn external_senders(&self) -> Option<&ExternalSendersExtension> {
+        self.extensions().external_senders()
+    }
+
+    fn requested_removals(&self) -> HashSet<LeafNodeIndex> {
+        requested_by_server(self.pending_proposals())
+    }
+}
+
+pub(crate) fn named_leaves(
+    members: impl Iterator<Item = Member>,
+) -> Vec<(LeafNodeIndex, VerifiedLeaf)> {
+    members
+        .filter_map(|member| member_leaf(&member).map(|leaf| (member.index, leaf)))
         .collect()
 }
 
@@ -117,10 +164,6 @@ pub(crate) fn check_standalone(queued: &QueuedProposal) -> Result<(), PolicyErro
 
 fn member_leaf(member: &Member) -> Option<VerifiedLeaf> {
     name_leaf(&member.credential)
-}
-
-fn leaf_at(group: &MlsGroup, index: LeafNodeIndex) -> Option<VerifiedLeaf> {
-    group.member_at(index).as_ref().and_then(member_leaf)
 }
 
 /// Who made a commit.
@@ -160,11 +203,11 @@ enum Kind {
     Other,
 }
 
-fn entry(group: &MlsGroup, queued: &QueuedProposal, roster: &impl Roster) -> Entry {
+fn entry(group: &impl GroupView, queued: &QueuedProposal, roster: &impl Roster) -> Entry {
     let kind = match queued.proposal() {
         Proposal::Remove(remove) => Kind::Remove {
             index: remove.removed(),
-            device: leaf_at(group, remove.removed()),
+            device: group.device_at(remove.removed()),
         },
         Proposal::Add(add) => {
             let leaf = add.key_package().leaf_node();
@@ -176,7 +219,7 @@ fn entry(group: &MlsGroup, queued: &QueuedProposal, roster: &impl Roster) -> Ent
         }
         Proposal::GroupContextExtensions(change) => Kind::GroupContextExtensions {
             keeps_external_senders: change.extensions().external_senders()
-                == group.extensions().external_senders(),
+                == group.external_senders(),
         },
         Proposal::ExternalInit(_) => Kind::ExternalInit,
         _ => Kind::Other,
@@ -246,7 +289,7 @@ fn check_proposals(
 /// commits are checked before they are submitted), and says who joins and
 /// who leaves.
 pub(crate) fn check_commit(
-    group: &MlsGroup,
+    group: &impl GroupView,
     staged: &StagedCommit,
     committer: &Sender,
     roster: &impl Roster,
@@ -259,7 +302,7 @@ pub(crate) fn check_commit(
         .transpose()?;
     let committer = match committer {
         Sender::Member(index) => {
-            let before = leaf_at(group, *index).ok_or(LeafError::Malformed)?;
+            let before = group.device_at(*index).ok_or(LeafError::Malformed)?;
             if let Some(after) = path_leaf
                 && after != before
             {
@@ -280,21 +323,22 @@ pub(crate) fn check_commit(
         .map(|queued| entry(group, queued, roster))
         .collect();
     let (mut added, removed_indexes) =
-        check_proposals(committer, &entries, &server_requested_removals(group))?;
+        check_proposals(committer, &entries, &group.requested_removals())?;
     if let Committer::Joiner(joiner) = committer {
         added.insert(0, joiner);
     }
     let removed: Vec<VerifiedLeaf> = removed_indexes
         .iter()
-        .filter_map(|index| leaf_at(group, *index))
+        .filter_map(|index| group.device_at(*index))
         .collect();
 
     // After the commit, no device may have two leaves.
     let mut devices = HashSet::new();
     let remaining = group
-        .members()
-        .filter(|member| !removed_indexes.contains(&member.index))
-        .filter_map(|member| member_leaf(&member));
+        .leaves()
+        .into_iter()
+        .filter(|(index, _)| !removed_indexes.contains(index))
+        .map(|(_, leaf)| leaf);
     for leaf in remaining.chain(added.iter().copied()) {
         if !devices.insert(leaf) {
             return Err(LeafError::DuplicateDevice.into());
