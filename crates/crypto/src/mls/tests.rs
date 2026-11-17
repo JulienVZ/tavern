@@ -1778,6 +1778,81 @@ fn a_message_of_a_past_epoch_can_no_longer_be_read() {
     );
 }
 
+/// The wrapper refuses a past epoch before OpenMLS sees it (above). Past
+/// it, OpenMLS itself has nothing left to decrypt with: the secrets are
+/// deleted, not merely ignored. A device that keeps one past epoch (a
+/// configuration Tavern never uses) still reads the same message.
+#[test]
+fn the_secrets_of_a_past_epoch_are_deleted() {
+    use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
+    use openmls::prelude::{PastEpochDeletionPolicy, ProcessMessageError, ValidationError};
+
+    let mut dm = Dm::new();
+    let device = &dm.devices[0];
+    let late = dm.groups[0]
+        .encrypt(
+            &device.provider,
+            &device.signer(),
+            b"sent before the update",
+        )
+        .unwrap();
+    dm.groups[3]
+        .inner_mut()
+        .set_past_epoch_deletion_policy(
+            &dm.devices[3].provider,
+            PastEpochDeletionPolicy::MaxEpochs(1),
+        )
+        .unwrap();
+    let device = &dm.devices[2];
+    let update = dm.groups[2]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    dm.groups[2]
+        .merge_pending_commit(&dm.devices[2].provider)
+        .unwrap();
+    dm.deliver(1, &update.commit).unwrap();
+    dm.deliver(3, &update.commit).unwrap();
+
+    let protocol = || {
+        MlsMessageIn::tls_deserialize_bytes(&late)
+            .unwrap()
+            .0
+            .try_into_protocol_message()
+            .unwrap()
+    };
+    let error = dm.groups[1]
+        .inner_mut()
+        .process_message(&dm.devices[1].provider, protocol())
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+                MessageDecryptionError::SecretTreeError(SecretTreeError::TooDistantInThePast)
+            ))
+        ),
+        "{error:?}"
+    );
+    assert!(matches!(
+        processing_error(error),
+        MlsError::Refused(Refusal::PastEpoch)
+    ));
+
+    let read = dm.groups[3]
+        .inner_mut()
+        .process_message(&dm.devices[3].provider, protocol())
+        .unwrap();
+    match read.into_content() {
+        openmls::prelude::ProcessedMessageContent::ApplicationMessage(message) => {
+            assert_eq!(
+                padding::unpad(&message.into_bytes()).unwrap(),
+                b"sent before the update"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn messages_of_one_sender_may_arrive_out_of_order() {
     let mut dm = Dm::new();

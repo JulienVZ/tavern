@@ -148,7 +148,14 @@ pub(crate) fn processing_error<E: std::fmt::Display>(
     match error {
         P::InvalidCommit(StageCommitError::MissingProposal) => Alarm::UnknownProposal.into(),
         P::ValidationError(V::WrongEpoch) => MlsError::Refused(Refusal::WrongEpoch),
-        P::ValidationError(V::NoPastEpochData) => MlsError::Refused(Refusal::PastEpoch),
+        // A `PublicMessage` of a past epoch, and a `PrivateMessage` of an
+        // epoch whose secrets are deleted (section 9).
+        P::ValidationError(
+            V::NoPastEpochData
+            | V::UnableToDecrypt(MessageDecryptionError::SecretTreeError(
+                SecretTreeError::TooDistantInThePast,
+            )),
+        ) => MlsError::Refused(Refusal::PastEpoch),
         P::ValidationError(V::WrongGroupId) => MlsError::Refused(Refusal::WrongGroup),
         P::ValidationError(V::InvalidSignature) => MlsError::Refused(Refusal::InvalidSignature),
         P::ValidationError(V::UnauthorizedExternalSender) => {
