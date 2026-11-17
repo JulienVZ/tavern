@@ -165,6 +165,29 @@ jobs:
           count=$(grep -c crypto_bigint "$RUNNER_TEMP/argon2_memory.nm" || true)
           echo "crypto_bigint symbols: $count"
           test "$count" -eq 0
+      # deny.toml ignores RUSTSEC-2026-0543 (chrono, unmaintained) on the
+      # grounds that zxcvbn depends on chrono for wasm32 only, a target Tavern
+      # does not ship. This keeps that claim true for every shipped target.
+      # Witnesses: chrono is found under wasm32, and zxcvbn under each shipped
+      # target. Once zxcvbn drops chrono, the first witness fails: remove this
+      # step and the deny.toml entry.
+      - name: chrono is not built for any shipped target
+        run: |
+          deps() { cargo tree --locked --workspace --target "$1" --invert "$2" --prefix none; }
+          deps wasm32-unknown-unknown chrono > "$RUNNER_TEMP/chrono-wasm32.tree"
+          grep -q '^chrono ' "$RUNNER_TEMP/chrono-wasm32.tree"
+          echo "wasm32: chrono found (witness)"
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-pc-windows-msvc aarch64-pc-windows-msvc \
+            x86_64-apple-darwin aarch64-apple-darwin; do
+            deps "$target" zxcvbn > "$RUNNER_TEMP/zxcvbn.tree"
+            grep -q '^zxcvbn ' "$RUNNER_TEMP/zxcvbn.tree"
+            deps "$target" chrono > "$RUNNER_TEMP/chrono.tree"
+            if grep -q '^chrono ' "$RUNNER_TEMP/chrono.tree"; then
+              echo "$target builds chrono:"; cat "$RUNNER_TEMP/chrono.tree"; exit 1
+            fi
+            echo "$target: zxcvbn found (witness), chrono absent"
+          done
       - name: Free disk space
         run: |
           df -h / | tail -n 1

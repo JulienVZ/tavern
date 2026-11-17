@@ -40,6 +40,14 @@ ignore = [
     # hax-lib-macros. No upgrade exists. Approved on 2026-11-16 (ADR 0019).
     # Remove this entry as soon as cargo deny reports it as not encountered.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained compile-time proc macro under OpenMLS's HPKE (libcrux); no runtime code, no fix available" },
+    # chrono (unmaintained, no vulnerability, no fixed version) reaches the
+    # lock file through zxcvbn 3.1, the client's password strength estimator,
+    # which depends on it for wasm32 only: a target Tavern does not ship.
+    # It is built for none of the shipped targets, which CI checks on every
+    # run (step "chrono is not built for any shipped target"). Approved on
+    # 2026-11-17. Remove this entry when zxcvbn drops chrono (the CI step then
+    # fails on its wasm32 witness), or before Tavern ever builds for wasm32.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is a wasm32-only dependency of zxcvbn; no shipped target builds it; verified in CI" },
 ]
 
 [licenses]
