@@ -167,13 +167,14 @@ jobs:
           test "$count" -eq 0
       # deny.toml ignores RUSTSEC-2026-0543 (chrono, unmaintained) on the
       # grounds that zxcvbn depends on chrono for wasm32 only, a target Tavern
-      # does not ship. This keeps that claim true for every shipped target.
-      # Witnesses: chrono is found under wasm32, and zxcvbn under each shipped
-      # target. Once zxcvbn drops chrono, the first witness fails: remove this
-      # step and the deny.toml entry.
+      # does not ship. This keeps that claim true for every shipped target,
+      # with every feature on, as cargo deny reads the graph (deny.toml,
+      # [graph]). Witnesses: chrono is found under wasm32, and zxcvbn under
+      # each shipped target. Once zxcvbn drops chrono, the first witness
+      # fails: remove this step and the deny.toml entry.
       - name: chrono is not built for any shipped target
         run: |
-          deps() { cargo tree --locked --workspace --target "$1" --invert "$2" --prefix none; }
+          deps() { cargo tree --locked --workspace --all-features --target "$1" --invert "$2" --prefix none; }
           deps wasm32-unknown-unknown chrono > "$RUNNER_TEMP/chrono-wasm32.tree"
           grep -q '^chrono ' "$RUNNER_TEMP/chrono-wasm32.tree"
           echo "wasm32: chrono found (witness)"
