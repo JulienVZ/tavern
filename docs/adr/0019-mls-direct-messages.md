@@ -157,7 +157,6 @@ What the user can do, from the alarm:
 
 **Resyncs are bounded**: a second `OutOfSync` in the same conversation within 24 hours of an automatic resync marks the conversation broken, with the alarm above, and so does an `OutOfSync` once the conversation has had 3 automatic resyncs in 30 days. A server cannot keep a device resyncing silently. (Values proposed with this correction, to be confirmed in the plan of task 10.)
 
-
 ### 12. Ciphertext retention on the server
 
 - A stored message (application, commit or proposal) is deleted once every leaf it was sent to has acknowledged it, and in any case after `TAVERN_MESSAGE_RETENTION_DAYS` (default 30, maximum 30), by a background task that runs every hour. A welcome is deleted when acknowledged, or after the same delay.
@@ -246,6 +245,15 @@ The counter-review of `46b90a3..c0c7d70` found the 14 findings corrected, and th
 - F. `MlsError::OutOfSync` for a commit the device cannot process (section 11). Test: a forked device gets it, resyncs by external commit, and reads again.
 - G. A wrong comment on the external commit's proposal filter is corrected.
 
+### Corrections after the check of A to G (2026-11-17)
+
+The reviewer's check of `c0c7d70..3fa660f` found A to G corrected and the chrono exception right, with four points:
+
+1. `OutOfSync` was too broad: everything but OpenMLS's local errors became a desynchronisation, so a dishonest server could cause silent resyncs at will. Every error is now classified explicitly (section 11): 48 alarms, 9 out of sync, the local ones, and the refusals the wrapper decides first. Tests: one case per error (`every_error_refusing_a_commit_is_classified`), and an encrypted commit raising the alarm end to end. Resyncs are bounded (section 11). On its own, an external proposal other than an `Add` is now a policy refusal, no longer a library error.
+2. A pending server `Remove` of this very device made every commit fail with OpenMLS's `CannotRemoveSelf`, reported as a library error: commits now fail with `MlsError::BeingRemoved` (section 6). Test: update, add, remove and pending commits refused, the request kept, the removal committed by another member.
+3. The CI check of chrono reads the graph with every feature on, as `cargo deny` does.
+4. The `deny.toml` comment also names chrono's optional dependency under serde_with, never enabled.
+
 ## Tasks that follow (M2)
 
 | Task | Content |
@@ -254,7 +262,7 @@ The counter-review of `46b90a3..c0c7d70` found the 14 findings corrected, and th
 | 4 | Server public state (14), commit validation, `Remove` signing |
 | 5–7 | KeyPackages and their claim rules (3), friends and blocks, conversations: one DM per pair (4) |
 | 8–9 | Messages, sequence, acknowledgements, idempotency, retention (7, 12); commits, GroupInfo, external commits (5, 7), removal (6), inactive devices and restore (15), recreation (17), read-only DMs (16) |
-| 10–11 | Client sync engine and storage provider (13), including the resync of a device out of sync and, if it fails, the broken conversation (11); trust: pinning, safety numbers, warnings (10, 11) |
+| 10–11 | Client sync engine and storage provider (13), including the resync of a device out of sync, bounded (a second one within 24 hours, or a fourth in 30 days, marks the conversation broken with the alarm), the broken conversation if it fails (11), and a device being removed, which commits nothing (6); trust: pinning, safety numbers, warnings (10, 11) |
 | 12 | Tauri commands and UI, including the notice that a participant with no device in the group cannot read what is sent (4) |
 | 13–14 | Tests (18), memory measurements, documentation |
 
