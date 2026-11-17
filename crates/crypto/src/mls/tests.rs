@@ -1522,6 +1522,85 @@ fn an_own_commit_sent_back_by_the_server_is_merged() {
     dm.send(1, b"merged");
 }
 
+/// A device whose state forked (it merged a commit that the others never
+/// saw, or lost a write) cannot process the next commit the server accepted.
+/// That is not an alarm: it resyncs by external commit as the same device
+/// (section 5), and the conversation goes on (section 11).
+#[test]
+fn a_device_out_of_sync_resyncs_by_external_commit() {
+    let mut dm = Dm::new();
+    let device = &dm.devices[0];
+    let refused = dm.groups[0]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    let device = &dm.devices[2];
+    let accepted = dm.groups[2]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    dm.groups[2]
+        .merge_pending_commit(&dm.devices[2].provider)
+        .unwrap();
+    dm.groups[0]
+        .discard_pending_commit(&dm.devices[0].provider)
+        .unwrap();
+    dm.deliver(0, &accepted.commit).unwrap();
+    dm.deliver(3, &accepted.commit).unwrap();
+    // Alice's second device merges the commit the server refused.
+    dm.deliver(1, &refused.commit).unwrap();
+    assert_eq!(dm.epochs(), [2, 2, 2, 2], "same epoch, another state");
+
+    let device = &dm.devices[3];
+    let next = dm.groups[3]
+        .self_update(&device.provider, &device.signer(), &dm.pins)
+        .unwrap();
+    dm.groups[3]
+        .merge_pending_commit(&dm.devices[3].provider)
+        .unwrap();
+    dm.deliver(0, &next.commit).unwrap();
+    dm.deliver(2, &next.commit).unwrap();
+
+    let result = dm.deliver(1, &next.commit);
+    assert!(matches!(result, Err(MlsError::OutOfSync(_))), "{result:?}");
+    let error = result.unwrap_err();
+    assert!(error.is_out_of_sync());
+    assert!(!error.is_alarm());
+    assert_eq!(dm.groups[1].epoch(), 2, "nothing merged");
+
+    // The resync: the forked state is dropped, the device rejoins from the
+    // latest GroupInfo, replacing its own earlier leaf.
+    let forked = dm.groups.remove(1);
+    forked.delete(&dm.devices[1].provider).unwrap();
+    let device = &dm.devices[1];
+    let (mut group, rejoined, _) = Group::join_by_external_commit(
+        &device.provider,
+        &device.signer(),
+        device.credential(),
+        &next.group_info,
+        &expected(),
+        &dm.pins,
+        &dm.server.public_bytes(),
+    )
+    .unwrap();
+    group.merge_pending_commit(&device.provider).unwrap();
+    dm.groups.insert(1, group);
+    let alice2 = dm.devices[1].leaf();
+    for incoming in dm.deliver_all(&rejoined.commit, &[1]) {
+        assert_eq!(
+            incoming,
+            Incoming::Commit {
+                changes: MembershipChanges {
+                    added: vec![alice2],
+                    removed: vec![alice2],
+                },
+                self_removed: false,
+            }
+        );
+    }
+    assert_eq!(dm.epochs(), [4, 4, 4, 4]);
+    dm.send(1, b"back in sync");
+    dm.send(2, b"good");
+}
+
 // --- Serialization round trips ------------------------------------------------------------
 
 proptest! {

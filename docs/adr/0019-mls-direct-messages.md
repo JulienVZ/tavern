@@ -142,6 +142,14 @@ What the user can do, from the alarm:
 - **Warn the administrator of the instance**: a certificate that does not verify, or an AIK that changed without the contact knowing, means the server misbehaves. The alarm says so in those words.
 - **Recreate the conversation** (17) from its menu, with the keys pinned now. The local history is kept; the broken group is abandoned.
 
+**A device out of sync** (decided 2026-11-17) is another case, not an alarm: a commit of the conversation's sequence, for the device's epoch and accepted by the server, that OpenMLS cannot process (`MlsError::OutOfSync`), because the device's state no longer matches the others' (a lost write, a commit merged that the others never saw). Other devices can process that commit; this one cannot, and would read nothing more. The client core then:
+
+1. drops the group's state and rejoins by external commit from the latest GroupInfo, as the same device (a resync, 5), checking the group as in 4;
+2. shows the gap in the conversation, like a return after inactivity (15);
+3. if the resync fails (refused by the server, or the group fails the checks of 4), marks the conversation broken as above, with the actions listed there. A group that fails the checks raises the alarm itself.
+
+A commit that refers to a refused proposal stays an alarm; a failure of the device's own storage is retried, not a desynchronisation.
+
 ### 12. Ciphertext retention on the server
 
 - A stored message (application, commit or proposal) is deleted once every leaf it was sent to has acknowledged it, and in any case after `TAVERN_MESSAGE_RETENTION_DAYS` (default 30, maximum 30), by a background task that runs every hour. A welcome is deleted when acknowledged, or after the same delay.

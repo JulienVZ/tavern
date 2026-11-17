@@ -75,6 +75,15 @@ pub enum MlsError {
     /// OpenMLS refused the message.
     #[error("refused message: {0}")]
     Refused(Refusal),
+    /// A commit of the conversation's sequence, for this device's epoch, that
+    /// OpenMLS cannot process although the server accepted it: this device's
+    /// group state no longer matches the other devices' (a lost write, a
+    /// commit merged that the others never saw). Not an alarm: the device
+    /// resyncs by external commit, as the same device (section 5), and the
+    /// conversation is marked broken (section 11) only if that fails. See
+    /// [`MlsError::is_out_of_sync`].
+    #[error("this device is out of sync with the group: {0}")]
+    OutOfSync(String),
     /// The padded content is malformed.
     #[error("malformed padding: {0}")]
     Padding(#[from] padding::PaddingError),
@@ -101,6 +110,12 @@ impl MlsError {
     /// server accepted, or a commit that refers to a refused proposal.
     pub fn is_alarm(&self) -> bool {
         matches!(self, Self::Alarm(_))
+    }
+
+    /// Whether this device must resync by external commit (section 11): it
+    /// cannot process a commit the server accepted.
+    pub fn is_out_of_sync(&self) -> bool {
+        matches!(self, Self::OutOfSync(_))
     }
 }
 
@@ -167,6 +182,23 @@ pub(crate) fn processing_error<E: std::fmt::Display>(
         P::ValidationError(V::UnableToDecrypt(_)) => MlsError::Refused(Refusal::UnableToDecrypt),
         P::ValidationError(V::UnknownMember) => MlsError::Refused(Refusal::UnknownMember),
         other => library(other),
+    }
+}
+
+/// Classifies OpenMLS's refusal of a commit of the conversation's sequence,
+/// once the wrapper has checked that it is for this group and this epoch.
+/// The server accepted it, so the other devices can process it: unless it
+/// refers to a proposal this device refused (an alarm), or fails for this
+/// device's own reasons (its storage, a bug, a group it has left), this
+/// device is out of sync.
+pub(crate) fn commit_processing_error<E: std::fmt::Display>(
+    error: openmls::prelude::ProcessMessageError<E>,
+) -> MlsError {
+    use openmls::prelude::{ProcessMessageError as P, StageCommitError};
+    match error {
+        P::InvalidCommit(StageCommitError::MissingProposal) => Alarm::UnknownProposal.into(),
+        P::LibraryError(_) | P::StorageError(_) | P::GroupStateError(_) => library(error),
+        other => MlsError::OutOfSync(other.to_string()),
     }
 }
 

@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
 use openmls::prelude::{
-    CommitBuilder, CommitMessageBundle, CredentialWithKey, Initial, KeyPackageBundle,
+    CommitBuilder, CommitMessageBundle, ContentType, CredentialWithKey, Initial, KeyPackageBundle,
     KeyPackageRef, LeafNodeIndex, MlsGroup, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
     ProcessedMessageContent, ProposalOrRefType, ProtocolMessage, ProtocolVersion, QueuedProposal,
     Sender, StagedWelcome, Welcome,
@@ -29,8 +29,8 @@ use super::group_id::GroupIdentity;
 use super::key_package::ClaimedKeyPackage;
 use super::policy::{self, Alarm, PolicyError};
 use super::{
-    CIPHERSUITE, DeviceSigner, MlsError, create_config, join_config, library, padding,
-    processing_error, required_capabilities, server_external_sender,
+    CIPHERSUITE, DeviceSigner, MlsError, commit_processing_error, create_config, join_config,
+    library, padding, processing_error, required_capabilities, server_external_sender,
 };
 use crate::identity::{ID_LEN, PUBLIC_KEY_LEN};
 
@@ -577,7 +577,10 @@ impl Group {
     /// Processes a message from the conversation's sequence: decrypts
     /// content, stores the server's removal proposals, checks and merges
     /// commits. Nothing that fails the policy or a leaf check is stored or
-    /// merged; a commit that fails is an alarm ([`MlsError::is_alarm`]).
+    /// merged; a commit that fails is an alarm ([`MlsError::is_alarm`]). A
+    /// commit of this epoch that OpenMLS cannot process, although the server
+    /// accepted it, means this device is out of sync
+    /// ([`MlsError::is_out_of_sync`]).
     pub fn process<P: OpenMlsProvider>(
         &mut self,
         provider: &P,
@@ -599,10 +602,17 @@ impl Group {
         if epoch > current {
             return Err(MlsError::Refused(super::Refusal::WrongEpoch));
         }
+        let is_commit = protocol.content_type() == ContentType::Commit;
         let processed = self
             .inner
             .process_message(provider, protocol)
-            .map_err(processing_error)?;
+            .map_err(|error| {
+                if is_commit {
+                    commit_processing_error(error)
+                } else {
+                    processing_error(error)
+                }
+            })?;
         let sender = processed.sender().clone();
         let sender_leaf = name_leaf(processed.credential());
         match processed.into_content() {
