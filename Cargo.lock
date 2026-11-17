@@ -6665,6 +6665,8 @@ dependencies = [
  "data-encoding",
  "futures-util",
  "governor",
+ "openmls_memory_storage",
+ "openmls_traits",
  "prost",
  "reqwest",
  "serde",

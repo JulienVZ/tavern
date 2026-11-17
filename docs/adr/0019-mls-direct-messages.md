@@ -174,6 +174,8 @@ What the user can do, from the alarm:
 
 The server's `PublicGroup` is stored in PostgreSQL (`mls_groups`: public group state, class PUB; latest GroupInfo, class PUB), through a `PublicStorageProvider` that loads the group's entries at the start of a request and writes those changed in the same transaction as the epoch update. The OpenMLS API is synchronous; this keeps it out of async code.
 
+As implemented (task 4, decided 2026-11-17): one row per group generation in `mls_groups` (group id, conversation, generation, epoch, latest GroupInfo), and OpenMLS's rows in `mls_group_entries` (kind, key, value). Loading a group locks its row until the transaction ends. Creating a generation deletes the conversation's earlier ones, with their rows, in the same transaction: the server keeps the current state only (12).
+
 ### 15. Inactive devices, and restored backups
 
 - **Inactive devices**: a device that has not connected for `TAVERN_DEVICE_INACTIVE_DAYS` (default: the retention, 30 days; never more than `TAVERN_MESSAGE_RETENTION_DAYS`, the server refuses to start otherwise) is removed from its groups by the server as in 6, without being revoked. Beyond the retention the device has to rejoin by external commit anyway, since what it missed is gone; keeping it a member longer would only keep a useless leaf, to which every message is still encrypted. When it comes back (its session may still be valid: sessions last 90 days without use), it rejoins each conversation by external commit and shows in each one: "this device was away from <date> to <date>; messages from that time are not available here".
@@ -269,7 +271,6 @@ The reviewer's check of `c0c7d70..3fa660f` found A to G corrected and the chrono
   - `crypto` now depends on `serde` and `serde_json`, already in the workspace, to store OpenMLS's values as OpenMLS serialises them.
   - A fixture of the stored rows (`crates/crypto/fixtures/public-state-v1.txt`) must keep loading after an OpenMLS upgrade (13).
 
-
 ## Tasks that follow (M2)
 
 | Task | Content |
@@ -277,7 +278,7 @@ The reviewer's check of `c0c7d70..3fa660f` found A to G corrected and the chrono
 | 3 | `crypto/src/mls/`: wrapper, parameters, credential checks, padding, safety numbers |
 | 4 | Server public state (14), commit validation, `Remove` signing |
 | 5–7 | KeyPackages and their claim rules (3), friends and blocks, conversations: one DM per pair (4) |
-| 8–9 | Messages, sequence, acknowledgements, idempotency, retention (7, 12); commits, GroupInfo, external commits (5, 7), removal (6), inactive devices and restore (15), recreation (17), read-only DMs (16) |
+| 8–9 | Messages, sequence, acknowledgements, idempotency, retention (7, 12); commits, GroupInfo, external commits (5, 7), removal (6), the removals asked again after an external commit appended to the sequence (5), the notice to active devices left out of a group (4), inactive devices and restore (15), recreation (17), read-only DMs (16) |
 | 10–11 | Client sync engine and storage provider (13), including the resync of a device out of sync, bounded (a second one within 24 hours, or a fourth in 30 days, marks the conversation broken with the alarm), the broken conversation if it fails (11), and a device being removed, which commits nothing (6); trust: pinning, safety numbers, warnings (10, 11) |
 | 12 | Tauri commands and UI, including the notice that a participant with no device in the group cannot read what is sent (4) |
 | 13–14 | Tests (18), memory measurements, documentation |
