@@ -226,6 +226,18 @@ Findings of the review, all corrected (commits from `46b90a3`):
 12. The guard on `openmls_memory_storage` reads the dependency graph (`cargo metadata`, renames included), and CI checks that none of its symbols is linked into the server or the client (it is re-exported by `openmls_rust_crypto`, which the graph alone does not see).
 13. and 14. Tests check exact errors, the groups' actual parameters, positive witnesses, the STALE_EPOCH path, `OwnPendingCommit`, and serialization round trips by property.
 
+### Corrections after the counter-review (2026-11-17)
+
+The counter-review of `46b90a3..c0c7d70` found the 14 findings corrected, and these new points, decided by the maintainer and corrected in the commits that follow `c0c7d70`:
+
+- A. `ExpectedGroup` no longer requires a device of every participant: only devices of others are refused (section 4). `Group::participants_without_devices` names those without one, for the conversation to say it (task 12). Tests: a DM created with no KeyPackage, joined by external commit and by Welcome, then recreated, while Bob has no device; Bob joining later.
+- B. `add`, `self_update` and `remove` include the server's pending removals (sections 6, 7). Test: each of the three, with a pending removal, carries it once.
+- C. In an external commit, nothing by reference, and the joiner's rules come first (section 5). The policy's decision is a pure function, tested case by case (`policy::tests`), since OpenMLS's API cannot build such a commit.
+- D. CI: every `nm` search checks first that the binary exists and has symbols of its own.
+- E. A test bypasses the wrapper's epoch check: OpenMLS itself can no longer decrypt a message of a past epoch (`UnableToDecrypt(TooDistantInThePast)` for a `PrivateMessage`; `NoPastEpochData` is the error for a `PublicMessage`, which never carries content), while a device configured to keep one past epoch still reads it. The wrapper maps both errors to `Refusal::PastEpoch`.
+- F. `MlsError::OutOfSync` for a commit the device cannot process (section 11). Test: a forked device gets it, resyncs by external commit, and reads again.
+- G. A wrong comment on the external commit's proposal filter is corrected.
+
 ## Tasks that follow (M2)
 
 | Task | Content |
@@ -234,13 +246,15 @@ Findings of the review, all corrected (commits from `46b90a3`):
 | 4 | Server public state (14), commit validation, `Remove` signing |
 | 5–7 | KeyPackages and their claim rules (3), friends and blocks, conversations: one DM per pair (4) |
 | 8–9 | Messages, sequence, acknowledgements, idempotency, retention (7, 12); commits, GroupInfo, external commits (5, 7), removal (6), inactive devices and restore (15), recreation (17), read-only DMs (16) |
-| 10–11 | Client sync engine and storage provider (13); trust: pinning, safety numbers, warnings (10, 11) |
-| 12 | Tauri commands and UI |
+| 10–11 | Client sync engine and storage provider (13), including the resync of a device out of sync and, if it fails, the broken conversation (11); trust: pinning, safety numbers, warnings (10, 11) |
+| 12 | Tauri commands and UI, including the notice that a participant with no device in the group cannot read what is sent (4) |
 | 13–14 | Tests (18), memory measurements, documentation |
 
 ## Validation
 
 Validated by the maintainer on 2026-11-16: OpenMLS 0.9.2 and the RUSTSEC-2026-0173 exception with its removal condition; the parameters (20 + 1 KeyPackages, `max_past_epochs = 0`, sender ratchet tolerance, 7-day updates, padding buckets); the safety number format and the behaviour on key change. Added at validation: who may claim KeyPackages and how often (3), one DM per pair (4), unfriending and blocking (16), inactive devices removed after the retention period (15), the simplified repair after a restored backup and the recreation of a group (15, 17), what the user can do with a broken conversation (11), removals shown like additions (6), idempotent sending (7). Corrected afterwards (2026-11-16): a restored backup revokes every session, so that a device revoked after the backup cannot act without the password; the idempotency record is kept for twice the retention, and clients never resend a message older than the retention.
+
+Confirmed by the maintainer on 2026-11-17: the rules marked "accepted 2026-11-16" (members check external commits, 5; members never send proposals on their own and clients refuse unauthorised removals, 6; the pair (user id, device id) as a device's identity and `DeviceChanged`, 2). Decided the same day, after the counter-review: a participant may have no device in the group (4), every commit carries the pending removals (6, 7), nothing by reference in an external commit (5), and the path of a device out of sync (11).
 
 ## Consequences
 
