@@ -1172,6 +1172,155 @@ fn a_member_removes_its_own_devices_or_those_the_server_asked_for() {
     );
 }
 
+/// Section 6: removals come first. Whatever this device commits while a
+/// removal requested by the server is pending carries it: merging a commit
+/// empties the store, so a commit that left it out would lose it.
+#[test]
+fn every_commit_carries_the_server_s_pending_removals() {
+    #[derive(Debug, Clone, Copy)]
+    enum Operation {
+        Update,
+        Add,
+        RemoveOwnDevice,
+        RemoveRequested,
+    }
+    for operation in [
+        Operation::Update,
+        Operation::Add,
+        Operation::RemoveOwnDevice,
+        Operation::RemoveRequested,
+    ] {
+        let mut dm = Dm::new();
+        let bob2 = dm.devices[3].leaf();
+        let bob2_index = dm.groups[0]
+            .leaf_of(&bob2.user_id, &bob2.device_id)
+            .unwrap();
+        let request = server_remove(&mut dm, bob2_index);
+        for incoming in dm.deliver_all(&request, &[]) {
+            assert_eq!(incoming, Incoming::Proposal);
+        }
+
+        let alice2 = dm.devices[1].leaf();
+        let alice2_index = dm.groups[0]
+            .leaf_of(&alice2.user_id, &alice2.device_id)
+            .unwrap();
+        let bob3 = dm.bob.device(0xb3);
+        let device = &dm.devices[0];
+        let (provider, signer) = (&device.provider, device.signer());
+        let group = &mut dm.groups[0];
+        let (commit, mut expected) = match operation {
+            Operation::Update => (
+                group.self_update(provider, &signer, &dm.pins).unwrap(),
+                MembershipChanges {
+                    added: vec![],
+                    removed: vec![bob2],
+                },
+            ),
+            Operation::Add => (
+                group
+                    .add(provider, &signer, &[bob3.claimed(&dm.pins)], &dm.pins)
+                    .unwrap(),
+                MembershipChanges {
+                    added: vec![bob3.leaf()],
+                    removed: vec![bob2],
+                },
+            ),
+            Operation::RemoveOwnDevice => (
+                group
+                    .remove(provider, &signer, &[alice2_index], &dm.pins)
+                    .unwrap(),
+                MembershipChanges {
+                    added: vec![],
+                    removed: vec![bob2, alice2],
+                },
+            ),
+            // Not twice: once, by reference.
+            Operation::RemoveRequested => (
+                group
+                    .remove(provider, &signer, &[bob2_index], &dm.pins)
+                    .unwrap(),
+                MembershipChanges {
+                    added: vec![],
+                    removed: vec![bob2],
+                },
+            ),
+        };
+        let staged = group.inner_mut().pending_commit().unwrap();
+        let by_reference: Vec<_> = staged
+            .queued_proposals()
+            .filter(|queued| {
+                queued.proposal_or_ref_type() == openmls::prelude::ProposalOrRefType::Reference
+            })
+            .collect();
+        assert_eq!(by_reference.len(), 1, "{operation:?}");
+        assert!(matches!(by_reference[0].sender(), Sender::External(_)));
+        dm.groups[0]
+            .merge_pending_commit(&dm.devices[0].provider)
+            .unwrap();
+
+        expected.removed.sort_by_key(|leaf| leaf.device_id);
+        for index in [1, 2, 3] {
+            match dm.deliver(index, &commit.commit) {
+                Ok(Incoming::Commit {
+                    mut changes,
+                    self_removed,
+                }) => {
+                    changes.removed.sort_by_key(|leaf| leaf.device_id);
+                    assert_eq!(changes, expected, "{operation:?}");
+                    let gone = expected.removed.contains(&dm.devices[index].leaf());
+                    assert_eq!(self_removed, gone, "{operation:?}");
+                }
+                other => panic!("{operation:?}: {other:?}"),
+            }
+        }
+        assert!(!dm.groups[0].devices().contains(&bob2), "{operation:?}");
+        assert_eq!(dm.groups[0].inner_mut().pending_proposals().count(), 0);
+        assert!(
+            dm.groups[0]
+                .commit_pending_proposals(
+                    &dm.devices[0].provider,
+                    &dm.devices[0].signer(),
+                    &dm.pins
+                )
+                .unwrap()
+                .is_none(),
+            "nothing left to commit"
+        );
+    }
+}
+
+/// An external commit cannot carry the server's removals (the joining
+/// device does not have them, and may not refer to them): merging it
+/// empties the members' stores, and the server has to ask again in the new
+/// epoch (ADR 0019, section 6).
+#[test]
+fn an_external_commit_leaves_the_server_s_removals_to_be_asked_again() {
+    let mut dm = Dm::new();
+    let bob2 = dm.devices[3].leaf();
+    let bob2_index = dm.groups[0]
+        .leaf_of(&bob2.user_id, &bob2.device_id)
+        .unwrap();
+    let request = server_remove(&mut dm, bob2_index);
+    dm.deliver_all(&request, &[]);
+
+    let alice3 = dm.alice.device(0xa3);
+    let (_, commit) = join_externally(&mut dm, &alice3).unwrap();
+    for incoming in dm.deliver_all(&commit.commit, &[]) {
+        assert_eq!(
+            incoming,
+            Incoming::Commit {
+                changes: MembershipChanges {
+                    added: vec![alice3.leaf()],
+                    removed: vec![],
+                },
+                self_removed: false,
+            }
+        );
+    }
+    assert!(dm.groups[0].devices().contains(&bob2));
+    assert_eq!(dm.groups[0].inner_mut().pending_proposals().count(), 0);
+}
+
 #[test]
 fn devices_are_told_apart_by_user_and_device_id() {
     let mut dm = Dm::new();

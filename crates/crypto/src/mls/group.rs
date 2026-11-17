@@ -7,16 +7,18 @@
 //! written (section 13). Commits created here stay pending until the server
 //! accepts them ([`Group::merge_pending_commit`]) or refuses them
 //! ([`Group::discard_pending_commit`]), as section 7 requires. They carry
-//! only the proposals chosen here, never whatever OpenMLS has stored, and
-//! pass the same checks as other devices' commits before they are returned.
+//! the proposals chosen here and the server's pending removals, never
+//! anything else OpenMLS has stored, and pass the same checks as other
+//! devices' commits before they are returned.
 
 use std::collections::HashSet;
 
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
 use openmls::prelude::{
-    CommitMessageBundle, CredentialWithKey, KeyPackageBundle, KeyPackageRef, LeafNodeIndex,
-    MlsGroup, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessageContent,
-    ProtocolMessage, ProtocolVersion, Sender, StagedWelcome, Welcome,
+    CommitBuilder, CommitMessageBundle, CredentialWithKey, Initial, KeyPackageBundle,
+    KeyPackageRef, LeafNodeIndex, MlsGroup, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    ProcessedMessageContent, ProposalOrRefType, ProtocolMessage, ProtocolVersion, QueuedProposal,
+    Sender, StagedWelcome, Welcome,
 };
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::storage::StorageProvider as _;
@@ -253,6 +255,14 @@ fn check_key_packages(
     Ok(verified)
 }
 
+/// Which proposals a commit of this device carries: its own, by value, and
+/// the server's pending removals, by reference (section 6: removals come
+/// first, and merging a commit empties the store, so a commit that left them
+/// out would lose them). Nothing else OpenMLS has stored.
+fn own_or_server_removal(queued: &QueuedProposal) -> bool {
+    queued.proposal_or_ref_type() == ProposalOrRefType::Proposal || policy::committable(queued)
+}
+
 /// An own commit that fails the checks is a bug of this device, not an
 /// alarm about others.
 fn own_commit_error(alarm: Alarm) -> MlsError {
@@ -303,8 +313,9 @@ impl Group {
         Ok((group, commit))
     }
 
-    /// Adds devices, in a commit that stays pending. Each package must pass
-    /// the roster, and no device may end up with two leaves.
+    /// Adds devices, in a commit that stays pending, with the server's
+    /// pending removals. Each package must pass the roster, and no device
+    /// may end up with two leaves.
     pub fn add<P: OpenMlsProvider>(
         &mut self,
         provider: &P,
@@ -313,21 +324,35 @@ impl Group {
         roster: &impl Roster,
     ) -> Result<Commit, MlsError> {
         check_key_packages(key_packages, roster, &self.devices())?;
-        let bundle = self
-            .inner
-            .commit_builder()
-            .consume_proposal_store(false)
-            .propose_adds(
+        self.own_commit(provider, signer, roster, |builder| {
+            builder.propose_adds(
                 key_packages
                     .iter()
                     .map(|claimed| claimed.key_package().clone()),
             )
+        })
+    }
+
+    /// Builds this device's commit: `proposals` adds its own, the store
+    /// gives the server's pending removals ([`own_or_server_removal`]). The
+    /// commit stays pending, once checked like any other.
+    fn own_commit<P: OpenMlsProvider>(
+        &mut self,
+        provider: &P,
+        signer: &DeviceSigner<'_>,
+        roster: &impl Roster,
+        proposals: impl FnOnce(CommitBuilder<'_, Initial>) -> CommitBuilder<'_, Initial>,
+    ) -> Result<Commit, MlsError> {
+        let bundle = proposals(self.inner.commit_builder().consume_proposal_store(true))
             .load_psks(provider.storage())
             .map_err(library)?
             .create_group_info(true)
-            // The filter applies to this commit's own proposals too: keep them.
-            // The store is left out by `consume_proposal_store(false)`.
-            .build(provider.rand(), provider.crypto(), signer, |_| true)
+            .build(
+                provider.rand(),
+                provider.crypto(),
+                signer,
+                own_or_server_removal,
+            )
             .map_err(library)?
             .stage_commit(provider)
             .map_err(library)?;
@@ -432,8 +457,10 @@ impl Group {
             .load_psks(provider.storage())
             .map_err(library)?
             .create_group_info(true)
-            // The filter applies to this commit's own proposals too: keep them.
-            // The store is left out by `consume_proposal_store(false)`.
+            // The filter sees the external commit's own proposals only (its
+            // `ExternalInit`, and the `Remove` OpenMLS adds for an earlier leaf
+            // of this device): keep them. No other proposal was given to the
+            // builder (no `with_proposals`).
             .build(provider.rand(), provider.crypto(), signer, |_| true)
             .map_err(library)?
             .finalize(provider)
@@ -618,29 +645,17 @@ impl Group {
         }
     }
 
-    /// Commits an update of this device's leaf (section 9), pending. It
-    /// carries no proposal.
+    /// Commits an update of this device's leaf (section 9), pending, with
+    /// the server's pending removals and no other proposal.
     pub fn self_update<P: OpenMlsProvider>(
         &mut self,
         provider: &P,
         signer: &DeviceSigner<'_>,
         roster: &impl Roster,
     ) -> Result<Commit, MlsError> {
-        let bundle = self
-            .inner
-            .commit_builder()
-            .consume_proposal_store(false)
-            .force_self_update(true)
-            .load_psks(provider.storage())
-            .map_err(library)?
-            .create_group_info(true)
-            // The filter applies to this commit's own proposals too: keep them.
-            // The store is left out by `consume_proposal_store(false)`.
-            .build(provider.rand(), provider.crypto(), signer, |_| true)
-            .map_err(library)?
-            .stage_commit(provider)
-            .map_err(library)?;
-        self.checked_own_commit(provider, bundle, roster)
+        self.own_commit(provider, signer, roster, |builder| {
+            builder.force_self_update(true)
+        })
     }
 
     /// Commits the server's stored removal proposals (section 6), and
@@ -654,27 +669,13 @@ impl Group {
         if !self.inner.pending_proposals().any(policy::committable) {
             return Ok(None);
         }
-        let bundle = self
-            .inner
-            .commit_builder()
-            .consume_proposal_store(true)
-            .load_psks(provider.storage())
-            .map_err(library)?
-            .create_group_info(true)
-            .build(
-                provider.rand(),
-                provider.crypto(),
-                signer,
-                policy::committable,
-            )
-            .map_err(library)?
-            .stage_commit(provider)
-            .map_err(library)?;
-        self.checked_own_commit(provider, bundle, roster).map(Some)
+        self.own_commit(provider, signer, roster, |builder| builder)
+            .map(Some)
     }
 
-    /// Removes leaves, pending: devices of this user (a device it replaces),
-    /// or leaves the server asked to remove. Anything else is refused.
+    /// Removes leaves, pending, with the server's pending removals: devices
+    /// of this user (a device it replaces), or leaves the server asked to
+    /// remove. Anything else is refused.
     pub fn remove<P: OpenMlsProvider>(
         &mut self,
         provider: &P,
@@ -700,21 +701,16 @@ impl Group {
                 return Err(PolicyError::RemoveNotAllowed.into());
             }
         }
-        let bundle = self
-            .inner
-            .commit_builder()
-            .consume_proposal_store(false)
-            .propose_removals(leaves.iter().copied())
-            .load_psks(provider.storage())
-            .map_err(library)?
-            .create_group_info(true)
-            // The filter applies to this commit's own proposals too: keep them.
-            // The store is left out by `consume_proposal_store(false)`.
-            .build(provider.rand(), provider.crypto(), signer, |_| true)
-            .map_err(library)?
-            .stage_commit(provider)
-            .map_err(library)?;
-        self.checked_own_commit(provider, bundle, roster)
+        // The leaves the server asked to remove come from the store, by
+        // reference: not a second time by value.
+        let own: Vec<_> = leaves
+            .iter()
+            .filter(|leaf| !requested.contains(leaf))
+            .copied()
+            .collect();
+        self.own_commit(provider, signer, roster, |builder| {
+            builder.propose_removals(own)
+        })
     }
 
     /// The server accepted this device's pending commit.
