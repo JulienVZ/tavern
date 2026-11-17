@@ -6,8 +6,9 @@
 //! group's row until the transaction ends), lets `tavern-crypto` check and
 //! merge what it must on a [`PublicState`], and writes back the rows that
 //! changed ([`save`]) in the transaction that moves the epoch. Both [`save`]
-//! and [`insert`] use the state up. OpenMLS runs
-//! on the loaded rows in memory, synchronously, between the two.
+//! and [`insert`] use the state up, and [`save`] writes only over the
+//! revision it loaded. OpenMLS runs on the loaded rows in memory,
+//! synchronously, between the two.
 //!
 //! The server never decrypts anything here: it holds the public tree, the
 //! group context and its own `Remove` proposals.
@@ -35,9 +36,9 @@ pub enum StateError {
     /// API, ADR 0019, sections 4 and 17).
     #[error("the conversation already has this group generation or a later one")]
     GenerationExists,
-    /// The stored group does not match the state: its epoch moved since the
-    /// state was loaded, or the row is gone, or its epoch disagrees with its
-    /// rows.
+    /// The stored group does not match the state: another request saved it
+    /// since the state was loaded, or the row is gone, or its epoch disagrees
+    /// with its rows.
     #[error("the stored group does not match the state")]
     Inconsistent,
 }
@@ -130,19 +131,31 @@ pub async fn insert(conn: &mut PgConnection, state: PublicState) -> Result<(), S
     Ok(())
 }
 
+/// A group's state as [`load`] read it, with the revision of its row: what
+/// [`save`] writes back, provided no other request saved the group since.
+#[derive(Debug)]
+pub struct LoadedState {
+    /// The state, to check and merge commits and removals on.
+    pub state: PublicState,
+    identity: GroupIdentity,
+    revision: i64,
+}
+
 /// Loads a group's state, and locks its row until the transaction ends: one
-/// request at a time moves a group's epoch (ADR 0019, section 7).
+/// request at a time moves a group's epoch or changes its proposals (ADR
+/// 0019, sections 7 and 14).
 pub async fn load(
     conn: &mut PgConnection,
     identity: GroupIdentity,
-) -> Result<Option<PublicState>, StateError> {
+) -> Result<Option<LoadedState>, StateError> {
     let id = group_id(identity);
-    let row: Option<(i64, Vec<u8>)> =
-        sqlx::query_as("SELECT epoch, group_info FROM mls_groups WHERE group_id = $1 FOR UPDATE")
-            .bind(&id)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let Some((epoch, group_info)) = row else {
+    let row: Option<(i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT epoch, revision, group_info FROM mls_groups WHERE group_id = $1 FOR UPDATE",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((epoch, revision, group_info)) = row else {
         return Ok(None);
     };
     let rows: Vec<(i16, Vec<u8>, Vec<u8>)> =
@@ -159,28 +172,39 @@ pub async fn load(
     if epoch_of(&state)? != epoch {
         return Err(StateError::Inconsistent);
     }
-    Ok(Some(state))
+    Ok(Some(LoadedState {
+        state,
+        identity,
+        revision,
+    }))
 }
 
 /// Writes back what changed in a state [`load`] returned: its epoch, its
 /// latest GroupInfo and the rows that changed. The state is used up: after a
 /// failure, the request loads the group again rather than reuse a state
-/// whose changes were taken. Refused if the stored group is no longer at the
-/// epoch the state was loaded at.
-pub async fn save(conn: &mut PgConnection, state: PublicState) -> Result<(), StateError> {
-    let id = group_id(state.identity()?);
-    let loaded = state
-        .loaded_epoch()
-        .and_then(|epoch| i64::try_from(epoch).ok())
-        .ok_or(StateError::Inconsistent)?;
+/// whose changes were taken. Refused if another request saved the group
+/// since the state was loaded: every save moves the row's revision, so a
+/// proposal stored in between, which leaves the epoch where it was, counts
+/// too (ADR 0019, section 14).
+pub async fn save(conn: &mut PgConnection, loaded: LoadedState) -> Result<(), StateError> {
+    let LoadedState {
+        state,
+        identity,
+        revision,
+    } = loaded;
+    if state.identity()? != identity {
+        return Err(StateError::Inconsistent);
+    }
+    let id = group_id(identity);
     let updated = sqlx::query(
-        "UPDATE mls_groups SET epoch = $2, group_info = $3, updated_at = now() \
-         WHERE group_id = $1 AND epoch = $4",
+        "UPDATE mls_groups \
+         SET epoch = $2, group_info = $3, revision = revision + 1, updated_at = now() \
+         WHERE group_id = $1 AND revision = $4",
     )
     .bind(&id)
     .bind(epoch_of(&state)?)
     .bind(state.group_info())
-    .bind(loaded)
+    .bind(revision)
     .execute(&mut *conn)
     .await?;
     if updated.rows_affected() != 1 {

@@ -36,13 +36,46 @@ use tavern_crypto::mls::{
     PublicState, Refusal, Roster, ServerSigner, VerifiedLeaf,
 };
 use tavern_server::db;
-use tavern_server::mls::{self, ServerRoster, StateError};
+use tavern_server::mls::{self, LoadedState, ServerRoster, StateError};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 async fn pool() -> PgPool {
     let pool = db::connect(&common::database_url(), 8).await.unwrap();
     db::migrate(&pool).await.unwrap();
     pool
+}
+
+/// The PostgreSQL backend of a connection, to watch it wait.
+async fn backend(conn: &mut sqlx::PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(conn)
+        .await
+        .unwrap()
+}
+
+/// Returns once the backend `waiter` waits for a lock that `holder` holds:
+/// the concurrent request is seen blocked, not assumed to be after a delay.
+/// PostgreSQL announces no such event, so it is polled; the timeout only
+/// keeps a broken test from hanging.
+async fn blocked(pool: &PgPool, waiter: i32, holder: i32) {
+    let wait = async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT $2 = ANY(pg_blocking_pids($1))")
+                .bind(waiter)
+                .bind(holder)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("the other request never waited for the lock");
 }
 
 /// An account in the database, with its identity key.
@@ -298,30 +331,42 @@ impl Dm {
             .unwrap()
     }
 
-    /// The server takes `commit` from `submitter` in a transaction, holding
-    /// the group for `hold` before checking it, and commits the transaction
-    /// or rolls it back. The new epoch, or why OpenMLS or the policy refused.
+    /// The server takes `commit` from `submitter` in a transaction, and
+    /// commits the transaction or rolls it back. The new epoch, or why
+    /// OpenMLS or the policy refused.
     async fn submit(
         &self,
         pool: &PgPool,
         submitter: VerifiedLeaf,
         commit: &Commit,
-        hold: Duration,
         keep: bool,
     ) -> Result<(u64, Vec<Vec<u8>>), MlsError> {
         let mut tx = pool.begin().await.unwrap();
-        let mut state = mls::load(&mut tx, self.identity).await.unwrap().unwrap();
-        tokio::time::sleep(hold).await;
+        let loaded = mls::load(&mut tx, self.identity).await.unwrap().unwrap();
+        self.finish(tx, loaded, submitter, commit, keep).await
+    }
+
+    /// [`Dm::submit`] once the group is loaded in `tx`.
+    async fn finish(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        mut loaded: LoadedState,
+        submitter: VerifiedLeaf,
+        commit: &Commit,
+        keep: bool,
+    ) -> Result<(u64, Vec<Vec<u8>>), MlsError> {
         let roster = self.roster(&mut tx).await;
-        let validated = state.validate_commit(
+        let validated = loaded.state.validate_commit(
             &commit.commit,
             &commit.group_info,
             submitter,
             &self.expected(),
             &roster,
         )?;
-        let merged = state.merge(validated, &ServerSigner::new(&self.server))?;
-        mls::save(&mut tx, state).await.unwrap();
+        let merged = loaded
+            .state
+            .merge(validated, &ServerSigner::new(&self.server))?;
+        mls::save(&mut tx, loaded).await.unwrap();
         if keep {
             tx.commit().await.unwrap();
         } else {
@@ -332,7 +377,11 @@ impl Dm {
 
     async fn stored(&self, pool: &PgPool) -> PublicState {
         let mut conn = pool.acquire().await.unwrap();
-        mls::load(&mut conn, self.identity).await.unwrap().unwrap()
+        mls::load(&mut conn, self.identity)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
     }
 }
 
@@ -348,10 +397,7 @@ async fn the_public_state_moves_with_the_transaction_of_each_commit() {
     // GroupInfo.
     let commit = dm.bob_update();
     let bob1 = dm.bob1.leaf();
-    let (epoch, _) = dm
-        .submit(&pool, bob1, &commit, Duration::ZERO, true)
-        .await
-        .unwrap();
+    let (epoch, _) = dm.submit(&pool, bob1, &commit, true).await.unwrap();
     assert_eq!(epoch, 2);
     let stored = dm.stored(&pool).await;
     assert_eq!(
@@ -369,14 +415,9 @@ async fn the_public_state_moves_with_the_transaction_of_each_commit() {
     // Accepted, then the transaction fails: nothing moved. The retry loads
     // the group again (`save` used the state up) and goes through.
     let commit = dm.bob_update();
-    dm.submit(&pool, bob1, &commit, Duration::ZERO, false)
-        .await
-        .unwrap();
+    dm.submit(&pool, bob1, &commit, false).await.unwrap();
     assert_eq!(dm.stored(&pool).await.epoch(), 2);
-    let (epoch, _) = dm
-        .submit(&pool, bob1, &commit, Duration::ZERO, true)
-        .await
-        .unwrap();
+    let (epoch, _) = dm.submit(&pool, bob1, &commit, true).await.unwrap();
     assert_eq!(epoch, 3);
     assert_eq!(dm.stored(&pool).await.epoch(), 3, "rows and epoch agree");
 }
@@ -392,7 +433,7 @@ async fn a_state_loaded_before_another_commit_cannot_be_saved() {
     tx.rollback().await.unwrap();
 
     let commit = dm.bob_update();
-    dm.submit(&pool, dm.bob1.leaf(), &commit, Duration::ZERO, true)
+    dm.submit(&pool, dm.bob1.leaf(), &commit, true)
         .await
         .unwrap();
 
@@ -404,8 +445,81 @@ async fn a_state_loaded_before_another_commit_cannot_be_saved() {
     );
 }
 
+/// Section 14: a proposal leaves the epoch where it was, so `save` writes
+/// only over the revision it loaded. The scenario of the counter-review, in
+/// three transactions: the first loads the group, asks for Y's removal, and
+/// lets the group go without saving; the second asks for X's removal and
+/// saves it; the third saves the first state. Accepted, it would rewrite
+/// the proposal queue without X, whose removal the clients hold and refer
+/// to in their commits: every later commit refused for a missing proposal.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_state_loaded_before_another_removal_cannot_be_saved() {
+    let pool = pool().await;
+    let dm = Dm::new(&pool).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let mut stale = mls::load(&mut tx, dm.identity).await.unwrap().unwrap();
+    let y = stale.state.leaf_of(dm.alice1.leaf()).unwrap();
+    stale
+        .state
+        .remove(y, &ServerSigner::new(&dm.server))
+        .unwrap()
+        .unwrap();
+    tx.rollback().await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let mut loaded = mls::load(&mut tx, dm.identity).await.unwrap().unwrap();
+    let x = loaded.state.leaf_of(dm.bob1.leaf()).unwrap();
+    loaded
+        .state
+        .remove(x, &ServerSigner::new(&dm.server))
+        .unwrap()
+        .unwrap();
+    mls::save(&mut tx, loaded).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let result = mls::save(&mut tx, stale).await;
+    assert!(
+        matches!(result, Err(StateError::Inconsistent)),
+        "{result:?}"
+    );
+    tx.rollback().await.unwrap();
+    let stored = dm.stored(&pool).await;
+    assert_eq!(stored.epoch(), 1, "a proposal does not move the epoch");
+    assert_eq!(
+        stored.pending_removals().unwrap(),
+        [x],
+        "X's removal is kept"
+    );
+}
+
+/// `save` writes back into the group it loaded only: another group's state
+/// put in its place is refused, though both rows are at the same revision.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_loaded_group_takes_back_only_its_own_state() {
+    let pool = pool().await;
+    let dm = Dm::new(&pool).await;
+    let other = Dm::new(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    let mut loaded = mls::load(&mut tx, dm.identity).await.unwrap().unwrap();
+    loaded.state = mls::load(&mut tx, other.identity)
+        .await
+        .unwrap()
+        .unwrap()
+        .state;
+    let result = mls::save(&mut tx, loaded).await;
+    assert!(
+        matches!(result, Err(StateError::Inconsistent)),
+        "{result:?}"
+    );
+}
+
 /// Section 7 and 18: one commit per epoch under concurrent submissions. The
-/// second waits for the group, then finds the epoch moved.
+/// second waits for the group, then finds the epoch moved. The first holds
+/// the group until the second is seen waiting for it.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn of_two_commits_for_one_epoch_the_second_is_stale() {
@@ -414,11 +528,23 @@ async fn of_two_commits_for_one_epoch_the_second_is_stale() {
     let alice = dm.alice_update();
     let bob = dm.bob_update();
     let (alice1, bob1) = (dm.alice1.leaf(), dm.bob1.leaf());
+    let (locked, on_locked) = oneshot::channel();
+    let (waiting, on_waiting) = oneshot::channel();
 
-    let first = dm.submit(&pool, alice1, &alice, Duration::from_millis(400), true);
+    let first = async {
+        let mut tx = pool.begin().await.unwrap();
+        let holder = backend(&mut tx).await;
+        let loaded = mls::load(&mut tx, dm.identity).await.unwrap().unwrap();
+        locked.send(()).unwrap();
+        blocked(&pool, on_waiting.await.unwrap(), holder).await;
+        dm.finish(tx, loaded, alice1, &alice, true).await
+    };
     let second = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        dm.submit(&pool, bob1, &bob, Duration::ZERO, true).await
+        let mut tx = pool.begin().await.unwrap();
+        waiting.send(backend(&mut tx).await).unwrap();
+        on_locked.await.unwrap();
+        let loaded = mls::load(&mut tx, dm.identity).await.unwrap().unwrap();
+        dm.finish(tx, loaded, bob1, &bob, true).await
     };
     let (first, second) = tokio::join!(first, second);
     assert_eq!(first.unwrap().0, 2);
@@ -437,13 +563,14 @@ async fn the_server_s_removals_go_through_save_and_load() {
     let bob1 = dm.bob1.leaf();
 
     let mut tx = pool.begin().await.unwrap();
-    let mut state = mls::load(&mut tx, dm.identity).await.unwrap().unwrap();
-    let leaf = state.leaf_of(bob1).unwrap();
-    state
+    let mut loaded = mls::load(&mut tx, dm.identity).await.unwrap().unwrap();
+    let leaf = loaded.state.leaf_of(bob1).unwrap();
+    loaded
+        .state
         .remove(leaf, &ServerSigner::new(&dm.server))
         .unwrap()
         .unwrap();
-    mls::save(&mut tx, state).await.unwrap();
+    mls::save(&mut tx, loaded).await.unwrap();
     tx.commit().await.unwrap();
     let stored = dm.stored(&pool).await;
     assert_eq!(stored.pending_removals().unwrap(), [leaf]);
@@ -464,7 +591,7 @@ async fn the_server_s_removals_go_through_save_and_load() {
     )
     .unwrap();
     let (epoch, reissued) = dm
-        .submit(&pool, alice2.leaf(), &joined, Duration::ZERO, true)
+        .submit(&pool, alice2.leaf(), &joined, true)
         .await
         .unwrap();
     assert_eq!((epoch, reissued.len()), (2, 1));
@@ -484,9 +611,7 @@ async fn a_revoked_device_is_not_accepted_any_more() {
         .execute(&pool)
         .await
         .unwrap();
-    let result = dm
-        .submit(&pool, dm.bob1.leaf(), &commit, Duration::ZERO, true)
-        .await;
+    let result = dm.submit(&pool, dm.bob1.leaf(), &commit, true).await;
     assert!(
         matches!(result, Err(MlsError::Leaf(LeafError::InactiveDevice))),
         "{result:?}"
@@ -522,9 +647,7 @@ async fn a_leaf_must_be_the_device_s_enrolled_key_and_certificate() {
                 &keys,
             )
             .unwrap();
-        let result = dm
-            .submit(&pool, dm.alice1.leaf(), &commit, Duration::ZERO, true)
-            .await;
+        let result = dm.submit(&pool, dm.alice1.leaf(), &commit, true).await;
         assert!(
             matches!(result, Err(MlsError::Leaf(LeafError::NotEnrolled))),
             "{result:?}"
@@ -546,9 +669,7 @@ async fn a_leaf_must_be_the_device_s_enrolled_key_and_certificate() {
         &dm.server.public_bytes(),
     )
     .unwrap();
-    let result = dm
-        .submit(&pool, forged.leaf(), &joined, Duration::ZERO, true)
-        .await;
+    let result = dm.submit(&pool, forged.leaf(), &joined, true).await;
     assert!(
         matches!(result, Err(MlsError::Leaf(LeafError::NotEnrolled))),
         "{result:?}"
@@ -565,7 +686,7 @@ async fn a_leaf_must_be_the_device_s_enrolled_key_and_certificate() {
         )
         .unwrap();
     assert!(
-        dm.submit(&pool, dm.alice1.leaf(), &commit, Duration::ZERO, true)
+        dm.submit(&pool, dm.alice1.leaf(), &commit, true)
             .await
             .is_ok()
     );
@@ -637,27 +758,36 @@ async fn a_new_generation_replaces_the_earlier_ones_which_cannot_come_back() {
 
 /// Sections 4 and 17: two devices create the same group at once. The second
 /// waits for the first, then gets `GenerationExists`, never a database error.
+/// The first holds the conversation's lock until the second is seen waiting
+/// for it.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn of_two_creations_at_once_the_second_finds_the_group_there() {
     let pool = pool().await;
     let dm = Dm::made(&pool).await;
-    let (pool_ref, dm_ref) = (&pool, &dm);
-    let create = |hold: Duration| async move {
-        let (pool, dm) = (pool_ref, dm_ref);
+    let (locked, on_locked) = oneshot::channel();
+    let (waiting, on_waiting) = oneshot::channel();
+    let first = async {
         let mut tx = pool.begin().await.unwrap();
+        let holder = backend(&mut tx).await;
         let state = dm
             .created_state(&mut tx, &dm.first_group_info, dm.identity)
             .await;
+        // `insert` takes the conversation's lock, held until the commit.
         let result = mls::insert(&mut tx, state).await;
-        tokio::time::sleep(hold).await;
+        locked.send(()).unwrap();
+        blocked(&pool, on_waiting.await.unwrap(), holder).await;
         tx.commit().await.unwrap();
         result
     };
-    let first = create(Duration::from_millis(400));
     let second = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        create(Duration::ZERO).await
+        let mut tx = pool.begin().await.unwrap();
+        waiting.send(backend(&mut tx).await).unwrap();
+        on_locked.await.unwrap();
+        let state = dm
+            .created_state(&mut tx, &dm.first_group_info, dm.identity)
+            .await;
+        mls::insert(&mut tx, state).await
     };
     let (first, second) = tokio::join!(first, second);
     assert!(first.is_ok(), "{first:?}");
@@ -667,10 +797,12 @@ async fn of_two_creations_at_once_the_second_finds_the_group_there() {
     );
 
     // A writer that skipped the lock meets the unique index instead: the
-    // same answer.
+    // same answer. Its row is committed once the insert waits on it, so
+    // that the insert's own check cannot see it first.
     let dm = Dm::made(&pool).await;
     let conversation = Uuid::from_bytes(dm.identity.conversation_id);
     let mut raw = pool.begin().await.unwrap();
+    let holder = backend(&mut raw).await;
     sqlx::query(
         "INSERT INTO mls_groups (group_id, conversation_id, generation, epoch, group_info) \
          VALUES ($1, $2, 0, 1, '\\x00')",
@@ -680,15 +812,17 @@ async fn of_two_creations_at_once_the_second_finds_the_group_there() {
     .execute(&mut *raw)
     .await
     .unwrap();
+    let (waiting, on_waiting) = oneshot::channel();
     let locked = async {
         let mut tx = pool.begin().await.unwrap();
+        waiting.send(backend(&mut tx).await).unwrap();
         let state = dm
             .created_state(&mut tx, &dm.first_group_info, dm.identity)
             .await;
         mls::insert(&mut tx, state).await
     };
     let release = async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        blocked(&pool, on_waiting.await.unwrap(), holder).await;
         raw.commit().await.unwrap();
     };
     let (result, ()) = tokio::join!(locked, release);

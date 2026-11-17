@@ -529,7 +529,6 @@ pub struct PublicState {
     group: PublicGroup,
     entries: PublicEntries,
     group_info: Vec<u8>,
-    loaded_epoch: Option<u64>,
     crypto: RustCrypto,
 }
 
@@ -686,7 +685,6 @@ impl PublicState {
                 group,
                 entries,
                 group_info: group_info.to_vec(),
-                loaded_epoch: None,
                 crypto,
             },
             devices,
@@ -706,12 +704,10 @@ impl PublicState {
                 EntriesError::Encoding(_) => MlsError::Malformed,
             })?
             .ok_or(MlsError::Malformed)?;
-        let loaded_epoch = Some(group.group_context().epoch().as_u64());
         Ok(Self {
             group,
             entries,
             group_info,
-            loaded_epoch,
             crypto: RustCrypto::default(),
         })
     }
@@ -725,12 +721,6 @@ impl PublicState {
     /// by external commit.
     pub fn group_info(&self) -> &[u8] {
         &self.group_info
-    }
-
-    /// The epoch the state had when it was loaded; `None` for a state that
-    /// [`PublicState::create`] built and that is not stored yet.
-    pub fn loaded_epoch(&self) -> Option<u64> {
-        self.loaded_epoch
     }
 
     /// Which conversation and generation.

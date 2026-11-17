@@ -203,6 +203,7 @@ CREATE TABLE mls_groups (
     conversation_id uuid NOT NULL,                           -- META
     generation      bigint NOT NULL,                         -- META
     epoch           bigint NOT NULL,                         -- META  current epoch
+    revision        bigint NOT NULL DEFAULT 0,               -- META  saves so far: a save writes only over the revision it loaded
     group_info      bytea NOT NULL,                          -- PUB   latest GroupInfo with its ratchet tree, for external commits
     updated_at      timestamptz NOT NULL DEFAULT now(),      -- META
     UNIQUE (conversation_id, generation),
@@ -210,7 +211,8 @@ CREATE TABLE mls_groups (
     -- The MLS group id: the conversation id, then the generation as 4
     -- big-endian bytes (ADR 0019, section 17).
     CHECK (group_id = uuid_send(conversation_id) || substring(int8send(generation) FROM 5 FOR 4)),
-    CHECK (epoch >= 1)
+    CHECK (epoch >= 1),
+    CHECK (revision >= 0)
 );
 
 CREATE TABLE mls_group_entries (
