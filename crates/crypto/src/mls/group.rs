@@ -335,7 +335,8 @@ impl Group {
 
     /// Builds this device's commit: `proposals` adds its own, the store
     /// gives the server's pending removals ([`own_or_server_removal`]). The
-    /// commit stays pending, once checked like any other.
+    /// commit stays pending, once checked like any other. None while the
+    /// server asks to remove this very device ([`MlsError::BeingRemoved`]).
     fn own_commit<P: OpenMlsProvider>(
         &mut self,
         provider: &P,
@@ -343,6 +344,9 @@ impl Group {
         roster: &impl Roster,
         proposals: impl FnOnce(CommitBuilder<'_, Initial>) -> CommitBuilder<'_, Initial>,
     ) -> Result<Commit, MlsError> {
+        if self.being_removed() {
+            return Err(MlsError::BeingRemoved);
+        }
         let bundle = proposals(self.inner.commit_builder().consume_proposal_store(true))
             .load_psks(provider.storage())
             .map_err(library)?
@@ -523,6 +527,12 @@ impl Group {
             .collect()
     }
 
+    /// Whether the server has asked to remove this device from the group:
+    /// it then commits nothing ([`MlsError::BeingRemoved`]).
+    pub fn being_removed(&self) -> bool {
+        policy::server_requested_removals(&self.inner).contains(&self.inner.own_leaf_index())
+    }
+
     /// The participants that have no device in the group (section 4): what
     /// is sent now will not be readable by them, which the conversation
     /// says. They join later by external commit.
@@ -669,7 +679,8 @@ impl Group {
     }
 
     /// Commits the server's stored removal proposals (section 6), and
-    /// nothing else, pending. `None` when none is stored.
+    /// nothing else, pending. `None` when none is stored;
+    /// [`MlsError::BeingRemoved`] when one of them removes this device.
     pub fn commit_pending_proposals<P: OpenMlsProvider>(
         &mut self,
         provider: &P,

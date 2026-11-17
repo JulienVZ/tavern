@@ -84,6 +84,13 @@ pub enum MlsError {
     /// [`MlsError::is_out_of_sync`].
     #[error("this device is out of sync with the group: {0}")]
     OutOfSync(String),
+    /// The server has asked to remove this very device from the group: it
+    /// commits nothing more there (a commit cannot remove its committer, and
+    /// one without the removal would drop it). Another member commits it;
+    /// this device then learns it was removed (`self_removed`), and rejoins
+    /// by external commit if it is still active (section 15).
+    #[error("the server asked to remove this device from the group")]
+    BeingRemoved,
     /// The padded content is malformed.
     #[error("malformed padding: {0}")]
     Padding(#[from] padding::PaddingError),

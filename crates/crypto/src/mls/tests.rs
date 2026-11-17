@@ -1289,6 +1289,81 @@ fn every_commit_carries_the_server_s_pending_removals() {
     }
 }
 
+/// A device the server asks to remove commits nothing more: a commit cannot
+/// remove its committer (OpenMLS refuses to build it), and one without the
+/// removal would drop it from every store. It says so with a typed error,
+/// keeps the request, and learns it was removed when another member commits.
+#[test]
+fn a_device_the_server_removes_commits_nothing_more() {
+    let mut dm = Dm::new();
+    let bob2 = dm.devices[3].leaf();
+    let bob2_index = dm.groups[0]
+        .leaf_of(&bob2.user_id, &bob2.device_id)
+        .unwrap();
+    let bob1 = dm.devices[2].leaf();
+    let bob1_index = dm.groups[3]
+        .leaf_of(&bob1.user_id, &bob1.device_id)
+        .unwrap();
+    let request = server_remove(&mut dm, bob2_index);
+    dm.deliver_all(&request, &[]);
+    assert!(dm.groups[3].being_removed());
+    assert!(!dm.groups[0].being_removed());
+
+    let bob3 = dm.bob.device(0xb3);
+    let device = &dm.devices[3];
+    let (provider, signer) = (&device.provider, device.signer());
+    let group = &mut dm.groups[3];
+    let attempts = [
+        (
+            "update",
+            group.self_update(provider, &signer, &dm.pins).map(|_| ()),
+        ),
+        (
+            "add",
+            group
+                .add(provider, &signer, &[bob3.claimed(&dm.pins)], &dm.pins)
+                .map(|_| ()),
+        ),
+        (
+            "remove",
+            group
+                .remove(provider, &signer, &[bob1_index], &dm.pins)
+                .map(|_| ()),
+        ),
+        (
+            "pending",
+            group
+                .commit_pending_proposals(provider, &signer, &dm.pins)
+                .map(|_| ()),
+        ),
+    ];
+    for (operation, result) in attempts {
+        assert!(
+            matches!(result, Err(MlsError::BeingRemoved)),
+            "{operation}: {result:?}"
+        );
+    }
+    let group = group.inner_mut();
+    assert!(group.pending_commit().is_none());
+    assert_eq!(group.pending_proposals().count(), 1, "the request is kept");
+
+    let device = &dm.devices[0];
+    let commit = dm.groups[0]
+        .commit_pending_proposals(&device.provider, &device.signer(), &dm.pins)
+        .unwrap()
+        .unwrap();
+    dm.groups[0]
+        .merge_pending_commit(&dm.devices[0].provider)
+        .unwrap();
+    assert!(matches!(
+        dm.deliver(3, &commit.commit).unwrap(),
+        Incoming::Commit {
+            self_removed: true,
+            ..
+        }
+    ));
+}
+
 /// An external commit cannot carry the server's removals (the joining
 /// device does not have them, and may not refer to them): merging it
 /// empties the members' stores, and the server has to ask again in the new
