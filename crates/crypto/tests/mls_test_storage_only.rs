@@ -29,13 +29,16 @@ const TEST_ONLY: &str = "openmls_memory_storage";
 fn no_workspace_crate_depends_on_the_in_memory_storage_outside_dev_dependencies() {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    // Not `--offline`: the graph covers every platform, and a build on this
+    // one never fetches the crates of the others (sqlx 0.9.1 brought one for
+    // Apple systems only, which a Linux runner had never downloaded).
+    // `--locked` keeps it the graph of Cargo.lock.
     let output = Command::new(cargo)
         .args([
             "metadata",
             "--format-version",
             "1",
             "--locked",
-            "--offline",
             "--manifest-path",
         ])
         .arg(&manifest)
