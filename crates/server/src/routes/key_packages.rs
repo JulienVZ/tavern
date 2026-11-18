@@ -4,9 +4,11 @@
 //! claims one for each active device of a user they may start a conversation
 //! with, to add those devices to it.
 //!
-//! A one-time package is served once: it is deleted in the claiming
-//! transaction, and two claims at once never get the same one. The
-//! last-resort package is served when no one-time package is left, and kept.
+//! A one-time package is served once: the claiming transaction keeps its
+//! row, without its bytes, until it expires, so that the same package sent
+//! again (a retried upload) is never stored nor served a second time; and
+//! two claims at once never get the same one. The last-resort package is
+//! served when no one-time package is left, and kept.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -26,15 +28,16 @@ use crate::AppState;
 use crate::activity;
 use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::gateway::Event;
+use crate::panics;
 use crate::routes::friends;
 use crate::session::Session;
 
-/// The packages a claim may serve: not expired, nor about to be. The device
-/// that claims one must still be able to add it to a group. A string literal,
-/// for `concat!`: queries stay static.
+/// The packages a claim may serve: not served already, not expired, nor
+/// about to be (the device that claims one must still be able to add it to
+/// a group). A string literal, for `concat!`: queries stay static.
 macro_rules! servable {
     () => {
-        "expires_at > now() + interval '1 hour'"
+        "served_at IS NULL AND expires_at > now() + interval '1 hour'"
     };
 }
 
@@ -96,7 +99,7 @@ type Checked = (
 /// hundred signatures and certificates. One refused package refuses the
 /// upload.
 async fn check(uploader: Uploader, request: UploadKeyPackagesRequest) -> ApiResult<Checked> {
-    tokio::task::spawn_blocking(move || {
+    panics::blocking(move || {
         let check_one = |bytes: B64, last_resort: bool| {
             key_package::validate_upload(bytes.as_slice(), &uploader, last_resort)
                 .map(|uploaded| (bytes.0, uploaded))
@@ -113,8 +116,7 @@ async fn check(uploader: Uploader, request: UploadKeyPackagesRequest) -> ApiResu
             .transpose()?;
         Ok((one_time, last_resort))
     })
-    .await
-    .map_err(|error| ApiError::internal("KeyPackage checks", &error))?
+    .await?
 }
 
 async fn insert<'c>(
@@ -125,7 +127,8 @@ async fn insert<'c>(
 ) -> ApiResult<()> {
     let not_after = i64::try_from(uploaded.not_after)
         .map_err(|_| ApiError::new(ErrorCode::InvalidKeyPackage, "a KeyPackage is not valid"))?;
-    // The same package sent again (a retried upload) is already there.
+    // The same package sent again (a retried upload) is already there, or
+    // was served and keeps its reference until it expires: not stored again.
     sqlx::query(
         "INSERT INTO key_packages (device_id, key_package, reference, last_resort, expires_at) \
          VALUES ($1, $2, $3, $4, to_timestamp($5)) ON CONFLICT (reference) DO NOTHING",
@@ -190,7 +193,8 @@ pub(crate) async fn upload(
         insert(&mut *tx, device, package, true).await?;
     }
     let stored: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM key_packages WHERE device_id = $1 AND NOT last_resort",
+        "SELECT count(*) FROM key_packages \
+         WHERE device_id = $1 AND NOT last_resort AND served_at IS NULL",
     )
     .bind(device)
     .fetch_one(&mut *tx)
@@ -245,8 +249,13 @@ pub(crate) async fn claim(
     Path(user_id): Path<Uuid>,
 ) -> ApiResult<Json<KeyPackageClaim>> {
     state.rate_limits.claims.check_requester(session.user_id)?;
+    let mut tx = state.db.begin().await?;
     if user_id != session.user_id {
-        if !friends::are_friends(&state.db, session.user_id, user_id).await? {
+        // Under the pair's turn (ADR 0020): a block or an unfriending either
+        // ends before the friendship is read, and the claim is refused, or
+        // waits for the claim to end.
+        let friendship = friends::lock_pair(&mut tx, session.user_id, user_id).await?;
+        if !friendship.is_some_and(|row| row.accepted) {
             return Err(ApiError::forbidden());
         }
         state
@@ -255,7 +264,6 @@ pub(crate) async fn claim(
             .check_pair(session.user_id, user_id)?;
     }
 
-    let mut tx = state.db.begin().await?;
     let devices: Vec<Uuid> = sqlx::query_scalar(concat!(
         "SELECT d.id FROM devices d JOIN users u ON u.id = d.user_id \
          WHERE d.user_id = $1 AND d.id <> $2 AND ",
@@ -272,13 +280,17 @@ pub(crate) async fn claim(
     let mut low = Vec::new();
     for device in devices {
         // Oldest first; a package another claim is taking right now is
-        // skipped, never served twice.
+        // skipped, never served twice. Its row stays, without its bytes,
+        // until it expires.
         let one_time: Option<Vec<u8>> = sqlx::query_scalar(concat!(
-            "DELETE FROM key_packages WHERE id = ( \
-                 SELECT id FROM key_packages WHERE device_id = $1 AND NOT last_resort AND ",
+            "WITH taken AS ( \
+                 SELECT id, key_package FROM key_packages \
+                 WHERE device_id = $1 AND NOT last_resort AND ",
             servable!(),
             " ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED) \
-             RETURNING key_package"
+             UPDATE key_packages k SET served_at = now(), key_package = '\\x' \
+             FROM taken WHERE k.id = taken.id \
+             RETURNING taken.key_package"
         ))
         .bind(device)
         .fetch_optional(&mut *tx)

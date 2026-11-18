@@ -197,7 +197,7 @@ Contenu des messages, pièces jointes, noms de fichiers, emojis personnalisés, 
 - Zéroïser les secrets en mémoire (`zeroize`).
 - Ne jamais logger : secrets, tokens, clés, payloads chiffrés, contenu en clair.
 - Toute entrée réseau est non fiable : validation stricte, tailles maximales, timeouts.
-- Une panique déclenchée par une entrée réseau ne doit jamais arrêter le serveur, seulement faire échouer la requête (500) ou la connexion WebSocket (1011), avec un journal sans contenu : le serveur se construit avec le profil `server` (`panic = "unwind"`, `cargo build --profile server`), le client garde `abort` (décision du 2026-11-18, ADR 0019 §18).
+- Une panique déclenchée par une entrée réseau ne doit jamais arrêter le serveur, seulement faire échouer la requête (500) ou la connexion WebSocket (1011), avec un journal sans contenu : le serveur se construit avec le profil `server` (`panic = "unwind"`, `cargo build --profile server`), le client garde `abort` ; le travail bloquant passe par `panics::blocking`, jamais par `spawn_blocking` directement (clippy l'impose dans le serveur), car l'affichage d'une `JoinError` cite le message de la panique (décisions du 2026-11-18, ADR 0019 §18).
 - Fuzzing (`cargo-fuzz`) sur le décodage du protocole.
 
 ---

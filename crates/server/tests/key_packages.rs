@@ -101,11 +101,12 @@ async fn claimed_devices(app: &TestApp, device: &Device, user: Uuid) -> Vec<Uuid
         .collect()
 }
 
-/// The rows stored for `device`: one-time, then last resort.
+/// The packages stored for `device` and not served: one-time, then last
+/// resort.
 async fn stored(app: &TestApp, device: &Device) -> (i64, i64) {
     sqlx::query_as(
         "SELECT count(*) FILTER (WHERE NOT last_resort), count(*) FILTER (WHERE last_resort) \
-         FROM key_packages WHERE device_id = $1",
+         FROM key_packages WHERE device_id = $1 AND served_at IS NULL",
     )
     .bind(device.device_id)
     .fetch_one(&app.state.db)
@@ -309,6 +310,43 @@ async fn a_claim_serves_each_one_time_package_once_then_the_last_resort() {
     );
 }
 
+/// The scenario of the review of tasks 5 to 7: a device sends its packages,
+/// a claim takes the first, and the same upload comes again (its answer was
+/// lost). The package served stays served: it is not stored again, and no
+/// claim gets it a second time. Its row keeps its reference only.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_package_sent_again_after_its_claim_is_never_served_again() {
+    let app = TestApp::spawn().await;
+    let (account, claimer) = app.account_with_device("kp", false).await;
+    let laptop = app.enrol(&account).await;
+    let batch = laptop.key_packages(3);
+    assert_eq!(upload(&app, &laptop, batch.clone(), None).await, 3);
+    let first = claim(&app, &claimer, account.user_id).await.unwrap();
+    assert_eq!(first.key_packages[0].key_package, batch[0]);
+
+    assert_eq!(
+        upload(&app, &laptop, batch.clone(), None).await,
+        2,
+        "the served package is not stored again"
+    );
+    let mut served = Vec::new();
+    for _ in 0..3 {
+        let claim = claim(&app, &claimer, account.user_id).await.unwrap();
+        served.extend(claim.key_packages.into_iter().map(|p| p.key_package));
+    }
+    assert_eq!(served, [batch[1].clone(), batch[2].clone()]);
+    let kept: Vec<(i32, bool)> = sqlx::query_as(
+        "SELECT octet_length(key_package), served_at IS NOT NULL FROM key_packages \
+         WHERE device_id = $1 ORDER BY created_at, id",
+    )
+    .bind(laptop.device_id)
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(kept, [(0, true), (0, true), (0, true)], "references only");
+}
+
 /// Two claims at once never get the same one-time package: one that another
 /// claim is taking is skipped.
 #[tokio::test]
@@ -492,6 +530,63 @@ async fn a_friend_s_key_packages_are_claimable_within_the_pair_limit() {
     let (status, ..) = claim(&app, &carol1, bob.user_id).await.unwrap_err();
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(count(&app, &bob1).await, 6, "nothing consumed");
+}
+
+/// A claim after a block is refused, and takes nothing: the friendship is
+/// read under the pair's turn, which the block takes too.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_claim_after_a_block_is_forbidden_and_takes_nothing() {
+    let app = TestApp::spawn().await;
+    let (alice, alice1) = app.account_with_device("kp", false).await;
+    let (bob, bob1) = app.account_with_device("kp", false).await;
+    app.befriend((&alice, &alice1), (&bob, &bob1)).await;
+    upload(
+        &app,
+        &bob1,
+        bob1.key_packages(2),
+        Some(bob1.key_package(true)),
+    )
+    .await;
+    let status = app
+        .status::<()>(
+            Method::PUT,
+            &format!("/v1/blocks/{}", alice.user_id),
+            Some(&bob1.session_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, ..) = claim(&app, &alice1, bob.user_id).await.unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(stored(&app, &bob1).await, (2, 1), "nothing consumed");
+}
+
+/// A friend whose account is disabled has no active device: a claim serves
+/// nothing, and takes nothing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_friend_whose_account_is_disabled_has_nothing_to_serve() {
+    let app = TestApp::spawn().await;
+    let (alice, alice1) = app.account_with_device("kp", false).await;
+    let (bob, bob1) = app.account_with_device("kp", false).await;
+    app.befriend((&alice, &alice1), (&bob, &bob1)).await;
+    upload(
+        &app,
+        &bob1,
+        bob1.key_packages(2),
+        Some(bob1.key_package(true)),
+    )
+    .await;
+    sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1")
+        .bind(bob.user_id)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    assert!(claimed_devices(&app, &alice1, bob.user_id).await.is_empty());
+    assert_eq!(stored(&app, &bob1).await, (2, 1), "nothing consumed");
 }
 
 /// Anyone but oneself and one's friends is refused, an unknown user too,

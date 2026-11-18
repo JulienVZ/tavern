@@ -24,6 +24,8 @@ pub mod routes;
 pub mod secrets;
 pub mod session;
 pub mod telemetry;
+#[cfg(test)]
+mod test_log;
 pub mod totp;
 
 use std::sync::Arc;

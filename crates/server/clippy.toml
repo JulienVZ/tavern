@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Clippy reads the nearest clippy.toml only: this one repeats the root's.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Blocking work goes through `panics::blocking`: a `JoinError`'s `Display`
+# quotes the panic's message, which must never be logged (ADR 0019,
+# section 18).
+disallowed-methods = [
+    { path = "tokio::task::spawn_blocking", reason = "use panics::blocking, which never logs a panic's message" },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "use panics::blocking, which never logs a panic's message" },
+]

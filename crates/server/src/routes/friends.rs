@@ -106,19 +106,6 @@ async fn blocks<'c>(db: impl PgExecutor<'c>, blocker: Uuid, blocked: Uuid) -> Ap
     .await?)
 }
 
-/// Whether two users are friends.
-pub(crate) async fn are_friends<'c>(db: impl PgExecutor<'c>, a: Uuid, b: Uuid) -> ApiResult<bool> {
-    let (low, high) = pair(a, b);
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM friendships \
-         WHERE user_low = $1 AND user_high = $2 AND status = 'accepted')",
-    )
-    .bind(low)
-    .bind(high)
-    .fetch_one(db)
-    .await?)
-}
-
 async fn user_exists<'c>(db: impl PgExecutor<'c>, user: Uuid) -> ApiResult<bool> {
     Ok(
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")

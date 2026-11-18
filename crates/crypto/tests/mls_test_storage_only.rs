@@ -5,9 +5,9 @@
 //! PostgreSQL; nothing else may hold it.
 //!
 //! `openmls_memory_storage` is in the dependency graph anyway, through
-//! `openmls_rust_crypto`. This test reads the graph Cargo resolves (`cargo
-//! metadata`, so that a renamed dependency is seen as what it is) and fails
-//! if any crate of the workspace depends on it outside
+//! `openmls_rust_crypto`. This test reads what each crate of the workspace
+//! declares (`cargo metadata`, so that a renamed dependency is seen as what
+//! it is) and fails if any of them depends on it outside
 //! `[dev-dependencies]`. CI also checks the production binaries: no symbol of
 //! `openmls_memory_storage` may be linked into the server or the client,
 //! which also covers its re-export by `openmls_rust_crypto`.
@@ -29,16 +29,17 @@ const TEST_ONLY: &str = "openmls_memory_storage";
 fn no_workspace_crate_depends_on_the_in_memory_storage_outside_dev_dependencies() {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
-    // Not `--offline`: the graph covers every platform, and a build on this
-    // one never fetches the crates of the others (sqlx 0.9.1 brought one for
-    // Apple systems only, which a Linux runner had never downloaded).
-    // `--locked` keeps it the graph of Cargo.lock.
+    // `--no-deps`: the workspace's crates with the dependencies they declare
+    // (kind and rename included), without resolving the graph, so nothing
+    // is downloaded and the test runs offline. Resolving it would need the
+    // crates of every platform, which a build on one never fetches.
     let output = Command::new(cargo)
         .args([
             "metadata",
             "--format-version",
             "1",
-            "--locked",
+            "--no-deps",
+            "--offline",
             "--manifest-path",
         ])
         .arg(&manifest)

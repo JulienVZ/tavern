@@ -48,8 +48,18 @@ const MAX_APPLICATION_MESSAGE_BYTES: u32 = 64 * 1024;
 /// Largest upload announced to clients (used from milestone M5).
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
+/// Translates a registry event into a frame, and the close code that
+/// follows it, if any.
+pub type Translate = fn(Event) -> (ServerPayload, Option<u16>);
+
 /// Upgrades to a WebSocket. Refused unless the client asks for `tavern.v1`.
 pub(crate) async fn connect(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade_with(state, upgrade, event_payload)
+}
+
+/// The gateway's upgrade, with the translation of registry events given:
+/// [`event_payload`] for the server's route; tests give one that panics.
+pub fn upgrade_with(state: AppState, upgrade: WebSocketUpgrade, translate: Translate) -> Response {
     let upgrade = upgrade
         .protocols([GATEWAY_SUBPROTOCOL])
         .max_message_size(DEFAULT_MAX_FRAME_BYTES as usize)
@@ -61,7 +71,21 @@ pub(crate) async fn connect(State(state): State<AppState>, upgrade: WebSocketUpg
         )
             .into_response();
     }
-    upgrade.on_upgrade(move |socket| serve(state, socket))
+    upgrade.on_upgrade(move |socket| serve(state, socket, translate))
+}
+
+/// A connection in the registry, taken out of it when dropped: at the end of
+/// [`serve`], or by a panic that unwinds through it.
+struct Registered<'a> {
+    state: &'a AppState,
+    device: Uuid,
+    generation: u64,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.state.gateway.disconnect(self.device, self.generation);
+    }
 }
 
 fn frame(request_id: u64, payload: ServerPayload) -> Message {
@@ -212,7 +236,7 @@ fn failed<T, E>(result: Result<Result<T, E>, Panicked>) -> Result<T, u16> {
     }
 }
 
-async fn serve(state: AppState, socket: WebSocket) {
+async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
     // A panic while handling Hello drops the socket: the connection closes.
     let Ok(Some((mut socket, session, hello_id))) = panics::guard(handshake(&state, socket)).await
     else {
@@ -229,6 +253,11 @@ async fn serve(state: AppState, socket: WebSocket) {
     // Subscribe before reading the pending notices, so that none is lost in
     // between: one recorded meanwhile arrives twice, and clients go by its id.
     let mut subscription = state.gateway.connect(session.user_id, session.device_id);
+    let registered = Registered {
+        state: &state,
+        device: session.device_id,
+        generation: subscription.generation,
+    };
     let pending = async {
         let notices = notices::pending(&state, &session).await?;
         let key_packages = key_packages::remaining(&state.db, session.device_id).await?;
@@ -237,9 +266,7 @@ async fn serve(state: AppState, socket: WebSocket) {
     let (security_notices, key_packages_remaining) = match failed(panics::guard(pending).await) {
         Ok(pending) => pending,
         Err(code) => {
-            state
-                .gateway
-                .disconnect(session.device_id, subscription.generation);
+            drop(registered);
             close(socket, code).await;
             return;
         }
@@ -271,11 +298,17 @@ async fn serve(state: AppState, socket: WebSocket) {
     {
         None
     } else {
-        run(&state, &mut socket, &session, &mut subscription.events).await
+        run(
+            &state,
+            &mut socket,
+            &session,
+            &mut subscription.events,
+            translate,
+        )
+        .await
     };
-    state
-        .gateway
-        .disconnect(session.device_id, subscription.generation);
+    // Out of the registry before the peer sees the close.
+    drop(registered);
     if let Some(code) = close_with {
         close(socket, code).await;
     }
@@ -288,6 +321,7 @@ async fn run(
     socket: &mut WebSocket,
     session: &Session,
     events: &mut tokio::sync::mpsc::Receiver<Event>,
+    translate: Translate,
 ) -> Option<u16> {
     let silence = Duration::from_millis(GATEWAY_HEARTBEAT_TIMEOUT_MS);
     loop {
@@ -317,12 +351,18 @@ async fn run(
                     // The registry dropped this connection.
                     return Some(close_code::REPLACED);
                 };
-                let (payload, then_close) = event_payload(event);
-                if socket.send(frame(0, payload)).await.is_err() {
-                    return None;
-                }
-                if let Some(code) = then_close {
-                    return Some(code);
+                // Like a frame, an event is handled under the guard: a panic
+                // closes this connection only.
+                let sent = panics::guard(async {
+                    let (payload, then_close) = translate(event);
+                    socket.send(frame(0, payload)).await.map(|()| then_close)
+                })
+                .await;
+                match sent {
+                    Err(Panicked) => return Some(close_code::INTERNAL_ERROR),
+                    Ok(Err(_)) => return None,
+                    Ok(Ok(Some(code))) => return Some(code),
+                    Ok(Ok(None)) => {}
                 }
             }
         }
@@ -443,8 +483,9 @@ async fn session_is_live(state: &AppState, session: &Session) -> bool {
     live.unwrap_or(true)
 }
 
-/// Translates a registry event into a frame, and the close code that follows it, if any.
-fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
+/// Translates a registry event into a frame, and the close code that follows
+/// it, if any: the gateway's [`Translate`].
+pub fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
     match event {
         Event::DeviceListChanged { device_id, added } => (
             ServerPayload::DeviceListChanged(proto::DeviceListChanged {

@@ -14,7 +14,12 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::time::Duration;
+
+use axum::Router;
+use axum::extract::{State, WebSocketUpgrade};
+use axum::routing::get;
 
 use common::{Device, TestApp};
 use futures_util::{SinkExt, StreamExt};
@@ -25,6 +30,8 @@ use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_protocol::rest::B64;
 use tavern_protocol::{GATEWAY_PATH, GATEWAY_SUBPROTOCOL, close_code};
+use tavern_server::gateway::Event;
+use tavern_server::{AppState, routes, with_layers};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -36,7 +43,11 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const NO_BODY: Option<&()> = None;
 
 async fn open(app: &TestApp, subprotocol: Option<&str>) -> Result<Socket, StatusCode> {
-    let mut request = format!("ws://{}{GATEWAY_PATH}", app.addr)
+    open_at(app.addr, subprotocol).await
+}
+
+async fn open_at(addr: SocketAddr, subprotocol: Option<&str>) -> Result<Socket, StatusCode> {
+    let mut request = format!("ws://{addr}{GATEWAY_PATH}")
         .into_client_request()
         .unwrap();
     if let Some(subprotocol) = subprotocol {
@@ -115,7 +126,11 @@ fn hello(token: &B64) -> ClientPayload {
 
 /// Opens an authenticated connection and returns it with its `Ready`.
 async fn connect(app: &TestApp, device: &Device) -> (Socket, proto::Ready) {
-    let mut socket = open(app, Some(GATEWAY_SUBPROTOCOL)).await.unwrap();
+    connect_at(app.addr, device).await
+}
+
+async fn connect_at(addr: SocketAddr, device: &Device) -> (Socket, proto::Ready) {
+    let mut socket = open_at(addr, Some(GATEWAY_SUBPROTOCOL)).await.unwrap();
     send(&mut socket, 1, hello(&device.session_token)).await;
     let frame = expect_frame(&mut socket).await;
     assert_eq!(frame.request_id, 1);
@@ -123,6 +138,77 @@ async fn connect(app: &TestApp, device: &Device) -> (Socket, proto::Ready) {
         panic!("expected Ready, got {frame:?}");
     };
     (socket, ready)
+}
+
+/// The event the test gateway below panics on.
+const PANICS: Event = Event::KeyPackagesLow { remaining: 4242 };
+
+fn panicking_translate(event: Event) -> (ServerPayload, Option<u16>) {
+    assert_ne!(event, PANICS, "translating the test's event");
+    routes::gateway::event_payload(event)
+}
+
+/// ADR 0019, section 18: a panic while the gateway handles a connection's
+/// event closes that connection with 1011 and takes it out of the registry;
+/// the other connections go on.
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn a_panic_closes_its_connection_and_the_others_go_on() {
+    let app = TestApp::spawn().await;
+    let (_, alice1) = app.account_with_device("gw", false).await;
+    let (_, bob1) = app.account_with_device("gw", false).await;
+    // The server's state (database, registry), under its layers, with a
+    // gateway whose translation of events panics on one of them.
+    let routes = Router::new().route(
+        GATEWAY_PATH,
+        get(
+            |State(state): State<AppState>, upgrade: WebSocketUpgrade| async move {
+                routes::gateway::upgrade_with(state, upgrade, panicking_translate)
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = with_layers(routes, app.state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            server.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let (mut alice_socket, _) = connect_at(addr, &alice1).await;
+    let (mut bob_socket, _) = connect_at(addr, &bob1).await;
+    assert_eq!(app.state.gateway.connected(), 2);
+
+    app.state.gateway.notify_device(bob1.device_id, PANICS);
+    assert_eq!(
+        expect_close(&mut bob_socket).await,
+        Some(close_code::INTERNAL_ERROR)
+    );
+    assert_eq!(app.state.gateway.connected(), 1, "out of the registry");
+
+    // Alice's connection goes on: an event, then a heartbeat.
+    app.state
+        .gateway
+        .notify_device(alice1.device_id, Event::KeyPackagesLow { remaining: 3 });
+    assert_eq!(
+        expect_frame(&mut alice_socket).await.payload,
+        Some(ServerPayload::KeyPackagesLow(proto::KeyPackagesLow {
+            remaining: 3
+        }))
+    );
+    send(
+        &mut alice_socket,
+        2,
+        ClientPayload::Heartbeat(proto::Heartbeat {}),
+    )
+    .await;
+    assert!(matches!(
+        expect_frame(&mut alice_socket).await.payload,
+        Some(ServerPayload::HeartbeatAck(_))
+    ));
 }
 
 #[tokio::test]

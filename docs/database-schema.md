@@ -146,12 +146,14 @@ Profile fields added at M5 (`bio`, `custom_status`, `avatar_blob_id`, `banner_bl
 ## 4. M2 — KeyPackages, friends, conversations, messages
 
 ```sql
--- Implemented (task 5 of M2, migration 0006). The KeyPackages each device
--- keeps on the server (ADR 0019, section 3): up to 200 one-time packages,
--- each served once and deleted in the claiming transaction, and one
--- last-resort package, served when no one-time package is left and kept
--- until the device replaces it. Public MLS data only: the private parts stay
--- on the device. A revoked device's packages are deleted with its
+-- Implemented (task 5 of M2, migrations 0006 and 0009). The KeyPackages
+-- each device keeps on the server (ADR 0019, section 3): up to 200 one-time
+-- packages, each served once, and one last-resort package, served when no
+-- one-time package is left and kept until the device replaces it. A served
+-- one-time package keeps its row, without its bytes, until it expires: its
+-- reference stays taken, so that the same package sent again is never
+-- stored nor served a second time. Public MLS data only: the private parts
+-- stay on the device. A revoked device's packages are deleted with its
 -- revocation.
 CREATE TABLE key_packages (
     id           uuid PRIMARY KEY DEFAULT uuidv7(),          -- META
@@ -161,7 +163,11 @@ CREATE TABLE key_packages (
     last_resort  boolean NOT NULL DEFAULT false,             -- META
     expires_at   timestamptz NOT NULL,                       -- META  end of the KeyPackage's lifetime
     created_at   timestamptz NOT NULL DEFAULT now(),         -- META
-    CHECK (octet_length(key_package) <= 4096)
+    served_at    timestamptz,                                -- META  when a claim served it (one-time packages; migration 0009)
+    CHECK (octet_length(key_package) <= 4096),
+    CONSTRAINT key_packages_served CHECK (
+        served_at IS NULL OR (NOT last_resort AND octet_length(key_package) = 0)
+    )
 );
 -- A claim serves a device's oldest one-time package first.
 CREATE INDEX key_packages_device_idx ON key_packages (device_id, last_resort, created_at);

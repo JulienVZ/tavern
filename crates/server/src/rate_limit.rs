@@ -208,8 +208,11 @@ impl ClaimLimiter {
         self.check_requester_at(requester, Instant::now())
     }
 
-    /// Counts one claim by `requester` of another user's KeyPackages. A
-    /// claim refused by either limit counts against neither.
+    /// Counts one claim by `requester` of another user's KeyPackages, once
+    /// the route has counted it against the requester
+    /// ([`ClaimLimiter::check_requester`]): a claim refused here still
+    /// counts there. A claim refused by the hourly or the daily limit of
+    /// the pair counts against neither of them.
     pub fn check_pair(&self, requester: Uuid, target: Uuid) -> ApiResult<()> {
         self.check_pair_at(requester, target, Instant::now())
     }
