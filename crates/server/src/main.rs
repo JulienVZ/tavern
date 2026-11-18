@@ -14,6 +14,14 @@
 
 #![forbid(unsafe_code)]
 
+// A panic caused by a request must fail that request, never stop the server
+// (ADR 0019, section 18): the release build comes from the `server` profile.
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "tavern-server must be built with panic = \"unwind\": \
+     use `cargo build --profile server`, not `--release`"
+);
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -21,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use tavern_server::config::Config;
 use tavern_server::secrets::InstanceSecrets;
-use tavern_server::{AppState, Settings, app, db, routes, telemetry};
+use tavern_server::{AppState, Settings, app, db, panics, routes, telemetry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -57,6 +65,7 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<()> {
     let config = Config::from_env().context("invalid configuration")?;
     telemetry::init(&config.log_level, config.log_format).context("invalid log level")?;
+    panics::install_hook();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         ?config,

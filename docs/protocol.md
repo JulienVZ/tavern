@@ -518,6 +518,7 @@ WebSocket close codes:
 | 4006 | Heartbeat timeout |
 | 4007 | Rate limit exceeded repeatedly |
 | 4008 | Malformed frame |
+| 1011 | The server failed while handling a frame of this connection; the client reconnects |
 
 ## 7. Limits
 

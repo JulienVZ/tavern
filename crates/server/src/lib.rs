@@ -17,6 +17,7 @@ pub mod error;
 pub mod gateway;
 pub mod mls;
 pub mod notices;
+pub mod panics;
 pub mod pending;
 pub mod rate_limit;
 pub mod routes;
@@ -201,13 +202,23 @@ pub(crate) const CLIENT_TOKEN_LEN: usize = TOKEN_LEN;
 /// Serve it with `into_make_service_with_connect_info::<SocketAddr>()`: rate
 /// limiting needs the peer address.
 pub fn app(state: AppState) -> Router {
-    routes::router(state.clone())
+    with_layers(routes::router(state.clone()), state)
+}
+
+/// Puts `router` under the layers every route of the server runs under: the
+/// default body limit, the panic catcher, the timeout, and the request log.
+/// [`app`] uses it; tests use it on routes of their own.
+pub fn with_layers(router: Router<AppState>, state: AppState) -> Router {
+    router
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REST_BODY_BYTES))
+        // A handler that panics answers 500 INTERNAL; the server goes on.
+        .layer(panics::layer())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        // Outermost, so that timeouts and refused bodies are logged too.
+        // Outermost, so that timeouts, refused bodies and panics are logged
+        // too.
         .layer(axum::middleware::from_fn(telemetry::log_request))
         .with_state(state)
 }

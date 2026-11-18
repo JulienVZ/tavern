@@ -84,7 +84,7 @@ utoipa-axum = "0.3.0"
 uuid = { version = "1.29", features = ["serde", "v4"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "net", "signal", "time", "io-util"] }
-tower-http = { version = "0.7.1", features = ["timeout", "limit"] }
+tower-http = { version = "0.7.1", features = ["catch-panic", "limit", "timeout"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5"
@@ -143,3 +143,12 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# The server's release build: a panic caused by a request must fail that
+# request, never stop the server, so it unwinds (ADR 0019, section 18). The
+# client keeps `abort`. Cargo cannot set `panic` per package, hence a profile
+# of its own: `cargo build --profile server --package tavern-server`, used
+# by deploy/Dockerfile. The server refuses to compile with `abort`.
+[profile.server]
+inherits = "release"
+panic = "unwind"

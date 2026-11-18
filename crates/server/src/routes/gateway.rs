@@ -14,7 +14,9 @@
 //! 5. the server pushes events from the [`Registry`](crate::gateway::Registry).
 //!
 //! Every frame is decoded from untrusted bytes: sizes are bounded by the
-//! WebSocket layer, and anything malformed closes the connection.
+//! WebSocket layer, and anything malformed closes the connection. Each frame
+//! is handled under [`panics::guard`]: a panic closes its connection with
+//! 1011, and the server goes on.
 
 use std::time::Duration;
 
@@ -37,6 +39,7 @@ use crate::AppState;
 use crate::error::ApiResult;
 use crate::gateway::{Event, RevocationReason};
 use crate::notices;
+use crate::panics::{self, Panicked};
 use crate::routes::key_packages;
 use crate::session::{self, Session};
 
@@ -200,13 +203,27 @@ async fn handshake(state: &AppState, mut socket: WebSocket) -> Option<(WebSocket
     Some((socket, session, first.request_id))
 }
 
+/// The close code for a step that failed, or panicked.
+fn failed<T, E>(result: Result<Result<T, E>, Panicked>) -> Result<T, u16> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(close_code::AUTHENTICATION_FAILED),
+        Err(Panicked) => Err(close_code::INTERNAL_ERROR),
+    }
+}
+
 async fn serve(state: AppState, socket: WebSocket) {
-    let Some((mut socket, session, hello_id)) = handshake(&state, socket).await else {
+    // A panic while handling Hello drops the socket: the connection closes.
+    let Ok(Some((mut socket, session, hello_id))) = panics::guard(handshake(&state, socket)).await
+    else {
         return;
     };
-    let Ok(new_devices) = new_devices(&state, &session).await else {
-        close(socket, close_code::AUTHENTICATION_FAILED).await;
-        return;
+    let new_devices = match failed(panics::guard(new_devices(&state, &session)).await) {
+        Ok(new_devices) => new_devices,
+        Err(code) => {
+            close(socket, code).await;
+            return;
+        }
     };
 
     // Subscribe before reading the pending notices, so that none is lost in
@@ -217,12 +234,15 @@ async fn serve(state: AppState, socket: WebSocket) {
         let key_packages = key_packages::remaining(&state.db, session.device_id).await?;
         Ok::<_, crate::error::ApiError>((notices, key_packages))
     };
-    let Ok((security_notices, key_packages_remaining)) = pending.await else {
-        state
-            .gateway
-            .disconnect(session.device_id, subscription.generation);
-        close(socket, close_code::AUTHENTICATION_FAILED).await;
-        return;
+    let (security_notices, key_packages_remaining) = match failed(panics::guard(pending).await) {
+        Ok(pending) => pending,
+        Err(code) => {
+            state
+                .gateway
+                .disconnect(session.device_id, subscription.generation);
+            close(socket, code).await;
+            return;
+        }
     };
     let ready = proto::Ready {
         user_id: session.user_id.as_bytes().to_vec(),
@@ -276,55 +296,19 @@ async fn run(
                 let Ok(message) = incoming else {
                     return Some(close_code::HEARTBEAT_TIMEOUT);
                 };
-                let request = match classify(message) {
-                    Incoming::Control => continue,
-                    Incoming::Gone => return None,
-                    Incoming::Malformed => return Some(close_code::MALFORMED_FRAME),
-                    Incoming::Frame(frame) => frame,
+                // Untrusted input: a panic while handling it closes this
+                // connection only.
+                let next = match panics::guard(on_message(state, session, message)).await {
+                    Ok(next) => next,
+                    Err(Panicked) => return Some(close_code::INTERNAL_ERROR),
                 };
-                let reply = match request.payload {
-                    Some(ClientPayload::Heartbeat(_)) => {
-                        // The cheapest place to notice an expired session.
-                        if !session_is_live(state, session).await {
-                            return Some(close_code::SESSION_REVOKED);
-                        }
-                        ServerPayload::HeartbeatAck(proto::HeartbeatAck {
-                            server_time_ms: now_ms(),
-                        })
-                    }
-                    Some(ClientPayload::AckDeviceList(_)) => {
-                        let updated =
-                            sqlx::query("UPDATE devices SET devices_seen_at = now() WHERE id = $1")
-                                .bind(session.device_id)
-                                .execute(&state.db)
-                                .await;
-                        if updated.is_err() {
-                            ServerPayload::Error(proto::Error {
-                                code: proto::ErrorCode::Internal.into(),
-                                message: "internal error".to_owned(),
-                                retry_after_ms: 0,
-                            })
-                        } else {
-                            ServerPayload::Ack(proto::Ack {})
-                        }
-                    }
-                    Some(ClientPayload::AckSecurityNotices(ack)) => {
-                        acknowledge_notices(state, session, &ack.notice_ids).await
-                    }
-                    // A second Hello makes no sense on an open connection.
-                    Some(ClientPayload::Hello(_)) => ServerPayload::Error(proto::Error {
-                        code: proto::ErrorCode::InvalidArgument.into(),
-                        message: "already authenticated".to_owned(),
-                        retry_after_ms: 0,
-                    }),
-                    // A payload this server does not know: a newer client.
-                    None => ServerPayload::Error(proto::Error {
-                        code: proto::ErrorCode::UnsupportedMessage.into(),
-                        message: "unsupported message".to_owned(),
-                        retry_after_ms: 0,
-                    }),
+                let (request_id, reply) = match next {
+                    Next::Reply(request_id, reply) => (request_id, reply),
+                    Next::Continue => continue,
+                    Next::Close(code) => return Some(code),
+                    Next::Gone => return None,
                 };
-                if socket.send(frame(request.request_id, reply)).await.is_err() {
+                if socket.send(frame(request_id, reply)).await.is_err() {
                     return None;
                 }
             }
@@ -343,6 +327,74 @@ async fn run(
             }
         }
     }
+}
+
+/// What to do after a message from the client.
+enum Next {
+    /// Answer the request.
+    Reply(u64, ServerPayload),
+    /// Nothing to answer.
+    Continue,
+    /// Close with this code.
+    Close(u16),
+    /// The peer is gone.
+    Gone,
+}
+
+/// Decodes and handles one message from the client.
+async fn on_message(
+    state: &AppState,
+    session: &Session,
+    message: Option<Result<Message, axum::Error>>,
+) -> Next {
+    let request = match classify(message) {
+        Incoming::Control => return Next::Continue,
+        Incoming::Gone => return Next::Gone,
+        Incoming::Malformed => return Next::Close(close_code::MALFORMED_FRAME),
+        Incoming::Frame(frame) => frame,
+    };
+    let reply = match request.payload {
+        Some(ClientPayload::Heartbeat(_)) => {
+            // The cheapest place to notice an expired session.
+            if !session_is_live(state, session).await {
+                return Next::Close(close_code::SESSION_REVOKED);
+            }
+            ServerPayload::HeartbeatAck(proto::HeartbeatAck {
+                server_time_ms: now_ms(),
+            })
+        }
+        Some(ClientPayload::AckDeviceList(_)) => {
+            let updated = sqlx::query("UPDATE devices SET devices_seen_at = now() WHERE id = $1")
+                .bind(session.device_id)
+                .execute(&state.db)
+                .await;
+            if updated.is_err() {
+                ServerPayload::Error(proto::Error {
+                    code: proto::ErrorCode::Internal.into(),
+                    message: "internal error".to_owned(),
+                    retry_after_ms: 0,
+                })
+            } else {
+                ServerPayload::Ack(proto::Ack {})
+            }
+        }
+        Some(ClientPayload::AckSecurityNotices(ack)) => {
+            acknowledge_notices(state, session, &ack.notice_ids).await
+        }
+        // A second Hello makes no sense on an open connection.
+        Some(ClientPayload::Hello(_)) => ServerPayload::Error(proto::Error {
+            code: proto::ErrorCode::InvalidArgument.into(),
+            message: "already authenticated".to_owned(),
+            retry_after_ms: 0,
+        }),
+        // A payload this server does not know: a newer client.
+        None => ServerPayload::Error(proto::Error {
+            code: proto::ErrorCode::UnsupportedMessage.into(),
+            message: "unsupported message".to_owned(),
+            retry_after_ms: 0,
+        }),
+    };
+    Next::Reply(request.request_id, reply)
 }
 
 fn error(code: proto::ErrorCode, message: &str) -> ServerPayload {

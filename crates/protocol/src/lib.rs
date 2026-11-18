@@ -93,6 +93,9 @@ pub mod close_code {
     pub const HEARTBEAT_TIMEOUT: u16 = 4006;
     /// Malformed frame.
     pub const MALFORMED_FRAME: u16 = 4008;
+    /// The server failed while handling a frame of this connection (the
+    /// standard WebSocket code). The client reconnects.
+    pub const INTERNAL_ERROR: u16 = 1011;
 }
 
 /// Largest JSON body accepted by the REST API by default, in bytes.

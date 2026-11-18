@@ -16,10 +16,13 @@ COPY . .
 # from. scripts/build.sh and the CI set it; the repository itself is not in
 # the build context.
 ARG TAVERN_BUILD_COMMIT=
+# The `server` profile is the release profile with panic = "unwind": a panic
+# caused by a request fails that request, never the server (ADR 0019,
+# section 18).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked --package tavern-server \
-    && cp target/release/tavern-server /tavern-server
+    cargo build --profile server --locked --package tavern-server \
+    && cp target/server/tavern-server /tavern-server
 
 # Distroless: no shell, no package manager, runs as an unprivileged user.
 FROM gcr.io/distroless/cc-debian13:nonroot
