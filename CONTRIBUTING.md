@@ -31,7 +31,7 @@ Security problems are **not** reported through issues: see [SECURITY.md](SECURIT
 
 `protoc` is not needed: `.proto` files are compiled with a pure-Rust compiler.
 
-The client's local store is SQLCipher ([ADR 0018](docs/adr/0018-local-store-encryption.md)). On Windows and Linux the first build compiles OpenSSL from source for it (about a minute on Linux, several on Windows); Windows needs Perl for that, for example [Strawberry Perl](https://strawberryperl.com/). The system's OpenSSL is never used, and macOS needs nothing. Do not enable SQLite in sqlx: see `third_party/sqlx-sqlite-unused/README.md`.
+The client's local store is SQLCipher ([ADR 0018](docs/adr/0018-local-store-encryption.md)). On Windows and Linux the first build compiles OpenSSL from source for it (about a minute on Linux, several on Windows); Windows needs Perl for that, for example [Strawberry Perl](https://strawberryperl.com/). The system's OpenSSL is never used, and macOS needs nothing. Do not enable SQLite in sqlx: the client's SQLCipher must be the only crate that links `sqlite3`, and the server links no SQLite (CI checks it).
 
 ## Building and testing
 
@@ -100,7 +100,7 @@ pnpm client alice-2    # a third one, and so on
 2. Update with `cargo update --package <crate>` (or the version in `Cargo.toml`), then run formatting, clippy, the tests, the PostgreSQL tests and the UI checks.
 3. Check the entries of `deny.toml` that name the upgraded crate or its dependents: an ignored advisory or a licence exception may no longer be needed, or may no longer be justified.
 4. Some crates come with extra steps:
-   - **sqlx**: `third_party/sqlx-sqlite-unused` must carry the version and the features of the `sqlx-sqlite` that the new sqlx requires (see its README). CI fails (`still-needed.sh`) once a sqlx release accepts our `libsqlite3-sys`: then upgrade sqlx, delete that directory and the `[patch.crates-io]` entry.
+   - **sqlx**: its SQLite driver, `sqlx-sqlite`, is resolved though never enabled, and must accept the `libsqlite3-sys` of the client's SQLCipher (only one crate may link `sqlite3`, [ADR 0018](docs/adr/0018-local-store-encryption.md)). If an upgrade cannot be resolved for that reason, stop and report it.
    - **rusqlite, libsqlite3-sys, sqlcipher-src, openssl-src**: run the three systems on demand (`gh workflow run ci.yml --ref <branch>`). The local store committed in `crates/client-core/fixtures/` must still open everywhere. An OpenSSL advisory means a client release ([ADR 0018](docs/adr/0018-local-store-encryption.md)).
    - **openmls, openmls_traits, openmls_rust_crypto**: pinned to exact versions, upgraded together. An upgrade can change the storage format of the MLS state: it needs the compatibility test of [ADR 0019](docs/adr/0019-mls-direct-messages.md) (section 13). The `RUSTSEC-2026-0173` entry of `deny.toml` goes as soon as `cargo deny` reports it as not encountered. `openmls_memory_storage` stays in `[dev-dependencies]` (a test enforces it). The server's stored public state must still load (`a_public_state_written_by_the_first_release_still_loads`, with its frozen fixture), and `crates/crypto/src/mls/no_storage.rs` is generated again from `openmls_traits`' `StorageProvider` if that trait changed (the file then no longer compiles).
    - **opaque-ke** and its curve crates: the `crypto-bigint is not linked` check of CI must stay green ([ADR 0011](docs/adr/0011-account-identity-and-primitives.md)).

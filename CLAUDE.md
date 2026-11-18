@@ -98,8 +98,6 @@ Les versions des crates évoluent : vérifie toujours la version actuelle et la 
 │   ├── client-core/           # Logique client sans UI : réseau, MLS, store local, LiveKit, état
 │   ├── media/                 # Capture écran/caméra/audio par OS, encodage matériel
 │   └── e2e-tests/             # Tests de bout en bout : vrai client contre vrai serveur (PostgreSQL requis)
-├── third_party/
-│   └── sqlx-sqlite-unused/    # Remplaçant vide de sqlx-sqlite, jamais compilé (libère `links = "sqlite3"` pour SQLCipher, ADR 0018)
 ├── apps/
 │   └── desktop/
 │       ├── src-tauri/         # Glue Tauri : commandes, événements, fenêtres (mince, délègue à client-core)

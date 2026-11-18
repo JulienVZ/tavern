@@ -140,6 +140,8 @@ The versions sqlx accepts are not an option: every `libsqlite3-sys` below 0.39 b
 
 So `third_party/sqlx-sqlite-unused` replaces `sqlx-sqlite` through `[patch.crates-io]`: an empty crate with the same version and features, which only frees the `links` slot. It is never built, and building it fails with an explanation, so enabling SQLite in sqlx cannot happen by accident. It must follow sqlx's version at each upgrade, and is to be deleted as soon as a sqlx release accepts our `libsqlite3-sys`: CI fails when that happens (`third_party/sqlx-sqlite-unused/still-needed.sh`, which asks Cargo's resolver). Upstream: [transact-rs/sqlx#3211](https://github.com/transact-rs/sqlx/issues/3211) (unwanted crates in `Cargo.lock`), [rust-lang/cargo#10801](https://github.com/rust-lang/cargo/issues/10801) (disabled optional weak dependencies are resolved), [transact-rs/sqlx#4516](https://github.com/transact-rs/sqlx/issues/4516) and [#4525](https://github.com/transact-rs/sqlx/pull/4525). Approved by the maintainer on 2026-11-16 (option A), with no other `deny.toml` exception.
 
+**Removed on 2026-11-18.** sqlx 0.9.1 accepts `libsqlite3-sys` 0.40: CI's check failed as intended, and the stand-in, its `[patch.crates-io]` entry and the check went with the upgrade to sqlx 0.9.1. `sqlx-sqlite` 0.9.1 is again in `Cargo.lock`, never built (the server enables PostgreSQL only, and CI checks that it links no SQLite).
+
 ### How the client uses SQLCipher
 
 - `crates/client-core/src/local/`. Opening sets `PRAGMA cipher_memory_security = ON` (process-wide: SQLCipher wipes every block SQLite frees; key material lives in its locked private heap in any case), then `PRAGMA key = "x'<64 hex digits>'"`, then `PRAGMA cipher_compatibility = 4`, then reads the schema, which fails on a wrong key, a plain file or a damaged file.
@@ -166,6 +168,6 @@ So `third_party/sqlx-sqlite-unused` replaces `sqlx-sqlite` through `[patch.crate
 - The client contains two crypto libraries: RustCrypto for everything we do, OpenSSL (or CommonCrypto) inside SQLCipher only.
 - **Any security advisory on OpenSSL requires a new client release.** `cargo deny` watches `openssl-src` on every CI run.
 - Compiling OpenSSL from source adds about a minute to a clean Linux build and several minutes on Windows (Perl is required, present on GitHub's runners); macOS builds compile no OpenSSL.
-- `third_party/sqlx-sqlite-unused` lives until sqlx accepts a recent `libsqlite3-sys`.
+- `third_party/sqlx-sqlite-unused` lived until sqlx accepted a recent `libsqlite3-sys` (removed on 2026-11-18, with sqlx 0.9.1).
 - The MLS state is stored by a storage provider of our own on this database, not by `openmls_sqlite_storage` (see the MLS plan).
 - Moving to SQLite3 Multiple Ciphers stays possible without migrating data.
