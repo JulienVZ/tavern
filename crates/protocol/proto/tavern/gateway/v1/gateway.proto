@@ -42,6 +42,7 @@ message ServerFrame {
     SecurityNotice security_notice = 17;
 
     // M2 events (field numbers as in docs/protocol.md, section 3).
+    ConversationCreated conversation_created = 44;  // Since minor 4.
     FriendshipChanged friendship_changed = 45;  // Since minor 3.
     KeyPackagesLow key_packages_low = 48;  // Since minor 2.
     UserDevicesChanged user_devices_changed = 49;  // Since minor 3.
@@ -126,6 +127,22 @@ message DeviceListChanged {
 // device that is not uploads at its next connection anyway. Since minor 2.
 message KeyPackagesLow {
   uint32 remaining = 1;
+}
+
+// A conversation of this user was created (ADR 0019, section 4). Sent to the
+// connected devices of its members; the others read GET /v1/conversations.
+// It has no MLS group yet: the creating device builds it, and any active
+// device of a member may if that one does not. Since minor 4.
+message ConversationCreated {
+  bytes conversation_id = 1;
+  ConversationKind kind = 2;
+  repeated bytes member_user_ids = 3;
+}
+
+enum ConversationKind {
+  CONVERSATION_KIND_UNSPECIFIED = 0;
+  CONVERSATION_KIND_DM = 1;
+  // Private groups and channels: M3 and M4.
 }
 
 // The relation of this user with another one changed (ADR 0020). Sent to

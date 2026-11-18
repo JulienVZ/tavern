@@ -210,6 +210,9 @@ pub enum ErrorCode {
     InvalidKeyPackage,
     /// This user blocks the other one: unblock them first.
     Blocked,
+    /// The two users are not friends: unknown, not friends any more, or
+    /// either one blocks the other, which this code does not tell apart.
+    NotFriends,
 }
 
 /// Body of every REST error response.
@@ -807,6 +810,55 @@ dto! {
         pub user_id: Uuid,
         /// What the request led to.
         pub outcome: RequestOutcome,
+    }
+}
+
+// --- Conversations (ADR 0019, section 4) ------------------------------------------
+
+/// What a conversation is.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationKind {
+    /// A direct conversation between two users.
+    Dm,
+}
+
+dto! {
+    /// `POST /v1/conversations`: the DM with a friend.
+    pub struct CreateDmRequest {
+        /// The friend.
+        pub user_id: Uuid,
+    }
+}
+
+dto! {
+    /// A conversation of the user.
+    pub struct Conversation {
+        /// The conversation.
+        pub conversation_id: Uuid,
+        /// What it is.
+        pub kind: ConversationKind,
+        /// Its members, smaller id first.
+        pub members: Vec<Uuid>,
+        /// The generation of its MLS group, `null` while it has none.
+        pub generation: Option<u32>,
+        /// The current epoch of its MLS group, `null` while it has none:
+        /// any active device of a member may then create the group.
+        pub epoch: Option<u64>,
+        /// The last sequence number assigned in it.
+        pub last_seq: u64,
+        /// A DM whose users are not friends any more: kept, with its
+        /// history, but nothing new can be sent in it.
+        pub read_only: bool,
+    }
+}
+
+dto! {
+    /// Answer to `GET /v1/conversations`.
+    pub struct ConversationList {
+        /// Oldest first.
+        pub conversations: Vec<Conversation>,
     }
 }
 

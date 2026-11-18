@@ -117,7 +117,8 @@ impl ApiError {
             ErrorCode::Forbidden
             | ErrorCode::AccountDisabled
             | ErrorCode::InvalidInvite
-            | ErrorCode::Blocked => StatusCode::FORBIDDEN,
+            | ErrorCode::Blocked
+            | ErrorCode::NotFriends => StatusCode::FORBIDDEN,
             ErrorCode::NotFound | ErrorCode::UnknownEndpoint => StatusCode::NOT_FOUND,
             ErrorCode::AlreadyExists | ErrorCode::HandleTaken | ErrorCode::TooManyDevices => {
                 StatusCode::CONFLICT

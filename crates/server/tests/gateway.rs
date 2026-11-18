@@ -426,6 +426,65 @@ async fn a_block_is_not_disclosed_by_events() {
     assert_eq!(friendship(&mut alice_socket).await, (bob_id, State::None));
 }
 
+/// ADR 0019, section 4: both users' devices are told when their DM is
+/// created, and only then.
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn both_users_are_told_when_their_dm_is_created() {
+    let app = TestApp::spawn().await;
+    let (alice, alice1) = app.account_with_device("gw", false).await;
+    let (bob, bob1) = app.account_with_device("gw", false).await;
+    app.befriend((&alice, &alice1), (&bob, &bob1)).await;
+    let (mut alice_socket, _) = connect(&app, &alice1).await;
+    let (mut bob_socket, _) = connect(&app, &bob1).await;
+    let request = tavern_protocol::rest::CreateDmRequest {
+        user_id: bob.user_id,
+    };
+    let dm: tavern_protocol::rest::Conversation = app
+        .post("/v1/conversations", Some(&alice1.session_token), &request)
+        .await;
+
+    let mut members = [alice.user_id, bob.user_id];
+    members.sort();
+    let expected = Some(ServerPayload::ConversationCreated(
+        proto::ConversationCreated {
+            conversation_id: dm.conversation_id.as_bytes().to_vec(),
+            kind: proto::ConversationKind::Dm.into(),
+            member_user_ids: members.iter().map(|id| id.as_bytes().to_vec()).collect(),
+        },
+    ));
+    assert_eq!(expected_frame_payload(&mut alice_socket).await, expected);
+    assert_eq!(expected_frame_payload(&mut bob_socket).await, expected);
+
+    // Asked again: it exists, nothing is announced. Bob's next frame is the
+    // unfriending that follows.
+    let _: tavern_protocol::rest::Conversation = app
+        .post("/v1/conversations", Some(&alice1.session_token), &request)
+        .await;
+    let status = app
+        .status(
+            Method::DELETE,
+            &format!("/v1/friends/{}", alice.user_id),
+            Some(&bob1.session_token),
+            NO_BODY,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        friendship(&mut bob_socket).await,
+        (
+            alice.user_id.as_bytes().to_vec(),
+            proto::FriendshipState::None
+        )
+    );
+}
+
+async fn expected_frame_payload(socket: &mut Socket) -> Option<ServerPayload> {
+    let frame = expect_frame(socket).await;
+    assert_eq!(frame.request_id, 0);
+    frame.payload
+}
+
 /// Protocol, section 5.2: a user's friends are told when they enrol or
 /// revoke a device; other users are not.
 #[tokio::test]

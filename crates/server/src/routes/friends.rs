@@ -28,14 +28,15 @@ use crate::session::Session;
 
 /// A pair as `friendships` stores it: smaller id first. PostgreSQL and
 /// `Uuid` order ids alike, byte by byte.
-fn pair(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
+pub(crate) fn pair(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
     if a < b { (a, b) } else { (b, a) }
 }
 
 /// The row of a pair.
 #[derive(Debug, Clone, Copy)]
-struct Row {
-    accepted: bool,
+pub(crate) struct Row {
+    /// Friends, not a request.
+    pub(crate) accepted: bool,
     requested_by: Uuid,
     hidden: bool,
 }
@@ -48,7 +49,9 @@ impl Row {
 }
 
 /// Takes the pair's turn, until the transaction ends, and reads its row.
-async fn lock_pair(conn: &mut PgConnection, a: Uuid, b: Uuid) -> ApiResult<Option<Row>> {
+/// Creating the pair's DM takes the same turn, so that it never interleaves
+/// with an unfriending or a block.
+pub(crate) async fn lock_pair(conn: &mut PgConnection, a: Uuid, b: Uuid) -> ApiResult<Option<Row>> {
     let (low, high) = pair(a, b);
     // An advisory lock: the row may not exist yet.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")

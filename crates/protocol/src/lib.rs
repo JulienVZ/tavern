@@ -37,8 +37,9 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 /// - 1: persisted security notices, replayed in `Ready` and acknowledged per
 ///   device;
 /// - 2: `KeyPackagesLow`, and `Ready.key_packages_remaining` filled (M2);
-/// - 3: `FriendshipChanged` and `UserDevicesChanged` (M2, ADR 0020).
-pub const GATEWAY_MINOR_VERSION: u32 = 3;
+/// - 3: `FriendshipChanged` and `UserDevicesChanged` (M2, ADR 0020);
+/// - 4: `ConversationCreated` (M2).
+pub const GATEWAY_MINOR_VERSION: u32 = 4;
 
 /// Largest number of notices one `AckSecurityNotices` frame may name.
 pub const MAX_SECURITY_NOTICE_ACKS: usize = 64;
@@ -58,8 +59,9 @@ pub const REST_MAJOR_VERSION: u32 = 1;
 /// - 2: session responses carry `local_store_share`; wrapped copies hold the
 ///   account root secret (format version 2, ADR 0017);
 /// - 3: KeyPackages: upload, count, claim (M2, ADR 0019);
-/// - 4: friends and blocks (M2, ADR 0020).
-pub const REST_MINOR_VERSION: u32 = 4;
+/// - 4: friends and blocks (M2, ADR 0020);
+/// - 5: conversations: DMs (M2, ADR 0019).
+pub const REST_MINOR_VERSION: u32 = 5;
 
 /// WebSocket subprotocol negotiated by the gateway.
 pub const GATEWAY_SUBPROTOCOL: &str = "tavern.v1";

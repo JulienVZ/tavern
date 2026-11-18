@@ -36,6 +36,9 @@ pub enum StateError {
     /// API, ADR 0019, sections 4 and 17).
     #[error("the conversation already has this group generation or a later one")]
     GenerationExists,
+    /// The group's conversation does not exist.
+    #[error("the group's conversation does not exist")]
+    NoConversation,
     /// The stored group does not match the state: another request saved it
     /// since the state was loaded, or the row is gone, or its epoch disagrees
     /// with its rows.
@@ -77,17 +80,20 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// [`PublicState::create`] with the GroupInfo it checked, and deletes the
 /// conversation's earlier generations with their rows (ADR 0019, section 12:
 /// the server keeps the current state only). Creations of one conversation
-/// take turns on a lock held until the transaction ends; the one that comes
-/// second gets [`StateError::GenerationExists`].
+/// take turns on the conversation's row, locked until the transaction ends;
+/// the one that comes second gets [`StateError::GenerationExists`].
 pub async fn insert(conn: &mut PgConnection, state: PublicState) -> Result<(), StateError> {
     let identity = state.identity()?;
     let conversation = Uuid::from_bytes(identity.conversation_id);
     let generation = i64::from(identity.generation);
-    // Until the conversation's own row exists (M2, task 7).
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("tavern.mls_groups:{conversation}"))
-        .execute(&mut *conn)
-        .await?;
+    let exists: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE")
+            .bind(conversation)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if exists.is_none() {
+        return Err(StateError::NoConversation);
+    }
     let later: Option<i64> = sqlx::query_scalar(
         "SELECT generation FROM mls_groups WHERE conversation_id = $1 AND generation >= $2 \
          LIMIT 1",

@@ -176,6 +176,13 @@ pub enum GatewayEvent {
         /// Where this user now stands with them.
         relation: Relation,
     },
+    /// A conversation of this user was created; it has no MLS group yet.
+    ConversationCreated {
+        /// The conversation.
+        conversation_id: Uuid,
+        /// Its members.
+        members: Vec<Uuid>,
+    },
     /// A friend enrolled (`added`) or revoked a device.
     UserDevicesChanged {
         /// The friend.
@@ -477,6 +484,16 @@ async fn connection(
                             user_id,
                             relation,
                         }),
+                    Some(ServerPayload::ConversationCreated(created)) => {
+                        let members: Option<Vec<Uuid>> =
+                            created.member_user_ids.iter().map(|id| uuid(id)).collect();
+                        uuid(&created.conversation_id).zip(members).map(
+                            |(conversation_id, members)| GatewayEvent::ConversationCreated {
+                                conversation_id,
+                                members,
+                            },
+                        )
+                    }
                     Some(ServerPayload::UserDevicesChanged(change)) => uuid(&change.user_id)
                         .zip(uuid(&change.device_id))
                         .map(|(user_id, device_id)| GatewayEvent::UserDevicesChanged {

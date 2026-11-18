@@ -70,6 +70,13 @@ pub enum Event {
         /// The relation now, as the receiving user sees it.
         relation: Relation,
     },
+    /// A DM of the receiving user was created.
+    ConversationCreated {
+        /// The conversation.
+        conversation_id: Uuid,
+        /// Its two users, smaller id first.
+        members: [Uuid; 2],
+    },
     /// A friend of the receiving user enrolled (`added`) or revoked a device.
     UserDevicesChanged {
         /// The friend.

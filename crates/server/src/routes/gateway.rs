@@ -474,6 +474,17 @@ fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
                 None,
             )
         }
+        Event::ConversationCreated {
+            conversation_id,
+            members,
+        } => (
+            ServerPayload::ConversationCreated(proto::ConversationCreated {
+                conversation_id: conversation_id.as_bytes().to_vec(),
+                kind: proto::ConversationKind::Dm.into(),
+                member_user_ids: members.iter().map(|id| id.as_bytes().to_vec()).collect(),
+            }),
+            None,
+        ),
         Event::UserDevicesChanged {
             user_id,
             device_id,

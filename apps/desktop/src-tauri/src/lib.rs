@@ -195,8 +195,8 @@ enum GatewayView {
 }
 
 impl GatewayView {
-    /// What the webview is told of `event`. Friends and their devices are
-    /// not shown before the interface of M2's task 12.
+    /// What the webview is told of `event`. Friends, their devices and
+    /// conversations are not shown before the interface of M2's task 12.
     fn of(event: GatewayEvent) -> Option<Self> {
         Some(match event {
             GatewayEvent::Connected {
@@ -224,9 +224,9 @@ impl GatewayView {
                     SessionEnd::Replaced => "replaced",
                 },
             },
-            GatewayEvent::FriendshipChanged { .. } | GatewayEvent::UserDevicesChanged { .. } => {
-                return None;
-            }
+            GatewayEvent::FriendshipChanged { .. }
+            | GatewayEvent::UserDevicesChanged { .. }
+            | GatewayEvent::ConversationCreated { .. } => return None,
         })
     }
 }

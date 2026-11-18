@@ -28,14 +28,15 @@ use tavern_crypto::recovery::RecoveryKey;
 use tavern_crypto::secret::Secret;
 use tavern_protocol::handle::Handle;
 use tavern_protocol::rest::{
-    AdminUserList, B64, CreateInviteRequest, CreatedInvite, DeviceList, EnrolDeviceRequest,
-    ErrorCode, FriendList, FriendRequest, FriendRequestAnswer, InviteList, KeyPackageClaim,
-    KeyPackageCount, LoginFinishRequest, LoginGrant, LoginOutcome, LoginStartRequest,
-    LoginStartResponse, LoginTotpRequest, Me, PasswordFinishRequest, PasswordStartRequest,
-    Platform, ReauthFinishRequest, ReauthGrant, ReauthStartRequest, RecoverFinishRequest,
-    RecoverStartRequest, RecoverStartResponse, RegisterFinishRequest, RegisterFinishResponse,
-    RegisterStartRequest, RegistrationResponse, ReopenSessionRequest, RotateRecoveryKeyRequest,
-    SessionResponse, TotpCodeRequest, TotpEnrolment, TotpRecoveryCodes, UploadKeyPackagesRequest,
+    AdminUserList, B64, Conversation, ConversationList, CreateDmRequest, CreateInviteRequest,
+    CreatedInvite, DeviceList, EnrolDeviceRequest, ErrorCode, FriendList, FriendRequest,
+    FriendRequestAnswer, InviteList, KeyPackageClaim, KeyPackageCount, LoginFinishRequest,
+    LoginGrant, LoginOutcome, LoginStartRequest, LoginStartResponse, LoginTotpRequest, Me,
+    PasswordFinishRequest, PasswordStartRequest, Platform, ReauthFinishRequest, ReauthGrant,
+    ReauthStartRequest, RecoverFinishRequest, RecoverStartRequest, RecoverStartResponse,
+    RegisterFinishRequest, RegisterFinishResponse, RegisterStartRequest, RegistrationResponse,
+    ReopenSessionRequest, RotateRecoveryKeyRequest, SessionResponse, TotpCodeRequest,
+    TotpEnrolment, TotpRecoveryCodes, UploadKeyPackagesRequest,
 };
 use uuid::Uuid;
 
@@ -929,6 +930,25 @@ impl Client {
         self.api()
             .act(Method::DELETE, &format!("v1/blocks/{user_id}"), self.auth())
             .await
+    }
+
+    /// Creates the DM with a friend, or returns it if it exists: there is
+    /// one per pair of users. `NOT_FRIENDS` for anyone else. A DM whose
+    /// `epoch` is `None` has no MLS group yet: this device builds it.
+    pub async fn create_dm(&self, user_id: Uuid) -> Result<Conversation, ClientError> {
+        self.api()
+            .call(
+                Method::POST,
+                "v1/conversations",
+                self.auth(),
+                &CreateDmRequest { user_id },
+            )
+            .await
+    }
+
+    /// The user's conversations, oldest first.
+    pub async fn conversations(&self) -> Result<ConversationList, ClientError> {
+        self.api().fetch("v1/conversations", self.auth()).await
     }
 
     /// Revokes a device of the account. Revoking this device signs it out.

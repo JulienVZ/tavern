@@ -45,6 +45,27 @@ async fn pool() -> PgPool {
     pool
 }
 
+/// A DM between `a` and `b`, as `POST /v1/conversations` creates it: a
+/// group belongs to its conversation.
+async fn conversation(pool: &PgPool, a: Uuid, b: Uuid) -> Uuid {
+    let id: Uuid =
+        sqlx::query_scalar("INSERT INTO conversations (kind) VALUES ('dm') RETURNING id")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO dm_conversations (conversation_id, user_low, user_high) \
+         VALUES ($1, LEAST($2::uuid, $3::uuid), GREATEST($2::uuid, $3::uuid))",
+    )
+    .bind(id)
+    .bind(a)
+    .bind(b)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
 /// The PostgreSQL backend of a connection, to watch it wait.
 async fn backend(conn: &mut sqlx::PgConnection) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -206,7 +227,7 @@ impl Dm {
         let bob1 = bob.enrol(pool).await;
         let server = ExternalSenderKey::generate();
         let identity = GroupIdentity {
-            conversation_id: *Uuid::new_v4().as_bytes(),
+            conversation_id: *conversation(pool, alice.user, bob.user).await.as_bytes(),
             generation: 0,
         };
         let participants = [*alice.user.as_bytes(), *bob.user.as_bytes()];
@@ -881,6 +902,42 @@ async fn a_stored_epoch_that_disagrees_with_the_rows_is_refused() {
     );
 }
 
+/// A group belongs to its conversation: without one, `insert` refuses it,
+/// and so does the schema.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_group_needs_its_conversation() {
+    let pool = pool().await;
+    let dm = Dm::made(&pool).await;
+    let conversation = Uuid::from_bytes(dm.identity.conversation_id);
+    let mut tx = pool.begin().await.unwrap();
+    let state = dm
+        .created_state(&mut tx, &dm.first_group_info, dm.identity)
+        .await;
+    sqlx::query("DELETE FROM conversations WHERE id = $1")
+        .bind(conversation)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let result = mls::insert(&mut tx, state).await;
+    assert!(
+        matches!(result, Err(StateError::NoConversation)),
+        "{result:?}"
+    );
+    let raw = sqlx::query(
+        "INSERT INTO mls_groups (group_id, conversation_id, generation, epoch, group_info) \
+         VALUES ($1, $2, 0, 1, '\\x00')",
+    )
+    .bind(dm.identity.to_group_id().as_slice())
+    .bind(conversation)
+    .execute(&mut *tx)
+    .await;
+    match raw {
+        Err(sqlx::Error::Database(error)) => assert_eq!(error.code().as_deref(), Some("23503")),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// The schema refuses rows the server would not write: an unknown kind, a
 /// group id that is not the conversation id and generation.
 #[tokio::test]
@@ -901,8 +958,13 @@ async fn the_schema_refuses_rows_the_server_would_not_write() {
         .execute(&pool)
         .await,
     );
+    let conversation: Uuid =
+        sqlx::query_scalar("INSERT INTO conversations (kind) VALUES ('dm') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let other = GroupIdentity {
-        conversation_id: *Uuid::new_v4().as_bytes(),
+        conversation_id: *conversation.as_bytes(),
         generation: 3,
     };
     check_violation(

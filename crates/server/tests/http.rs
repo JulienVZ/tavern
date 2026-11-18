@@ -148,14 +148,14 @@ async fn wrong_database_password_is_explained() {
     );
 }
 
-/// The routes of REST 1.4, frozen (1.4 added friends and blocks). If this
+/// The routes of REST 1.5, frozen (1.5 added conversations). If this
 /// test fails because a route was added or removed, update the list **and
 /// increment `tavern_protocol::REST_MINOR_VERSION`**: that number is how a
 /// client tells its user that an instance is older than the client.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn the_route_list_matches_the_announced_rest_version() {
-    const REST_MINOR_OF_THIS_LIST: u32 = 4;
+    const REST_MINOR_OF_THIS_LIST: u32 = 5;
     const ROUTES: &[&str] = &[
         "/health",
         "/v1/account/password/finish",
@@ -181,6 +181,7 @@ async fn the_route_list_matches_the_announced_rest_version() {
         "/v1/auth/register/finish",
         "/v1/auth/register/start",
         "/v1/blocks/{user_id}",
+        "/v1/conversations",
         "/v1/devices",
         "/v1/devices/me/key-packages",
         "/v1/devices/me/key-packages/count",

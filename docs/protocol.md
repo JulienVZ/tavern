@@ -287,10 +287,10 @@ Minor version 1 of the gateway. Each event below is stored for the account and r
 | `POST /v1/friends/requests/{user_id}/accept`, `DELETE /v1/friends/requests/{user_id}` | Accept (the recipient), decline (the recipient) or cancel (the sender). Implemented |
 | `DELETE /v1/friends/{user_id}` | Remove a friend. Implemented |
 | `PUT /v1/blocks/{user_id}`, `DELETE /v1/blocks/{user_id}` | Block (ends a friendship or a request between the two; not disclosed to the blocked user), unblock (deletes what the blocked user sent meanwhile). Implemented |
-| `POST /v1/conversations` | Create a DM with a friend; idempotent: one DM per pair of users, returns the existing one (with its epoch) if any, also when two creations cross |
-| `GET /v1/conversations` | Conversations of the user with their current epoch and last sequence number |
+| `POST /v1/conversations` | Create the DM with a friend (`{"user_id": ...}`); idempotent: one DM per pair of users, `201` when created, `200` with the existing one (with its epoch) if any, also when two creations cross and when two users become friends again. `NOT_FRIENDS` for anyone else, an unknown user and a blocked or blocking one alike; `INVALID_ARGUMENT` for oneself. Implemented (task 7 of M2) |
+| `GET /v1/conversations` | Conversations of the user, oldest first: members, generation and current epoch of the MLS group (`null` while it has none), last sequence number, and `read_only` for a DM whose users are not friends any more. Implemented |
 
-Creating a DM reserves a conversation id on the server. The creating device then builds the MLS group locally (group id = conversation id followed by a 32-bit group generation, 0 at first, incremented when the group is recreated; `external_senders` = the server's key), adds its own other devices and the peer's devices, and submits the first commit with its Welcome. Details, including unfriending, blocking and recreation: [ADR 0019](adr/0019-mls-direct-messages.md).
+Creating a DM reserves a conversation id on the server, and announces it (`ConversationCreated`). The creating device then builds the MLS group locally (group id = conversation id followed by a 32-bit group generation, 0 at first, incremented when the group is recreated; `external_senders` = the server's key), adds its own other devices and the peer's devices, and submits the first commit with its Welcome. If it stops before, the conversation stays without a group (epoch `null`): any active device of either user may create it, the first commit for epoch 0 wins and the others get `STALE_EPOCH`. Details, including unfriending, blocking and recreation: [ADR 0019](adr/0019-mls-direct-messages.md).
 
 ### 5.2 Gateway: messages and MLS
 
@@ -371,6 +371,7 @@ message WelcomeEvent {
   bytes mls_welcome = 3;
 }
 
+// To the connected devices of the conversation's members. Since minor 4.
 message ConversationCreated {
   bytes conversation_id = 1;
   ConversationKind kind = 2;
@@ -505,7 +506,7 @@ enum ErrorCode {
 }
 ```
 
-REST errors carry a JSON body `{ "code": "INVALID_CREDENTIALS", "message": "...", "retry_after_ms": 1200 }` with the matching HTTP status (400, 401, 403, 404, 409, 410, 413, 429, 500, 503). The REST codes are listed in the OpenAPI document (`ErrorCode`); beyond the generic ones they are `INVALID_CREDENTIALS`, `INVALID_INVITE`, `HANDLE_TAKEN`, `INVALID_HANDLE`, `TOTP_REQUIRED`, `TOTP_INVALID`, `ACCOUNT_DISABLED`, `INVALID_DEVICE_CERTIFICATE`, `EXCHANGE_EXPIRED` (410: a two-step exchange timed out or was already used), `TOO_MANY_DEVICES`, `INVALID_PROOF`, `INVALID_KEY_PACKAGE` (400) and `BLOCKED` (403: the requester blocks that user).
+REST errors carry a JSON body `{ "code": "INVALID_CREDENTIALS", "message": "...", "retry_after_ms": 1200 }` with the matching HTTP status (400, 401, 403, 404, 409, 410, 413, 429, 500, 503). The REST codes are listed in the OpenAPI document (`ErrorCode`); beyond the generic ones they are `INVALID_CREDENTIALS`, `INVALID_INVITE`, `HANDLE_TAKEN`, `INVALID_HANDLE`, `TOTP_REQUIRED`, `TOTP_INVALID`, `ACCOUNT_DISABLED`, `INVALID_DEVICE_CERTIFICATE`, `EXCHANGE_EXPIRED` (410: a two-step exchange timed out or was already used), `TOO_MANY_DEVICES`, `INVALID_PROOF`, `INVALID_KEY_PACKAGE` (400), `BLOCKED` (403: the requester blocks that user) and `NOT_FRIENDS` (403).
 
 WebSocket close codes:
 

@@ -5,6 +5,7 @@
 pub mod account;
 pub mod admin;
 pub mod auth;
+pub mod conversations;
 pub mod credentials;
 pub mod devices;
 pub mod friends;
@@ -71,6 +72,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .routes(routes!(friends::remove_request))
         .routes(routes!(friends::unfriend))
         .routes(routes!(friends::block, friends::unblock))
+        .routes(routes!(conversations::create, conversations::list))
         .routes(routes!(devices::enrol, devices::list))
         .routes(routes!(devices::revoke))
         .routes(routes!(devices::reopen_session))
