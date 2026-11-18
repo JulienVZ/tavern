@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Fuzz targets for the protocol decoders (cargo-fuzz, nightly toolchain).
+# Fuzz targets for the protocol decoders and the server's KeyPackage checks
+# (cargo-fuzz, nightly toolchain).
 # This package is outside the main workspace: it is built only by the fuzzing
 # workflow (.github/workflows/fuzz.yml) or by hand:
 #
@@ -19,6 +20,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 prost = "0.14.6"
+tavern-crypto = { path = "../../crypto" }
 tavern-protocol = { path = ".." }
 
 [[bin]]
@@ -38,6 +40,13 @@ bench = false
 [[bin]]
 name = "device_certificate"
 path = "fuzz_targets/device_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_package_upload"
+path = "fuzz_targets/key_package_upload.rs"
 test = false
 doc = false
 bench = false

@@ -10,8 +10,8 @@
 
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
 use openmls::prelude::{CredentialWithKey, KeyPackage, KeyPackageIn, Lifetime, ProtocolVersion};
+use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
-use openmls_traits::crypto::OpenMlsCrypto;
 
 use super::credential::{LeafError, Roster, VerifiedLeaf, verify_leaf};
 use super::{CIPHERSUITE, DeviceSigner, MlsError, capabilities, library};
@@ -86,7 +86,7 @@ pub enum KeyPackageError {
 
 /// The checks common to an upload and a claim.
 fn validate(
-    crypto: &impl OpenMlsCrypto,
+    crypto: &RustCrypto,
     bytes: &[u8],
     roster: &impl Roster,
     expected: VerifiedLeaf,
@@ -120,7 +120,7 @@ fn validate(
 }
 
 /// The device uploading KeyPackages, as the server knows it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Uploader {
     /// Its account.
     pub user_id: [u8; ID_LEN],
@@ -128,33 +128,73 @@ pub struct Uploader {
     pub device_id: [u8; ID_LEN],
     /// The account's identity key, from the server's database.
     pub identity_key: IdentityPublicKey,
+    /// The key the device enrolled with (`devices.signature_key`).
+    pub signature_key: Vec<u8>,
+    /// The certificate it enrolled with (`devices.certificate`).
+    pub certificate: Vec<u8>,
 }
 
 impl Roster for Uploader {
     fn identity_key(&self, user_id: &[u8; ID_LEN]) -> Option<IdentityPublicKey> {
         (*user_id == self.user_id).then_some(self.identity_key)
     }
+
+    /// A package carries the device itself (ADR 0019, section 2): the very
+    /// key and certificate it enrolled with, which a group would require of
+    /// its leaf anyway. Another device's package is refused next, as
+    /// [`KeyPackageError::WrongDevice`].
+    fn check_device(
+        &self,
+        device: &VerifiedLeaf,
+        signature_key: &[u8],
+        certificate: &[u8],
+    ) -> Result<(), LeafError> {
+        let uploader = device.user_id == self.user_id && device.device_id == self.device_id;
+        if uploader
+            && (signature_key != self.signature_key.as_slice()
+                || certificate != self.certificate.as_slice())
+        {
+            return Err(LeafError::NotEnrolled);
+        }
+        Ok(())
+    }
+}
+
+/// What the server stores of a KeyPackage it accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedKeyPackage {
+    /// Its `KeyPackageRef`, the hash that names it.
+    pub reference: Vec<u8>,
+    /// The end of its lifetime, in seconds since the Unix epoch.
+    pub not_after: u64,
 }
 
 /// Validates an uploaded KeyPackage on the server: OpenMLS's checks
 /// (signature, distinct keys, lifetime now valid), Tavern's ciphersuite, a
-/// lifetime of at most 90 days, the uploader's own device certificate, and
-/// the last-resort flag of the slot it is uploaded to.
+/// lifetime of at most 90 days, the uploader's own device certificate, the
+/// key and certificate the device enrolled with, and the last-resort flag
+/// of the slot it is uploaded to.
 pub fn validate_upload(
-    crypto: &impl OpenMlsCrypto,
     bytes: &[u8],
     uploader: &Uploader,
     last_resort_slot: bool,
-) -> Result<KeyPackage, KeyPackageError> {
+) -> Result<UploadedKeyPackage, KeyPackageError> {
+    let crypto = RustCrypto::default();
     let expected = VerifiedLeaf {
         user_id: uploader.user_id,
         device_id: uploader.device_id,
     };
-    let key_package = validate(crypto, bytes, uploader, expected)?;
+    let key_package = validate(&crypto, bytes, uploader, expected)?;
     if key_package.last_resort() != last_resort_slot {
         return Err(KeyPackageError::LastResortMismatch);
     }
-    Ok(key_package)
+    let reference = key_package
+        .hash_ref(&crypto)
+        .map_err(|error| KeyPackageError::Invalid(error.to_string()))?;
+    Ok(UploadedKeyPackage {
+        reference: reference.as_slice().to_vec(),
+        not_after: key_package.life_time().not_after(),
+    })
 }
 
 /// A KeyPackage claimed from the server and checked by this device: the only
@@ -177,10 +217,9 @@ impl ClaimedKeyPackage {
 /// device each package is for): the same checks as an upload, against the
 /// identity key this device trusts for that user (the roster).
 pub fn validate_claimed(
-    crypto: &impl OpenMlsCrypto,
     bytes: &[u8],
     device: VerifiedLeaf,
     roster: &impl Roster,
 ) -> Result<ClaimedKeyPackage, KeyPackageError> {
-    validate(crypto, bytes, roster, device).map(ClaimedKeyPackage)
+    validate(&RustCrypto::default(), bytes, roster, device).map(ClaimedKeyPackage)
 }

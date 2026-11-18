@@ -139,7 +139,6 @@ fn expected() -> ExpectedGroup<'static> {
 
 fn claim(device: &Device, key_package: &KeyPackage, roster: &impl Roster) -> ClaimedKeyPackage {
     key_package::validate_claimed(
-        device.provider.crypto(),
         &key_package::to_bytes(key_package).unwrap(),
         device.leaf(),
         roster,
@@ -436,7 +435,6 @@ fn a_key_package_of_another_ciphersuite_is_refused() {
     // Only a ClaimedKeyPackage can be added to a group, and the claim
     // refuses it.
     let result = key_package::validate_claimed(
-        other.provider.crypto(),
         &bytes(foreign.key_package()),
         other.leaf(),
         &Pins::of(&[&alice]),
@@ -581,11 +579,15 @@ fn an_update_may_not_swap_the_leaf_for_another_device() {
 
 // --- Section 3: KeyPackages ------------------------------------------------------------
 
+/// The uploader as the server knows it: enrolled with this device's key and
+/// certificate.
 fn uploader(account: &Account, device: &Device) -> Uploader {
     Uploader {
         user_id: account.user_id,
         device_id: device.device_id,
         identity_key: account.public(),
+        signature_key: device.key.public().to_bytes().to_vec(),
+        certificate: device.certificate.clone(),
     }
 }
 
@@ -620,7 +622,6 @@ fn key_packages_last_ninety_days_and_say_whether_they_are_last_resort() {
 fn the_server_accepts_a_device_s_own_valid_key_packages() {
     let alice = Account::new(1);
     let device = alice.device(1);
-    let crypto = device.provider.crypto();
     let who = uploader(&alice, &device);
     let one_time = device.key_package();
     let last_resort = key_package::build(
@@ -631,17 +632,80 @@ fn the_server_accepts_a_device_s_own_valid_key_packages() {
     )
     .unwrap();
 
-    assert!(key_package::validate_upload(crypto, &bytes(&one_time), &who, false).is_ok());
-    let result = key_package::validate_upload(crypto, &bytes(&last_resort), &who, true);
+    let uploaded = key_package::validate_upload(&bytes(&one_time), &who, false).unwrap();
+    // The server stores it under its reference, until the end of its lifetime.
+    assert_eq!(
+        uploaded.reference,
+        one_time
+            .hash_ref(device.provider.crypto())
+            .unwrap()
+            .as_slice()
+    );
+    assert_eq!(uploaded.not_after, one_time.life_time().not_after());
+    let result = key_package::validate_upload(&bytes(&last_resort), &who, true);
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(
-        key_package::validate_upload(crypto, &bytes(&one_time), &who, true).unwrap_err(),
+        key_package::validate_upload(&bytes(&one_time), &who, true).unwrap_err(),
         KeyPackageError::LastResortMismatch
     );
     assert_eq!(
-        key_package::validate_upload(crypto, &bytes(&last_resort), &who, false).unwrap_err(),
+        key_package::validate_upload(&bytes(&last_resort), &who, false).unwrap_err(),
         KeyPackageError::LastResortMismatch
     );
+}
+
+/// The server decodes every upload (section 18): every truncation of a valid
+/// package, and the package with any byte changed, is refused without a
+/// panic. The fuzz target `key_package_upload` goes further.
+#[test]
+fn a_damaged_upload_is_refused_without_a_panic() {
+    let alice = Account::new(1);
+    let device = alice.device(1);
+    let who = uploader(&alice, &device);
+    let package = bytes(&device.key_package());
+    assert!(key_package::validate_upload(&package, &who, false).is_ok());
+
+    for length in 0..package.len() {
+        assert!(key_package::validate_upload(&package[..length], &who, false).is_err());
+    }
+    for index in 0..package.len() {
+        let mut damaged = package.clone();
+        damaged[index] ^= 0x01;
+        assert!(
+            key_package::validate_upload(&damaged, &who, false).is_err(),
+            "byte {index}"
+        );
+    }
+}
+
+/// Section 2: a KeyPackage carries the device itself. A key the account
+/// certified under an enrolled device's id, or the enrolled key under a
+/// certificate issued again, is refused at upload.
+#[test]
+fn an_upload_carries_the_key_and_certificate_the_device_enrolled_with() {
+    let alice = Account::new(1);
+    let device = alice.device(1);
+    let who = uploader(&alice, &device);
+    let forged = alice.device(1);
+    let recertified = Device {
+        user_id: device.user_id,
+        device_id: device.device_id,
+        certificate: alice.identity.certify_device(
+            &alice.user_id,
+            &device.device_id,
+            &device.key.public(),
+            1,
+        ),
+        key: DeviceKey::from_seed(&device.key.seed()),
+        provider: TestProvider::default(),
+    };
+    for impostor in [&forged, &recertified] {
+        assert_eq!(
+            key_package::validate_upload(&bytes(&impostor.key_package()), &who, false).unwrap_err(),
+            KeyPackageError::Leaf(LeafError::NotEnrolled)
+        );
+    }
+    assert!(key_package::validate_upload(&bytes(&device.key_package()), &who, false).is_ok());
 }
 
 #[test]
@@ -649,10 +713,8 @@ fn the_server_refuses_foreign_expired_or_malformed_key_packages() {
     let alice = Account::new(1);
     let bob = Account::new(2);
     let device = alice.device(1);
-    let crypto = device.provider.crypto();
     let who = uploader(&alice, &device);
-    let check =
-        |bytes: &[u8]| key_package::validate_upload(crypto, bytes, &who, false).unwrap_err();
+    let check = |bytes: &[u8]| key_package::validate_upload(bytes, &who, false).unwrap_err();
 
     assert_eq!(check(b"garbage"), KeyPackageError::Malformed);
     assert_eq!(
@@ -3279,12 +3341,8 @@ fn a_device_with_an_unpinned_identity_is_never_added() {
     let pins = dm.pins.clone();
 
     // The claim refuses it...
-    let result = key_package::validate_claimed(
-        impostor.provider.crypto(),
-        &bytes(&impostor.key_package()),
-        impostor.leaf(),
-        &pins,
-    );
+    let result =
+        key_package::validate_claimed(&bytes(&impostor.key_package()), impostor.leaf(), &pins);
     assert_eq!(
         result.unwrap_err(),
         KeyPackageError::Leaf(LeafError::Untrusted)
@@ -3346,10 +3404,9 @@ fn a_claimed_key_package_must_be_the_announced_device_of_a_pinned_user() {
     let dm = Dm::new();
     let bob3 = dm.bob.device(0xb3);
     let package = bytes(&bob3.key_package());
-    let crypto = bob3.provider.crypto();
 
     assert_eq!(
-        key_package::validate_claimed(crypto, &package, bob3.leaf(), &dm.pins)
+        key_package::validate_claimed(&package, bob3.leaf(), &dm.pins)
             .unwrap()
             .device(),
         Some(bob3.leaf())
@@ -3357,13 +3414,12 @@ fn a_claimed_key_package_must_be_the_announced_device_of_a_pinned_user() {
     // The server said it was another device.
     let other = dm.devices[2].leaf();
     assert_eq!(
-        key_package::validate_claimed(crypto, &package, other, &dm.pins).unwrap_err(),
+        key_package::validate_claimed(&package, other, &dm.pins).unwrap_err(),
         KeyPackageError::WrongDevice
     );
     // A user this device does not know.
     assert_eq!(
-        key_package::validate_claimed(crypto, &package, bob3.leaf(), &Pins::of(&[&dm.alice]))
-            .unwrap_err(),
+        key_package::validate_claimed(&package, bob3.leaf(), &Pins::of(&[&dm.alice])).unwrap_err(),
         KeyPackageError::Leaf(LeafError::NotParticipant)
     );
 }

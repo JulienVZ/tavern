@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use openmls_memory_storage::MemoryStorage;
-use openmls_traits::OpenMlsProvider as _;
 use sqlx::PgPool;
 use tavern_crypto::identity::{
     AccountIdentityKey, AccountRootSecret, DeviceKey, ExternalSenderKey, ID_LEN, IdentityPublicKey,
@@ -166,7 +165,6 @@ impl Device {
         )
         .unwrap();
         key_package::validate_claimed(
-            self.provider.crypto(),
             &key_package::to_bytes(&package).unwrap(),
             self.leaf(),
             roster,

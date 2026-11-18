@@ -131,6 +131,13 @@ opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
 
+# tls_codec asserts, in debug builds only, that a length prefix does not run
+# past the input: there, a truncated MLS message panics, where a release
+# build refuses it. The server decodes MLS messages from every client, so
+# development and test builds refuse it too, as the release does.
+[profile.dev.package.tls_codec]
+debug-assertions = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
