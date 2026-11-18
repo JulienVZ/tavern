@@ -6625,6 +6625,7 @@ name = "tavern-e2e-tests"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "openmls_memory_storage",
  "sqlx",
  "tavern-client-core",
  "tavern-crypto",
@@ -6666,7 +6667,6 @@ dependencies = [
  "futures-util",
  "governor",
  "openmls_memory_storage",
- "openmls_traits",
  "prost",
  "reqwest",
  "serde",

@@ -8,10 +8,13 @@ pub mod auth;
 pub mod credentials;
 pub mod devices;
 pub mod gateway;
+pub mod key_packages;
 pub mod system;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use axum::{Json, Router, middleware};
+use tavern_protocol::MAX_KEY_PACKAGE_UPLOAD_BYTES;
 use tavern_protocol::handle::Handle;
 use tavern_protocol::rest::{B64, ErrorCode};
 use utoipa::OpenApi;
@@ -49,10 +52,18 @@ pub fn router(state: AppState) -> Router<AppState> {
             rate_limit::limit_by_ip,
         ));
 
+    // A batch of up to 100 KeyPackages of 4 KiB, in base64.
+    let uploads = OpenApiRouter::new()
+        .routes(routes!(key_packages::upload))
+        .layer(DefaultBodyLimit::max(MAX_KEY_PACKAGE_UPLOAD_BYTES));
+
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(system::health))
         .routes(routes!(system::version))
         .merge(auth)
+        .merge(uploads)
+        .routes(routes!(key_packages::count))
+        .routes(routes!(key_packages::claim))
         .routes(routes!(devices::enrol, devices::list))
         .routes(routes!(devices::revoke))
         .routes(routes!(devices::reopen_session))

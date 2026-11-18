@@ -107,7 +107,8 @@ impl ApiError {
         match self.code {
             ErrorCode::InvalidArgument
             | ErrorCode::InvalidHandle
-            | ErrorCode::InvalidDeviceCertificate => StatusCode::BAD_REQUEST,
+            | ErrorCode::InvalidDeviceCertificate
+            | ErrorCode::InvalidKeyPackage => StatusCode::BAD_REQUEST,
             ErrorCode::Unauthenticated
             | ErrorCode::InvalidCredentials
             | ErrorCode::TotpRequired

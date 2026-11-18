@@ -3,12 +3,14 @@
 //! Tavern instance server.
 //!
 //! At milestone M1 the server handles accounts: registration by invitation,
-//! OPAQUE login, devices, sessions, TOTP and credential recovery. It never
-//! sees a password, a private key or plaintext user content; see
+//! OPAQUE login, devices, sessions, TOTP and credential recovery. M2 adds the
+//! public state of MLS groups and the devices' KeyPackages. It never sees a
+//! password, a private key or plaintext user content; see
 //! `docs/threat-model.md`.
 
 #![forbid(unsafe_code)]
 
+pub mod activity;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -38,6 +40,7 @@ use tavern_protocol::handle::Handle;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
+use crate::config::ClaimLimits;
 use crate::gateway::Registry;
 use crate::pending::ExpiringMap;
 use crate::rate_limit::RateLimits;
@@ -128,10 +131,15 @@ pub struct Settings {
     pub auth_per_ip_per_minute: u32,
     /// Authentication attempts allowed per minute and per handle.
     pub auth_per_handle_per_minute: u32,
+    /// Days a device may stay away and still count as active.
+    pub device_inactive_days: u32,
+    /// How often KeyPackages may be claimed.
+    pub claim_limits: ClaimLimits,
 }
 
 impl Settings {
-    /// Settings with the production rate limits.
+    /// Settings with the production rate limits and the default device
+    /// inactivity window.
     pub fn new(
         source_url: Option<String>,
         trust_forwarded_for: bool,
@@ -143,6 +151,8 @@ impl Settings {
             session_ttl,
             auth_per_ip_per_minute: rate_limit::AUTH_PER_IP_PER_MINUTE,
             auth_per_handle_per_minute: rate_limit::AUTH_PER_HANDLE_PER_MINUTE,
+            device_inactive_days: activity::DEFAULT_INACTIVE_DAYS,
+            claim_limits: ClaimLimits::default(),
         }
     }
 }
@@ -170,6 +180,7 @@ impl AppState {
         let rate_limits = RateLimits::new(
             settings.auth_per_ip_per_minute,
             settings.auth_per_handle_per_minute,
+            settings.claim_limits,
         );
         Self {
             db,

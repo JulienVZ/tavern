@@ -229,13 +229,11 @@ pub async fn save(conn: &mut PgConnection, loaded: LoadedState) -> Result<(), St
 }
 
 /// What the server trusts for a conversation's leaves (ADR 0019, section 2):
-/// the participants' identity keys from `users`, and their devices that are
-/// not revoked, each with the key and the certificate it enrolled with. A
-/// leaf must be one of those devices with exactly that key and certificate:
-/// the identity key could certify another key under a device's id, the
-/// server alone knows which key enrolled. Devices that stayed away longer
-/// than the inactivity period join this rule with
-/// `TAVERN_DEVICE_INACTIVE_DAYS` (M2, tasks 8 and 9).
+/// the participants' identity keys from `users`, and their active devices
+/// ([`crate::activity`]), each with the key and the certificate it enrolled
+/// with. A leaf must be one of those devices with exactly that key and
+/// certificate: the identity key could certify another key under a device's
+/// id, the server alone knows which key enrolled.
 #[derive(Debug, Clone, Default)]
 pub struct ServerRoster {
     identity_keys: HashMap<[u8; ID_LEN], IdentityPublicKey>,
@@ -243,20 +241,27 @@ pub struct ServerRoster {
 }
 
 impl ServerRoster {
-    /// The roster of a conversation between `participants`. A disabled
-    /// account has no active device.
-    pub async fn load(conn: &mut PgConnection, participants: &[Uuid]) -> Result<Self, StateError> {
+    /// The roster of a conversation between `participants`, whose devices
+    /// count as active if seen within `inactive_days`. A disabled account
+    /// has no active device.
+    pub async fn load(
+        conn: &mut PgConnection,
+        participants: &[Uuid],
+        inactive_days: u32,
+    ) -> Result<Self, StateError> {
         let keys: Vec<(Uuid, Vec<u8>)> =
             sqlx::query_as("SELECT id, identity_key FROM users WHERE id = ANY($1)")
                 .bind(participants)
                 .fetch_all(&mut *conn)
                 .await?;
-        let devices: Vec<(Uuid, Uuid, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let devices: Vec<(Uuid, Uuid, Vec<u8>, Vec<u8>)> = sqlx::query_as(concat!(
             "SELECT d.user_id, d.id, d.signature_key, d.certificate \
              FROM devices d JOIN users u ON u.id = d.user_id \
-             WHERE d.user_id = ANY($1) AND d.revoked_at IS NULL AND u.disabled_at IS NULL",
-        )
+             WHERE d.user_id = ANY($1) AND ",
+            crate::activity::active_device!("$2")
+        ))
         .bind(participants)
+        .bind(crate::activity::window(inactive_days))
         .fetch_all(&mut *conn)
         .await?;
         let mut identity_keys = HashMap::new();

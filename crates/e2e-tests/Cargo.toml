@@ -19,6 +19,7 @@ tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+openmls_memory_storage.workspace = true
 sqlx.workspace = true
 tavern-crypto.workspace = true
 tavern-protocol.workspace = true

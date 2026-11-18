@@ -310,7 +310,7 @@ impl Dm {
     }
 
     async fn roster(&self, conn: &mut sqlx::PgConnection) -> ServerRoster {
-        ServerRoster::load(conn, &[self.alice.user, self.bob.user])
+        ServerRoster::load(conn, &[self.alice.user, self.bob.user], 30)
             .await
             .unwrap()
     }
@@ -613,6 +613,39 @@ async fn a_revoked_device_is_not_accepted_any_more() {
     assert!(
         matches!(result, Err(MlsError::Leaf(LeafError::InactiveDevice))),
         "{result:?}"
+    );
+}
+
+/// Section 3: the server accepts as leaves the active devices only, by the
+/// definition a KeyPackage claim uses: a device away for longer than the
+/// window (whole days) is refused, one away for exactly the window is not.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_device_away_longer_than_the_window_is_not_accepted() {
+    let pool = pool().await;
+    let mut dm = Dm::new(&pool).await;
+    let commit = dm.bob_update();
+    let away = |days: i32| {
+        sqlx::query(
+            "UPDATE devices SET created_at = now() - interval '90 days', \
+             last_seen_at = date_trunc('day', now()) - make_interval(days => $2) WHERE id = $1",
+        )
+        .bind(dm.bob1.id)
+        .bind(days)
+        .execute(&pool)
+    };
+
+    away(31).await.unwrap();
+    let result = dm.submit(&pool, dm.bob1.leaf(), &commit, true).await;
+    assert!(
+        matches!(result, Err(MlsError::Leaf(LeafError::InactiveDevice))),
+        "{result:?}"
+    );
+    away(30).await.unwrap();
+    assert!(
+        dm.submit(&pool, dm.bob1.leaf(), &commit, true)
+            .await
+            .is_ok()
     );
 }
 

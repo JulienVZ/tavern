@@ -35,8 +35,9 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 ///
 /// - 0: session, heartbeat, device list (M1);
 /// - 1: persisted security notices, replayed in `Ready` and acknowledged per
-///   device.
-pub const GATEWAY_MINOR_VERSION: u32 = 1;
+///   device;
+/// - 2: `KeyPackagesLow`, and `Ready.key_packages_remaining` filled (M2).
+pub const GATEWAY_MINOR_VERSION: u32 = 2;
 
 /// Largest number of notices one `AckSecurityNotices` frame may name.
 pub const MAX_SECURITY_NOTICE_ACKS: usize = 64;
@@ -54,8 +55,9 @@ pub const REST_MAJOR_VERSION: u32 = 1;
 /// - 0: health and version only (M0), and M1 before credential changes;
 /// - 1: accounts, devices, TOTP, administration, credential changes (M1);
 /// - 2: session responses carry `local_store_share`; wrapped copies hold the
-///   account root secret (format version 2, ADR 0017).
-pub const REST_MINOR_VERSION: u32 = 2;
+///   account root secret (format version 2, ADR 0017);
+/// - 3: KeyPackages: upload, count, claim (M2, ADR 0019).
+pub const REST_MINOR_VERSION: u32 = 3;
 
 /// WebSocket subprotocol negotiated by the gateway.
 pub const GATEWAY_SUBPROTOCOL: &str = "tavern.v1";
@@ -95,6 +97,15 @@ pub mod close_code {
 
 /// Largest JSON body accepted by the REST API by default, in bytes.
 pub const DEFAULT_MAX_REST_BODY_BYTES: usize = 64 * 1024;
+
+/// Largest JSON body of a KeyPackage upload, in bytes.
+pub const MAX_KEY_PACKAGE_UPLOAD_BYTES: usize = 512 * 1024;
+
+/// Largest number of one-time KeyPackages in one upload.
+pub const MAX_KEY_PACKAGES_PER_UPLOAD: usize = 100;
+
+/// Largest number of one-time KeyPackages the server keeps for one device.
+pub const MAX_STORED_KEY_PACKAGES: usize = 200;
 
 #[cfg(test)]
 mod tests {

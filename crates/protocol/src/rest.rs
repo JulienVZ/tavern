@@ -204,6 +204,10 @@ pub enum ErrorCode {
     TooManyDevices,
     /// A signature or proof did not verify.
     InvalidProof,
+    /// A KeyPackage was refused: malformed, expired, valid for too long,
+    /// another device's, or not the key and certificate the device enrolled
+    /// with.
+    InvalidKeyPackage,
 }
 
 /// Body of every REST error response.
@@ -696,6 +700,48 @@ dto! {
         pub wrapped_password_copy: B64,
         /// Account identity key signature authorising the change.
         pub signature: B64,
+    }
+}
+
+// --- KeyPackages (ADR 0019, section 3) --------------------------------------------
+
+dto! {
+    /// `POST /v1/devices/me/key-packages`
+    pub struct UploadKeyPackagesRequest {
+        /// One-time KeyPackages of this device, at most 100.
+        pub key_packages: Vec<B64>,
+        /// A new last-resort KeyPackage, which replaces the current one.
+        pub last_resort: Option<B64>,
+    }
+}
+
+dto! {
+    /// Answer to the upload and to `GET /v1/devices/me/key-packages/count`.
+    pub struct KeyPackageCount {
+        /// One-time KeyPackages of this device that the server can still serve.
+        pub one_time: u32,
+    }
+}
+
+dto! {
+    /// A KeyPackage served by a claim.
+    pub struct DeviceKeyPackage {
+        /// The device the server says it is for. The claimer checks it
+        /// against the device certificate, which is in the package's
+        /// credential.
+        pub device_id: Uuid,
+        /// The KeyPackage.
+        pub key_package: B64,
+    }
+}
+
+dto! {
+    /// Answer to `POST /v1/users/{user_id}/key-packages/claim`.
+    pub struct KeyPackageClaim {
+        /// One KeyPackage for each active device of the user that has one,
+        /// the requesting device excepted. A device with none is absent: it
+        /// joins later by external commit.
+        pub key_packages: Vec<DeviceKeyPackage>,
     }
 }
 

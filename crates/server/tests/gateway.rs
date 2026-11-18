@@ -273,6 +273,47 @@ async fn every_other_device_is_told_about_an_enrolment() {
     assert!(event.added);
 }
 
+/// `Ready` gives the one-time KeyPackages the server can still serve, and a
+/// claim that leaves fewer than 10 tells the device to upload more (ADR 0019,
+/// section 3).
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn a_device_learns_when_its_key_packages_run_low() {
+    let app = TestApp::spawn().await;
+    let (account, claimer) = app.account_with_device("gw", false).await;
+    let laptop = app.enrol(&account).await;
+    let _: tavern_protocol::rest::KeyPackageCount = app
+        .post(
+            "/v1/devices/me/key-packages",
+            Some(&laptop.session_token),
+            &tavern_protocol::rest::UploadKeyPackagesRequest {
+                key_packages: laptop.key_packages(11),
+                last_resort: None,
+            },
+        )
+        .await;
+    let (mut socket, ready) = connect(&app, &laptop).await;
+    assert_eq!(ready.key_packages_remaining, 11);
+    assert_eq!(ready.protocol_minor, tavern_protocol::GATEWAY_MINOR_VERSION);
+
+    let claim = format!("/v1/users/{}/key-packages/claim", account.user_id);
+    for _ in 0..2 {
+        let status = app
+            .status(Method::POST, &claim, Some(&claimer.session_token), NO_BODY)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // Ten left after the first claim: no event. Nine after the second.
+    let frame = expect_frame(&mut socket).await;
+    assert_eq!(frame.request_id, 0);
+    assert_eq!(
+        frame.payload,
+        Some(ServerPayload::KeyPackagesLow(proto::KeyPackagesLow {
+            remaining: 9
+        }))
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL"]
 async fn an_offline_device_learns_about_enrolments_when_it_reconnects() {

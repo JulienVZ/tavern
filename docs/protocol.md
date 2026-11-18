@@ -185,6 +185,8 @@ message Ready {
   uint64 server_time_ms = 4;
   Limits limits = 5;
   bytes mls_external_sender_key = 6;  // current Ed25519 public key
+  // One-time KeyPackages of this device the server can still serve. Since
+  // minor 2.
   uint32 key_packages_remaining = 7;
   // Devices enrolled since this device last sent AckDeviceList.
   repeated DeviceSummary new_devices = 8;
@@ -276,9 +278,9 @@ Minor version 1 of the gateway. Each event below is stored for the account and r
 
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/devices/me/key-packages` | Upload a batch of KeyPackages and, optionally, a new last-resort KeyPackage |
-| `GET /v1/devices/me/key-packages/count` | Remaining one-time KeyPackages |
-| `POST /v1/users/{id}/key-packages/claim` | One KeyPackage per active device of the user, each with its device certificate. Allowed only for a friend or for one's own user (`FORBIDDEN` otherwise, nothing consumed), at most 60 claims per hour per requester and 10 per hour per requester and target. One-time packages are deleted when claimed; the last-resort package is returned when none is left |
+| `POST /v1/devices/me/key-packages` | Upload up to 100 one-time KeyPackages of this device and, optionally, a new last-resort KeyPackage, which replaces the current one. Each must be valid now, for at most 90 days, and carry the key and certificate the device enrolled with (`INVALID_KEY_PACKAGE` otherwise: one refused package refuses the upload). A package sent again is stored once; a device keeps at most 200. Returns the count below. Implemented (task 5 of M2) |
+| `GET /v1/devices/me/key-packages/count` | One-time KeyPackages of this device the server can still serve. Implemented |
+| `POST /v1/users/{user_id}/key-packages/claim` | One KeyPackage for each active device of the user, the requesting device excepted: the oldest one-time package, deleted in the claiming transaction (two claims at once never get the same one), or the last-resort package, kept, when none is left. A device with neither is absent from the answer: it joins later by external commit. The device certificate travels in each package's credential. Allowed for one's own user, and for a friend (from task 6 of M2); anyone else, an unknown user included, gets `FORBIDDEN`, and nothing is consumed. Rate limits below. Implemented, own user only until task 6 |
 | `GET /v1/users/{id}/devices` | Device ids, signature keys and certificates of a user |
 | `GET /v1/friends` | Friends and pending requests |
 | `POST /v1/friends/requests` | Send a request (by handle) |
@@ -383,7 +385,8 @@ message UserDevicesChanged {
   bool added = 3;
 }
 
-// The device should upload more KeyPackages.
+// A claim left this device fewer than 10 one-time KeyPackages: it uploads
+// more. A device that is not connected uploads at its next connection.
 message KeyPackagesLow { uint32 remaining = 1; }
 ```
 
@@ -492,7 +495,6 @@ enum ErrorCode {
   INVALID_KEY_PACKAGE = 44;
   NOT_A_MEMBER = 45;
   GROUP_INFO_REQUIRED = 46;
-  NO_KEY_PACKAGE = 47;        // target device has none, not even last-resort
 
   // Social (M2)
   BLOCKED = 60;
@@ -500,7 +502,7 @@ enum ErrorCode {
 }
 ```
 
-REST errors carry a JSON body `{ "code": "INVALID_CREDENTIALS", "message": "...", "retry_after_ms": 1200 }` with the matching HTTP status (400, 401, 403, 404, 409, 410, 413, 429, 500, 503). The REST codes are listed in the OpenAPI document (`ErrorCode`); beyond the generic ones they are `INVALID_CREDENTIALS`, `INVALID_INVITE`, `HANDLE_TAKEN`, `INVALID_HANDLE`, `TOTP_REQUIRED`, `TOTP_INVALID`, `ACCOUNT_DISABLED`, `INVALID_DEVICE_CERTIFICATE`, `EXCHANGE_EXPIRED` (410: a two-step exchange timed out or was already used), `TOO_MANY_DEVICES` and `INVALID_PROOF`.
+REST errors carry a JSON body `{ "code": "INVALID_CREDENTIALS", "message": "...", "retry_after_ms": 1200 }` with the matching HTTP status (400, 401, 403, 404, 409, 410, 413, 429, 500, 503). The REST codes are listed in the OpenAPI document (`ErrorCode`); beyond the generic ones they are `INVALID_CREDENTIALS`, `INVALID_INVITE`, `HANDLE_TAKEN`, `INVALID_HANDLE`, `TOTP_REQUIRED`, `TOTP_INVALID`, `ACCOUNT_DISABLED`, `INVALID_DEVICE_CERTIFICATE`, `EXCHANGE_EXPIRED` (410: a two-step exchange timed out or was already used), `TOO_MANY_DEVICES`, `INVALID_PROOF` and `INVALID_KEY_PACKAGE` (400).
 
 WebSocket close codes:
 
@@ -529,7 +531,8 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | MLS commit | 256 KiB |
 | MLS Welcome | 512 KiB |
 | MLS GroupInfo | 512 KiB |
-| KeyPackage | 4 KiB each, 100 per upload, 200 stored per device |
+| KeyPackage | 4 KiB each, 100 per upload, 200 stored per device; served while valid for more than an hour |
+| KeyPackage claims | 60 per hour per requesting user; 3 per hour and 10 per day per (requester, target), claims of one's own devices not counted. Exact sliding windows, counted in memory: they start from zero when the server restarts * |
 | REST JSON body | 64 KiB (512 KiB for KeyPackage upload) |
 | Attachment (M5) | 500 MB * |
 | Handle | 2–32 characters, `a–z 0–9 _ .`, lower case, unique |
@@ -556,4 +559,4 @@ Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE
 - Decoders treat every input as hostile: bounded allocation, no recursion on attacker-controlled depth, strict length checks before copying.
 - Neither side logs tokens, keys, `mls_*` fields or decrypted content.
 - The client verifies `mls_external_sender_key` from `Ready` against the `external_senders` extension of each group and repairs mismatches as described in [ADR 0002](adr/0002-mls-via-openmls.md#external-sender-key-lifecycle).
-- The gateway and certificate decoders are fuzz targets (`crates/protocol/fuzz`, run weekly and on demand by `.github/workflows/fuzz.yml`); encode/decode round trips are property tested.
+- The gateway and certificate decoders, and the server's checks of an uploaded KeyPackage, are fuzz targets (`crates/protocol/fuzz`, run weekly and on demand by `.github/workflows/fuzz.yml`); encode/decode round trips are property tested.

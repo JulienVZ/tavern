@@ -138,6 +138,23 @@ impl Api {
             .map_err(|_| ClientError::IncompatibleServer)
     }
 
+    /// Sends a request without a body, with any method, and decodes the
+    /// JSON answer.
+    pub(crate) async fn call_without_body<R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        auth: Auth<'_>,
+    ) -> Result<R, ClientError> {
+        self.send::<()>(method, path, auth, None)
+            .await?
+            .json()
+            .await
+            // A success whose body this client cannot read: the two sides
+            // disagree about the format.
+            .map_err(|_| ClientError::IncompatibleServer)
+    }
+
     /// Sends a request without a body and expects no content back.
     pub(crate) async fn act(
         &self,

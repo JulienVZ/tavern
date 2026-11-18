@@ -37,6 +37,7 @@ use crate::AppState;
 use crate::error::ApiResult;
 use crate::gateway::{Event, RevocationReason};
 use crate::notices;
+use crate::routes::key_packages;
 use crate::session::{self, Session};
 
 /// Largest application message announced to clients (used from milestone M2).
@@ -211,7 +212,12 @@ async fn serve(state: AppState, socket: WebSocket) {
     // Subscribe before reading the pending notices, so that none is lost in
     // between: one recorded meanwhile arrives twice, and clients go by its id.
     let mut subscription = state.gateway.connect(session.user_id, session.device_id);
-    let Ok(security_notices) = notices::pending(&state, &session).await else {
+    let pending = async {
+        let notices = notices::pending(&state, &session).await?;
+        let key_packages = key_packages::remaining(&state.db, session.device_id).await?;
+        Ok::<_, crate::error::ApiError>((notices, key_packages))
+    };
+    let Ok((security_notices, key_packages_remaining)) = pending.await else {
         state
             .gateway
             .disconnect(session.device_id, subscription.generation);
@@ -230,7 +236,7 @@ async fn serve(state: AppState, socket: WebSocket) {
             heartbeat_interval_ms: GATEWAY_HEARTBEAT_INTERVAL_MS,
         }),
         mls_external_sender_key: state.secrets.external_sender.public_bytes().to_vec(),
-        key_packages_remaining: 0,
+        key_packages_remaining,
         new_devices,
         security_notices: security_notices
             .into_iter()
@@ -396,6 +402,10 @@ fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
             None,
         ),
         Event::SecurityNotice(notice) => (ServerPayload::SecurityNotice(notice.to_proto()), None),
+        Event::KeyPackagesLow { remaining } => (
+            ServerPayload::KeyPackagesLow(proto::KeyPackagesLow { remaining }),
+            None,
+        ),
         Event::SessionRevoked(reason) => {
             let (reason, code) = match reason {
                 RevocationReason::Revoked => (

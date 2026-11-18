@@ -43,6 +43,11 @@ pub enum Event {
     /// Something security-relevant happened to the account. The notice is
     /// stored: devices that miss this event get it at their next connection.
     SecurityNotice(Notice),
+    /// A claim left the receiving device fewer than 10 one-time KeyPackages.
+    KeyPackagesLow {
+        /// The one-time KeyPackages left.
+        remaining: u32,
+    },
 }
 
 /// Events queued per connection before the device is considered too slow.

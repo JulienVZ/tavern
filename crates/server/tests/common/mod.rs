@@ -18,12 +18,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use openmls_memory_storage::MemoryStorage;
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tavern_crypto::identity::{
     AccountIdentityKey, AccountRootSecret, DeviceKey, SessionChallenge, WrappingKey,
 };
+use tavern_crypto::mls::credential::for_device;
+use tavern_crypto::mls::{DeviceSigner, Provider, key_package};
 use tavern_crypto::opaque::Password;
 use tavern_crypto::opaque::client::{Login, Registration};
 use tavern_crypto::recovery::RecoveryKey;
@@ -79,7 +82,30 @@ pub struct Account {
 pub struct Device {
     pub device_id: Uuid,
     pub key: DeviceKey,
+    /// The certificate it enrolled with.
+    pub certificate: Vec<u8>,
     pub session_token: B64,
+}
+
+impl Device {
+    /// A KeyPackage of this device, built as its client would. The private
+    /// parts are dropped: these tests never join a group with it.
+    pub fn key_package(&self, last_resort: bool) -> B64 {
+        let provider = Provider::new(MemoryStorage::default());
+        let package = key_package::build(
+            &provider,
+            &DeviceSigner::new(&self.key),
+            for_device(&self.certificate, &self.key.public()),
+            last_resort,
+        )
+        .unwrap();
+        B64(key_package::to_bytes(&package).unwrap())
+    }
+
+    /// `count` one-time KeyPackages of this device.
+    pub fn key_packages(&self, count: usize) -> Vec<B64> {
+        (0..count).map(|_| self.key_package(false)).collect()
+    }
 }
 
 pub fn random_handle(prefix: &str) -> String {
@@ -109,6 +135,17 @@ impl TestApp {
     }
 
     async fn spawn_with(unlimited: bool) -> Self {
+        Self::spawn_configured(|settings| {
+            if unlimited {
+                settings.auth_per_ip_per_minute = 10_000;
+                settings.auth_per_handle_per_minute = 10_000;
+            }
+        })
+        .await
+    }
+
+    /// Like [`TestApp::spawn`], with settings changed by `configure`.
+    pub async fn spawn_configured(configure: impl FnOnce(&mut Settings)) -> Self {
         let database_url = database_url();
         let pool = db::connect(&database_url, 5)
             .await
@@ -121,10 +158,7 @@ impl TestApp {
                 false,
                 Duration::from_secs(3600),
             );
-            if unlimited {
-                settings.auth_per_ip_per_minute = 10_000;
-                settings.auth_per_handle_per_minute = 10_000;
-            }
+            configure(&mut settings);
             settings
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -432,7 +466,7 @@ impl TestApp {
                 "/v1/devices",
                 Some(&grant.enrolment_token),
                 &EnrolDeviceRequest {
-                    certificate: B64(certificate),
+                    certificate: B64(certificate.clone()),
                     name_encrypted: None,
                     platform: Platform::Linux,
                 },
@@ -442,6 +476,7 @@ impl TestApp {
         Device {
             device_id,
             key,
+            certificate,
             session_token: session.session_token,
         }
     }

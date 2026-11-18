@@ -40,6 +40,9 @@ message ServerFrame {
     SessionRevoked session_revoked = 15;
     DeviceListChanged device_list_changed = 16;
     SecurityNotice security_notice = 17;
+
+    // M2 events (field numbers as in docs/protocol.md, section 3).
+    KeyPackagesLow key_packages_low = 48;  // Since minor 2.
   }
 }
 
@@ -59,6 +62,8 @@ message Ready {
   Limits limits = 5;
   // Current Ed25519 public key of the instance's MLS external sender.
   bytes mls_external_sender_key = 6;
+  // One-time KeyPackages of this device the server can still serve (filled
+  // since minor 2; 0 before).
   uint32 key_packages_remaining = 7;
   // Devices enrolled on the account since this device last acknowledged the
   // device list. The client shows them to the user, with a way to revoke
@@ -112,6 +117,13 @@ enum RevocationReason {
 message DeviceListChanged {
   bytes device_id = 1;
   bool added = 2;
+}
+
+// A claim left this device fewer than 10 one-time KeyPackages on the
+// server: the device uploads more. Sent to the device if it is connected; a
+// device that is not uploads at its next connection anyway. Since minor 2.
+message KeyPackagesLow {
+  uint32 remaining = 1;
 }
 
 // Something security-relevant happened to the account. Pushed to the

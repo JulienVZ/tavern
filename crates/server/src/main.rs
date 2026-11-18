@@ -83,11 +83,15 @@ async fn run() -> anyhow::Result<()> {
     let state = AppState::new(
         pool.clone(),
         secrets,
-        Settings::new(
-            config.source_url.clone(),
-            config.trust_forwarded_for,
-            config.session_ttl,
-        ),
+        Settings {
+            device_inactive_days: config.device_inactive_days,
+            claim_limits: config.claim_limits,
+            ..Settings::new(
+                config.source_url.clone(),
+                config.trust_forwarded_for,
+                config.session_ttl,
+            )
+        },
     );
     let listener = TcpListener::bind(config.listen_addr)
         .await

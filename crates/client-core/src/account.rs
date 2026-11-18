@@ -20,6 +20,8 @@ use tavern_crypto::identity::{
     SessionChallenge, WrappingKey,
 };
 use tavern_crypto::local_store::{self, StoreKeyParts};
+use tavern_crypto::mls::key_package;
+use tavern_crypto::mls::{ClaimedKeyPackage, Roster, VerifiedLeaf};
 use tavern_crypto::opaque::client::{Login, Registration};
 use tavern_crypto::opaque::{ExportKey, Password};
 use tavern_crypto::recovery::RecoveryKey;
@@ -27,12 +29,13 @@ use tavern_crypto::secret::Secret;
 use tavern_protocol::handle::Handle;
 use tavern_protocol::rest::{
     AdminUserList, B64, CreateInviteRequest, CreatedInvite, DeviceList, EnrolDeviceRequest,
-    ErrorCode, InviteList, LoginFinishRequest, LoginGrant, LoginOutcome, LoginStartRequest,
-    LoginStartResponse, LoginTotpRequest, Me, PasswordFinishRequest, PasswordStartRequest,
-    Platform, ReauthFinishRequest, ReauthGrant, ReauthStartRequest, RecoverFinishRequest,
-    RecoverStartRequest, RecoverStartResponse, RegisterFinishRequest, RegisterFinishResponse,
-    RegisterStartRequest, RegistrationResponse, ReopenSessionRequest, RotateRecoveryKeyRequest,
-    SessionResponse, TotpCodeRequest, TotpEnrolment, TotpRecoveryCodes,
+    ErrorCode, InviteList, KeyPackageClaim, KeyPackageCount, LoginFinishRequest, LoginGrant,
+    LoginOutcome, LoginStartRequest, LoginStartResponse, LoginTotpRequest, Me,
+    PasswordFinishRequest, PasswordStartRequest, Platform, ReauthFinishRequest, ReauthGrant,
+    ReauthStartRequest, RecoverFinishRequest, RecoverStartRequest, RecoverStartResponse,
+    RegisterFinishRequest, RegisterFinishResponse, RegisterStartRequest, RegistrationResponse,
+    ReopenSessionRequest, RotateRecoveryKeyRequest, SessionResponse, TotpCodeRequest,
+    TotpEnrolment, TotpRecoveryCodes, UploadKeyPackagesRequest,
 };
 use uuid::Uuid;
 
@@ -788,6 +791,73 @@ impl Client {
     /// The active devices of the account.
     pub async fn devices(&self) -> Result<DeviceList, ClientError> {
         self.api().fetch("v1/devices", self.auth()).await
+    }
+
+    /// Uploads one-time KeyPackages of this device and, optionally, a new
+    /// last-resort one, which replaces the current one (ADR 0019, section
+    /// 3). Returns how many one-time packages the instance can still serve.
+    pub async fn upload_key_packages(
+        &self,
+        one_time: Vec<Vec<u8>>,
+        last_resort: Option<Vec<u8>>,
+    ) -> Result<u32, ClientError> {
+        let request = UploadKeyPackagesRequest {
+            key_packages: one_time.into_iter().map(B64).collect(),
+            last_resort: last_resort.map(B64),
+        };
+        let count: KeyPackageCount = self
+            .api()
+            .call(
+                Method::POST,
+                "v1/devices/me/key-packages",
+                self.auth(),
+                &request,
+            )
+            .await?;
+        Ok(count.one_time)
+    }
+
+    /// How many one-time KeyPackages of this device the instance can still
+    /// serve.
+    pub async fn key_package_count(&self) -> Result<u32, ClientError> {
+        let count: KeyPackageCount = self
+            .api()
+            .fetch("v1/devices/me/key-packages/count", self.auth())
+            .await?;
+        Ok(count.one_time)
+    }
+
+    /// Claims a KeyPackage for each active device of `user_id` (this device
+    /// excepted), and checks each one against the identity key this device
+    /// trusts for that user (`roster`) and the device the instance named for
+    /// it. Only a [`ClaimedKeyPackage`] can be added to a group. A package
+    /// that fails the checks fails the claim: the instance returned key
+    /// material that does not verify.
+    pub async fn claim_key_packages(
+        &self,
+        user_id: Uuid,
+        roster: &impl Roster,
+    ) -> Result<Vec<ClaimedKeyPackage>, ClientError> {
+        let claim: KeyPackageClaim = self
+            .api()
+            .call_without_body(
+                Method::POST,
+                &format!("v1/users/{user_id}/key-packages/claim"),
+                self.auth(),
+            )
+            .await?;
+        claim
+            .key_packages
+            .into_iter()
+            .map(|served| {
+                let device = VerifiedLeaf {
+                    user_id: *user_id.as_bytes(),
+                    device_id: *served.device_id.as_bytes(),
+                };
+                key_package::validate_claimed(served.key_package.as_slice(), device, roster)
+                    .map_err(|_| ClientError::UntrustedKeyMaterial)
+            })
+            .collect()
     }
 
     /// Revokes a device of the account. Revoking this device signs it out.

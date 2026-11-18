@@ -29,6 +29,14 @@ pub mod vars {
     pub const TRUST_FORWARDED_FOR: &str = "TAVERN_TRUST_FORWARDED_FOR";
     /// Days an unused session stays valid.
     pub const SESSION_TTL_DAYS: &str = "TAVERN_SESSION_TTL_DAYS";
+    /// Days a device may stay away before it no longer counts as active.
+    pub const DEVICE_INACTIVE_DAYS: &str = "TAVERN_DEVICE_INACTIVE_DAYS";
+    /// KeyPackage claims per hour and per requesting user.
+    pub const KEY_PACKAGE_CLAIMS_PER_HOUR: &str = "TAVERN_KEY_PACKAGE_CLAIMS_PER_HOUR";
+    /// KeyPackage claims per hour and per (requester, target) pair.
+    pub const KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR: &str = "TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR";
+    /// KeyPackage claims per day and per (requester, target) pair.
+    pub const KEY_PACKAGE_PAIR_CLAIMS_PER_DAY: &str = "TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_DAY";
 }
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
@@ -36,6 +44,8 @@ const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
 const MAX_SESSION_TTL_DAYS: u64 = 3650;
+/// Upper bound of every claim limit: far above any honest use.
+const MAX_CLAIM_LIMIT: u32 = 10_000;
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +78,36 @@ pub struct Config {
     pub trust_forwarded_for: bool,
     /// How long an unused session stays valid.
     pub session_ttl: Duration,
+    /// Days a device may stay away and still count as active.
+    pub device_inactive_days: u32,
+    /// How often KeyPackages may be claimed.
+    pub claim_limits: ClaimLimits,
+}
+
+/// How often KeyPackages may be claimed (ADR 0019, section 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimLimits {
+    /// Claims per hour by one requesting user, whoever the target.
+    pub per_requester_per_hour: u32,
+    /// Claims per hour by one user of another user's KeyPackages.
+    pub per_pair_per_hour: u32,
+    /// Claims per day by one user of another user's KeyPackages.
+    pub per_pair_per_day: u32,
+}
+
+impl Default for ClaimLimits {
+    /// A DM is unique per pair of users, so an honest claim of another
+    /// user's KeyPackages happens only when the DM is created or recreated
+    /// (at most once an hour): three an hour and ten a day leave room for
+    /// retries, and keep a friend from draining the one-time KeyPackages of
+    /// a device that is offline.
+    fn default() -> Self {
+        Self {
+            per_requester_per_hour: 60,
+            per_pair_per_hour: 3,
+            per_pair_per_day: 10,
+        }
+    }
 }
 
 // Manual implementation so that the database URL, which contains a password,
@@ -84,6 +124,8 @@ impl fmt::Debug for Config {
             .field("source_url", &self.source_url)
             .field("trust_forwarded_for", &self.trust_forwarded_for)
             .field("session_ttl", &self.session_ttl)
+            .field("device_inactive_days", &self.device_inactive_days)
+            .field("claim_limits", &self.claim_limits)
             .finish()
     }
 }
@@ -189,6 +231,49 @@ impl Config {
             },
         };
 
+        let number = |name: &'static str, default: u32, max: u32| match get(name) {
+            None => Ok(default),
+            Some(raw) => match raw.parse::<u32>() {
+                Ok(n) if (1..=max).contains(&n) => Ok(n),
+                _ => Err(ConfigError::Invalid {
+                    name,
+                    reason: format!("must be a whole number between 1 and {max}"),
+                }),
+            },
+        };
+        let device_inactive_days = number(
+            vars::DEVICE_INACTIVE_DAYS,
+            crate::activity::DEFAULT_INACTIVE_DAYS,
+            crate::activity::MAX_INACTIVE_DAYS,
+        )?;
+        let defaults = ClaimLimits::default();
+        let claim_limits = ClaimLimits {
+            per_requester_per_hour: number(
+                vars::KEY_PACKAGE_CLAIMS_PER_HOUR,
+                defaults.per_requester_per_hour,
+                MAX_CLAIM_LIMIT,
+            )?,
+            per_pair_per_hour: number(
+                vars::KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR,
+                defaults.per_pair_per_hour,
+                MAX_CLAIM_LIMIT,
+            )?,
+            per_pair_per_day: number(
+                vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY,
+                defaults.per_pair_per_day,
+                MAX_CLAIM_LIMIT,
+            )?,
+        };
+        if claim_limits.per_pair_per_day < claim_limits.per_pair_per_hour {
+            return Err(ConfigError::Invalid {
+                name: vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY,
+                reason: format!(
+                    "must be at least {}",
+                    vars::KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR
+                ),
+            });
+        }
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -199,6 +284,8 @@ impl Config {
             source_url: get(vars::SOURCE_URL),
             trust_forwarded_for,
             session_ttl: Duration::from_secs(session_ttl_days * 24 * 60 * 60),
+            device_inactive_days,
+            claim_limits,
         })
     }
 }
@@ -239,6 +326,66 @@ mod tests {
         assert_eq!(config.source_url, None);
         assert!(!config.trust_forwarded_for);
         assert_eq!(config.session_ttl, Duration::from_secs(90 * 24 * 60 * 60));
+        assert_eq!(config.device_inactive_days, 30);
+        assert_eq!(
+            config.claim_limits,
+            ClaimLimits {
+                per_requester_per_hour: 60,
+                per_pair_per_hour: 3,
+                per_pair_per_day: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn device_inactivity_and_claim_limits_are_read() {
+        let config = config_from(&[
+            DB,
+            (vars::DEVICE_INACTIVE_DAYS, "14"),
+            (vars::KEY_PACKAGE_CLAIMS_PER_HOUR, "100"),
+            (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR, "2"),
+            (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY, "5"),
+        ])
+        .unwrap();
+        assert_eq!(config.device_inactive_days, 14);
+        assert_eq!(
+            config.claim_limits,
+            ClaimLimits {
+                per_requester_per_hour: 100,
+                per_pair_per_hour: 2,
+                per_pair_per_day: 5,
+            }
+        );
+
+        // Never longer than the retention, 30 days at most (ADR 0019,
+        // section 15), and never zero.
+        for (name, value) in [
+            (vars::DEVICE_INACTIVE_DAYS, "31"),
+            (vars::DEVICE_INACTIVE_DAYS, "0"),
+            (vars::KEY_PACKAGE_CLAIMS_PER_HOUR, "0"),
+            (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR, "-1"),
+            (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY, "10001"),
+        ] {
+            let err = config_from(&[DB, (name, value)]).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Invalid { name: n, .. } if n == name),
+                "{name}={value}"
+            );
+        }
+        // A daily limit below the hourly one would make the hourly one a lie.
+        let err = config_from(&[
+            DB,
+            (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR, "5"),
+            (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY, "4"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                name: vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY,
+                ..
+            }
+        ));
     }
 
     #[test]

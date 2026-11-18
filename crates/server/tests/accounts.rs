@@ -562,6 +562,7 @@ async fn a_session_proof_is_refused_when_it_does_not_match() {
     let stranger = common::Device {
         device_id: device.device_id,
         key: DeviceKey::generate(),
+        certificate: Vec::new(),
         session_token: B64(vec![]),
     };
     let request = ReopenSessionRequest {

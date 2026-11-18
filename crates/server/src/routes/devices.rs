@@ -253,6 +253,11 @@ pub(crate) async fn revoke(
         .bind(device_id)
         .execute(&mut *tx)
         .await?;
+    // Never served again, so not kept either (ADR 0019, section 3).
+    sqlx::query("DELETE FROM key_packages WHERE device_id = $1")
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
     // The user's other devices are told, including those that are offline.
     let acting = Some(session.device_id);
     let notice =
