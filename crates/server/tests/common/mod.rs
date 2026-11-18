@@ -493,6 +493,33 @@ impl TestApp {
         let device = self.enrol(&account).await;
         (account, device)
     }
+
+    /// Makes two users friends: `from` sends `to` a request, which `to`'s
+    /// device accepts.
+    pub async fn befriend(
+        &self,
+        (from_account, from): (&Account, &Device),
+        (to_account, to): (&Account, &Device),
+    ) {
+        let _: FriendRequestAnswer = self
+            .post(
+                "/v1/friends/requests",
+                Some(&from.session_token),
+                &FriendRequest {
+                    handle: to_account.handle.as_str().to_owned(),
+                },
+            )
+            .await;
+        let status = self
+            .status::<()>(
+                reqwest::Method::POST,
+                &format!("/v1/friends/requests/{}/accept", from_account.user_id),
+                Some(&to.session_token),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
 }
 
 pub fn session_proof(grant: &LoginGrant, account: &Account, device: &Device) -> B64 {

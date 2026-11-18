@@ -208,6 +208,8 @@ pub enum ErrorCode {
     /// another device's, or not the key and certificate the device enrolled
     /// with.
     InvalidKeyPackage,
+    /// This user blocks the other one: unblock them first.
+    Blocked,
 }
 
 /// Body of every REST error response.
@@ -742,6 +744,69 @@ dto! {
         /// the requesting device excepted. A device with none is absent: it
         /// joins later by external commit.
         pub key_packages: Vec<DeviceKeyPackage>,
+    }
+}
+
+// --- Friends and blocks (ADR 0020) ---------------------------------------------
+
+dto! {
+    /// Another user, as the friend list shows them.
+    pub struct UserSummary {
+        /// The user.
+        pub user_id: Uuid,
+        /// Canonical handle.
+        pub handle: String,
+        /// Display name.
+        pub display_name: String,
+        /// Account identity public key, which the client pins when the
+        /// friendship is accepted (ADR 0019, section 10).
+        pub identity_key: B64,
+        /// When the friendship was accepted, the request sent, or the block
+        /// made.
+        pub since_ms: u64,
+    }
+}
+
+dto! {
+    /// Answer to `GET /v1/friends`.
+    pub struct FriendList {
+        /// Friends.
+        pub friends: Vec<UserSummary>,
+        /// Requests other users sent this user, waiting for an answer.
+        pub received: Vec<UserSummary>,
+        /// Requests this user sent, waiting for an answer.
+        pub sent: Vec<UserSummary>,
+        /// Users this user blocks.
+        pub blocked: Vec<UserSummary>,
+    }
+}
+
+dto! {
+    /// `POST /v1/friends/requests`
+    pub struct FriendRequest {
+        /// Canonical handle of the user to befriend.
+        pub handle: String,
+    }
+}
+
+/// Where a relation stands after a friend request.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOutcome {
+    /// The request waits for the other user's answer.
+    RequestSent,
+    /// The other user had sent a request already: both are now friends.
+    Friends,
+}
+
+dto! {
+    /// Answer to `POST /v1/friends/requests`.
+    pub struct FriendRequestAnswer {
+        /// The user the request is for.
+        pub user_id: Uuid,
+        /// What the request led to.
+        pub outcome: RequestOutcome,
     }
 }
 

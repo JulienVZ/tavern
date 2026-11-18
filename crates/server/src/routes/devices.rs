@@ -16,6 +16,7 @@ use crate::AppState;
 use crate::error::{ApiError, ApiJson, ApiResult, is_unique_violation};
 use crate::gateway::{Event, RevocationReason};
 use crate::notices::{self, NoticeKind};
+use crate::routes::friends;
 use crate::session::{self, EnrolmentAuth, Session};
 
 /// Active devices allowed per account.
@@ -129,6 +130,7 @@ pub(crate) async fn enrol(
             added: true,
         },
     );
+    friends::tell_friends_about_device(&state, user_id, device_id, true).await;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -279,5 +281,6 @@ pub(crate) async fn revoke(
             added: false,
         },
     );
+    friends::tell_friends_about_device(&state, session.user_id, device_id, false).await;
     Ok(StatusCode::NO_CONTENT)
 }

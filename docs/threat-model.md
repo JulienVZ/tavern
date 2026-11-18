@@ -102,7 +102,7 @@ Includes a malicious admin running modified software and an intruder who took ov
 | **Names of servers, channels, categories and roles**, role colours and permissions, channel order | Needed for permissions and invitations |
 | Server nicknames | Treated like profile data |
 | Device ids, device public keys and certificates, KeyPackages, creation and last-seen times | Authentication Service role |
-| Friend list, pending requests, blocks | Enforced server side |
+| Friend list, pending requests, blocks, and the requests a blocked user sent to their blocker, which the blocker never sees ([ADR 0020](adr/0020-friends-and-blocks.md)) | Enforced server side |
 | Membership of servers, channels, private groups and DMs; public MLS tree of each group | Routing and permission checks |
 | For each message: conversation, sending device, time, padded size, MLS epoch, whether it is a handshake or application message | Delivery Service role |
 | For each blob: size, uploader, conversation, time | Access control and quotas |

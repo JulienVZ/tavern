@@ -7,6 +7,7 @@ pub mod admin;
 pub mod auth;
 pub mod credentials;
 pub mod devices;
+pub mod friends;
 pub mod gateway;
 pub mod key_packages;
 pub mod system;
@@ -64,6 +65,12 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(uploads)
         .routes(routes!(key_packages::count))
         .routes(routes!(key_packages::claim))
+        .routes(routes!(friends::list))
+        .routes(routes!(friends::request))
+        .routes(routes!(friends::accept))
+        .routes(routes!(friends::remove_request))
+        .routes(routes!(friends::unfriend))
+        .routes(routes!(friends::block, friends::unblock))
         .routes(routes!(devices::enrol, devices::list))
         .routes(routes!(devices::revoke))
         .routes(routes!(devices::reopen_session))

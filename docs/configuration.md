@@ -42,6 +42,7 @@ Read by the `tavern-server` binary. The compose file sets them from the variable
 | `TAVERN_KEY_PACKAGE_CLAIMS_PER_HOUR` | no | `60` | KeyPackage claims a user may make per hour, whoever they are for (1 to 10000). A claim fetches the keys that add devices to a new conversation. |
 | `TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR` | no | `3` | KeyPackage claims a user may make per hour for another user's devices (1 to 10000). A conversation with someone is created, or recreated, at most once an hour, so this leaves room for retries while keeping a friend from using up the one-time KeyPackages of a device that is offline. Claims for one's own devices are not counted. |
 | `TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_DAY` | no | `10` | The same per day (1 to 10000, at least `TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR`). |
+| `TAVERN_FRIEND_REQUESTS_PER_HOUR` | no | `20` | Friend requests a user may send per hour, requests to unknown handles included (1 to 10000; [ADR 0020](adr/0020-friends-and-blocks.md)). |
 | `TAVERN_OPAQUE_SERVER_SETUP` | yes | generated | **Secret.** See "Secrets". |
 | `TAVERN_MLS_EXTERNAL_SENDER_KEY` | yes | generated | **Secret.** See "Secrets". |
 | `TAVERN_TOTP_ENCRYPTION_KEY` | yes | generated | **Secret.** See "Secrets". |
@@ -49,7 +50,7 @@ Read by the `tavern-server` binary. The compose file sets them from the variable
 
 An empty value counts as unset. An invalid value stops the server at start-up with a message naming the variable.
 
-The claim limits are counted exactly over sliding windows ("3 per hour" is at most 3 in any hour), in memory: they start from zero when the server restarts. They will be reviewed at M3, for private groups, where a user claims for several users at once ([ADR 0019](adr/0019-mls-direct-messages.md), section 3).
+The claim and friend request limits are counted exactly over sliding windows ("3 per hour" is at most 3 in any hour), in memory: they start from zero when the server restarts. They will be reviewed at M3, for private groups, where a user claims for several users at once ([ADR 0019](adr/0019-mls-direct-messages.md), section 3).
 
 ### Coming with M2 (not read by the server yet)
 

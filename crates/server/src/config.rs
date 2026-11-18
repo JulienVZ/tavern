@@ -37,6 +37,8 @@ pub mod vars {
     pub const KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR: &str = "TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR";
     /// KeyPackage claims per day and per (requester, target) pair.
     pub const KEY_PACKAGE_PAIR_CLAIMS_PER_DAY: &str = "TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_DAY";
+    /// Friend requests per hour and per requesting user.
+    pub const FRIEND_REQUESTS_PER_HOUR: &str = "TAVERN_FRIEND_REQUESTS_PER_HOUR";
 }
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
@@ -46,6 +48,8 @@ const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
 const MAX_SESSION_TTL_DAYS: u64 = 3650;
 /// Upper bound of every claim limit: far above any honest use.
 const MAX_CLAIM_LIMIT: u32 = 10_000;
+/// Friend requests per hour and per user, by default (ADR 0020).
+pub const DEFAULT_FRIEND_REQUESTS_PER_HOUR: u32 = 20;
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +86,8 @@ pub struct Config {
     pub device_inactive_days: u32,
     /// How often KeyPackages may be claimed.
     pub claim_limits: ClaimLimits,
+    /// Friend requests a user may send per hour.
+    pub friend_requests_per_hour: u32,
 }
 
 /// How often KeyPackages may be claimed (ADR 0019, section 3).
@@ -126,6 +132,7 @@ impl fmt::Debug for Config {
             .field("session_ttl", &self.session_ttl)
             .field("device_inactive_days", &self.device_inactive_days)
             .field("claim_limits", &self.claim_limits)
+            .field("friend_requests_per_hour", &self.friend_requests_per_hour)
             .finish()
     }
 }
@@ -264,6 +271,11 @@ impl Config {
                 MAX_CLAIM_LIMIT,
             )?,
         };
+        let friend_requests_per_hour = number(
+            vars::FRIEND_REQUESTS_PER_HOUR,
+            DEFAULT_FRIEND_REQUESTS_PER_HOUR,
+            MAX_CLAIM_LIMIT,
+        )?;
         if claim_limits.per_pair_per_day < claim_limits.per_pair_per_hour {
             return Err(ConfigError::Invalid {
                 name: vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY,
@@ -286,6 +298,7 @@ impl Config {
             session_ttl: Duration::from_secs(session_ttl_days * 24 * 60 * 60),
             device_inactive_days,
             claim_limits,
+            friend_requests_per_hour,
         })
     }
 }
@@ -327,6 +340,7 @@ mod tests {
         assert!(!config.trust_forwarded_for);
         assert_eq!(config.session_ttl, Duration::from_secs(90 * 24 * 60 * 60));
         assert_eq!(config.device_inactive_days, 30);
+        assert_eq!(config.friend_requests_per_hour, 20);
         assert_eq!(
             config.claim_limits,
             ClaimLimits {
@@ -345,9 +359,11 @@ mod tests {
             (vars::KEY_PACKAGE_CLAIMS_PER_HOUR, "100"),
             (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR, "2"),
             (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY, "5"),
+            (vars::FRIEND_REQUESTS_PER_HOUR, "7"),
         ])
         .unwrap();
         assert_eq!(config.device_inactive_days, 14);
+        assert_eq!(config.friend_requests_per_hour, 7);
         assert_eq!(
             config.claim_limits,
             ClaimLimits {
@@ -365,6 +381,7 @@ mod tests {
             (vars::KEY_PACKAGE_CLAIMS_PER_HOUR, "0"),
             (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR, "-1"),
             (vars::KEY_PACKAGE_PAIR_CLAIMS_PER_DAY, "10001"),
+            (vars::FRIEND_REQUESTS_PER_HOUR, "0"),
         ] {
             let err = config_from(&[DB, (name, value)]).unwrap_err();
             assert!(

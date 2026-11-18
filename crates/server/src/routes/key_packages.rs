@@ -26,6 +26,7 @@ use crate::AppState;
 use crate::activity;
 use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::gateway::Event;
+use crate::routes::friends;
 use crate::session::Session;
 
 /// The packages a claim may serve: not expired, nor about to be. The device
@@ -226,10 +227,10 @@ pub(crate) async fn count(
 /// device excepted: a one-time package, or the last-resort one when none is
 /// left. A device with neither is absent from the answer.
 ///
-/// Allowed for one's own account; for another user's, from task 6 of M2,
-/// for a friend only. Anyone else, an unknown user included, is refused
-/// with `FORBIDDEN`, and nothing is consumed. At most 60 claims an hour per
-/// requesting user (configurable).
+/// Allowed for one's own account and for a friend's. Anyone else, an
+/// unknown user included, is refused with `FORBIDDEN`, and nothing is
+/// consumed. At most 60 claims an hour per requesting user, and for a
+/// friend's packages 3 an hour and 10 a day per pair (configurable).
 #[utoipa::path(
     post,
     path = "/v1/users/{user_id}/key-packages/claim",
@@ -245,7 +246,13 @@ pub(crate) async fn claim(
 ) -> ApiResult<Json<KeyPackageClaim>> {
     state.rate_limits.claims.check_requester(session.user_id)?;
     if user_id != session.user_id {
-        return Err(ApiError::forbidden());
+        if !friends::are_friends(&state.db, session.user_id, user_id).await? {
+            return Err(ApiError::forbidden());
+        }
+        state
+            .rate_limits
+            .claims
+            .check_pair(session.user_id, user_id)?;
     }
 
     let mut tx = state.db.begin().await?;

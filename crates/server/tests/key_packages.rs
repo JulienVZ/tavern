@@ -416,9 +416,86 @@ async fn a_claim_serves_active_devices_only() {
     );
 }
 
-/// Until friendships exist (task 6 of M2), a user claims only their own
-/// devices' KeyPackages. Anyone else is refused, an unknown user too, and
-/// nothing is consumed.
+/// A friend's packages are claimable, at most 3 times an hour per pair;
+/// claims of one's own devices are not counted per pair. A request that is
+/// not accepted yet, or an unfriending, makes them forbidden, with nothing
+/// consumed.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_friend_s_key_packages_are_claimable_within_the_pair_limit() {
+    let app = TestApp::spawn().await;
+    let (alice, alice1) = app.account_with_device("kp", false).await;
+    let alice2 = app.enrol(&alice).await;
+    let (bob, bob1) = app.account_with_device("kp", false).await;
+    let (carol, carol1) = app.account_with_device("kp", false).await;
+    upload(&app, &bob1, bob1.key_packages(10), None).await;
+    upload(&app, &alice2, alice2.key_packages(10), None).await;
+
+    let _: tavern_protocol::rest::FriendRequestAnswer = app
+        .post(
+            "/v1/friends/requests",
+            Some(&alice1.session_token),
+            &tavern_protocol::rest::FriendRequest {
+                handle: bob.handle.as_str().to_owned(),
+            },
+        )
+        .await;
+    let (status, ..) = claim(&app, &alice1, bob.user_id).await.unwrap_err();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a request is not a friendship"
+    );
+    app.status::<()>(
+        Method::POST,
+        &format!("/v1/friends/requests/{}/accept", alice.user_id),
+        Some(&bob1.session_token),
+        None,
+    )
+    .await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            claimed_devices(&app, &alice1, bob.user_id).await,
+            [bob1.device_id]
+        );
+    }
+    let (status, code, _) = claim(&app, &alice1, bob.user_id).await.unwrap_err();
+    assert_eq!(
+        (status, code),
+        (StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited)
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            claimed_devices(&app, &alice1, alice.user_id).await,
+            [alice2.device_id],
+            "one's own devices are not counted per pair"
+        );
+    }
+    // Per pair: another friend of Bob's is not affected.
+    app.befriend((&carol, &carol1), (&bob, &bob1)).await;
+    assert_eq!(
+        claimed_devices(&app, &carol1, bob.user_id).await,
+        [bob1.device_id]
+    );
+    assert_eq!(count(&app, &bob1).await, 6);
+
+    let status = app
+        .status::<()>(
+            Method::DELETE,
+            &format!("/v1/friends/{}", carol.user_id),
+            Some(&bob1.session_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, ..) = claim(&app, &carol1, bob.user_id).await.unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(count(&app, &bob1).await, 6, "nothing consumed");
+}
+
+/// Anyone but oneself and one's friends is refused, an unknown user too,
+/// and nothing is consumed.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn another_user_s_key_packages_are_forbidden_and_nothing_is_consumed() {

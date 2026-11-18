@@ -194,9 +194,11 @@ enum GatewayView {
     },
 }
 
-impl From<GatewayEvent> for GatewayView {
-    fn from(event: GatewayEvent) -> Self {
-        match event {
+impl GatewayView {
+    /// What the webview is told of `event`. Friends and their devices are
+    /// not shown before the interface of M2's task 12.
+    fn of(event: GatewayEvent) -> Option<Self> {
+        Some(match event {
             GatewayEvent::Connected {
                 new_devices,
                 security_notices,
@@ -222,7 +224,10 @@ impl From<GatewayEvent> for GatewayView {
                     SessionEnd::Replaced => "replaced",
                 },
             },
-        }
+            GatewayEvent::FriendshipChanged { .. } | GatewayEvent::UserDevicesChanged { .. } => {
+                return None;
+            }
+        })
     }
 }
 
@@ -246,7 +251,9 @@ fn attach(app: &AppHandle, session: &mut Session, client: Client) -> Result<()> 
         while let Some(event) = events.recv().await {
             let ended = matches!(event, GatewayEvent::SessionEnded(_));
             // The window may be closing; nothing to do about a failed emit.
-            let _ = app.emit(GATEWAY_EVENT, GatewayView::from(event));
+            if let Some(view) = GatewayView::of(event) {
+                let _ = app.emit(GATEWAY_EVENT, view);
+            }
             if ended {
                 break;
             }
@@ -718,7 +725,16 @@ mod tests {
     #[test]
     fn gateway_events_are_tagged_for_the_webview() {
         let id = Uuid::from_u128(7);
-        let json = |event: GatewayEvent| serde_json::to_string(&GatewayView::from(event)).unwrap();
+        let json =
+            |event: GatewayEvent| serde_json::to_string(&GatewayView::of(event).unwrap()).unwrap();
+        assert!(
+            GatewayView::of(GatewayEvent::UserDevicesChanged {
+                user_id: id,
+                device_id: id,
+                added: true,
+            })
+            .is_none()
+        );
 
         assert_eq!(
             json(GatewayEvent::DeviceAdded(id)),

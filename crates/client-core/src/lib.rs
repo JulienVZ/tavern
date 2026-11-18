@@ -25,7 +25,7 @@ pub use account::{
 };
 pub use error::ClientError;
 pub use gateway::{
-    Gateway, GatewayEvent, NewDevice, SecurityNotice, SecurityNoticeKind, SessionEnd,
+    Gateway, GatewayEvent, NewDevice, Relation, SecurityNotice, SecurityNoticeKind, SessionEnd,
 };
 pub use instance::{
     Compatibility, InstanceUrl, InstanceUrlError, compatibility, fetch_health, fetch_version,

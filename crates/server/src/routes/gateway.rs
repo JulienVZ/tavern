@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::error::ApiResult;
-use crate::gateway::{Event, RevocationReason};
+use crate::gateway::{Event, Relation, RevocationReason};
 use crate::notices;
 use crate::panics::{self, Panicked};
 use crate::routes::key_packages;
@@ -456,6 +456,34 @@ fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
         Event::SecurityNotice(notice) => (ServerPayload::SecurityNotice(notice.to_proto()), None),
         Event::KeyPackagesLow { remaining } => (
             ServerPayload::KeyPackagesLow(proto::KeyPackagesLow { remaining }),
+            None,
+        ),
+        Event::FriendshipChanged { user_id, relation } => {
+            let state = match relation {
+                Relation::None => proto::FriendshipState::None,
+                Relation::RequestSent => proto::FriendshipState::RequestSent,
+                Relation::RequestReceived => proto::FriendshipState::RequestReceived,
+                Relation::Friends => proto::FriendshipState::Friends,
+                Relation::Blocked => proto::FriendshipState::Blocked,
+            };
+            (
+                ServerPayload::FriendshipChanged(proto::FriendshipChanged {
+                    user_id: user_id.as_bytes().to_vec(),
+                    state: state.into(),
+                }),
+                None,
+            )
+        }
+        Event::UserDevicesChanged {
+            user_id,
+            device_id,
+            added,
+        } => (
+            ServerPayload::UserDevicesChanged(proto::UserDevicesChanged {
+                user_id: user_id.as_bytes().to_vec(),
+                device_id: device_id.as_bytes().to_vec(),
+                added,
+            }),
             None,
         ),
         Event::SessionRevoked(reason) => {

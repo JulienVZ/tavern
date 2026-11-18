@@ -95,6 +95,7 @@ async fn run() -> anyhow::Result<()> {
         Settings {
             device_inactive_days: config.device_inactive_days,
             claim_limits: config.claim_limits,
+            friend_requests_per_hour: config.friend_requests_per_hour,
             ..Settings::new(
                 config.source_url.clone(),
                 config.trust_forwarded_for,

@@ -15,6 +15,21 @@ use uuid::Uuid;
 
 use crate::notices::Notice;
 
+/// Where the receiving user stands with another one (ADR 0020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// Nothing: no request, no friendship, or a block by the other user.
+    None,
+    /// This user sent a request.
+    RequestSent,
+    /// The other user sent a request.
+    RequestReceived,
+    /// Friends.
+    Friends,
+    /// This user blocks the other one.
+    Blocked,
+}
+
 /// Why a session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevocationReason {
@@ -47,6 +62,22 @@ pub enum Event {
     KeyPackagesLow {
         /// The one-time KeyPackages left.
         remaining: u32,
+    },
+    /// The receiving user's relation with `user_id` changed.
+    FriendshipChanged {
+        /// The other user.
+        user_id: Uuid,
+        /// The relation now, as the receiving user sees it.
+        relation: Relation,
+    },
+    /// A friend of the receiving user enrolled (`added`) or revoked a device.
+    UserDevicesChanged {
+        /// The friend.
+        user_id: Uuid,
+        /// The device.
+        device_id: Uuid,
+        /// `true` for an enrolment, `false` for a revocation.
+        added: bool,
     },
 }
 

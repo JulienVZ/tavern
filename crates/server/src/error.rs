@@ -114,9 +114,10 @@ impl ApiError {
             | ErrorCode::TotpRequired
             | ErrorCode::TotpInvalid
             | ErrorCode::InvalidProof => StatusCode::UNAUTHORIZED,
-            ErrorCode::Forbidden | ErrorCode::AccountDisabled | ErrorCode::InvalidInvite => {
-                StatusCode::FORBIDDEN
-            }
+            ErrorCode::Forbidden
+            | ErrorCode::AccountDisabled
+            | ErrorCode::InvalidInvite
+            | ErrorCode::Blocked => StatusCode::FORBIDDEN,
             ErrorCode::NotFound | ErrorCode::UnknownEndpoint => StatusCode::NOT_FOUND,
             ErrorCode::AlreadyExists | ErrorCode::HandleTaken | ErrorCode::TooManyDevices => {
                 StatusCode::CONFLICT

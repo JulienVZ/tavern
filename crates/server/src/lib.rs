@@ -136,6 +136,8 @@ pub struct Settings {
     pub device_inactive_days: u32,
     /// How often KeyPackages may be claimed.
     pub claim_limits: ClaimLimits,
+    /// Friend requests a user may send per hour.
+    pub friend_requests_per_hour: u32,
 }
 
 impl Settings {
@@ -154,6 +156,7 @@ impl Settings {
             auth_per_handle_per_minute: rate_limit::AUTH_PER_HANDLE_PER_MINUTE,
             device_inactive_days: activity::DEFAULT_INACTIVE_DAYS,
             claim_limits: ClaimLimits::default(),
+            friend_requests_per_hour: config::DEFAULT_FRIEND_REQUESTS_PER_HOUR,
         }
     }
 }
@@ -182,6 +185,7 @@ impl AppState {
             settings.auth_per_ip_per_minute,
             settings.auth_per_handle_per_minute,
             settings.claim_limits,
+            settings.friend_requests_per_hour,
         );
         Self {
             db,

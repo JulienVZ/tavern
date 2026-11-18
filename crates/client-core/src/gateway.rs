@@ -121,6 +121,33 @@ impl SecurityNotice {
     }
 }
 
+/// Where this user stands with another one (ADR 0020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// Nothing between them.
+    None,
+    /// This user sent a request.
+    RequestSent,
+    /// The other user sent a request.
+    RequestReceived,
+    /// Friends.
+    Friends,
+    /// This user blocks the other one.
+    Blocked,
+}
+
+impl Relation {
+    fn from_proto(state: i32) -> Option<Self> {
+        match proto::FriendshipState::try_from(state).ok()? {
+            proto::FriendshipState::None => Some(Self::None),
+            proto::FriendshipState::RequestSent => Some(Self::RequestSent),
+            proto::FriendshipState::RequestReceived => Some(Self::RequestReceived),
+            proto::FriendshipState::Friends => Some(Self::Friends),
+            proto::FriendshipState::Blocked => Some(Self::Blocked),
+        }
+    }
+}
+
 /// What the gateway tells the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayEvent {
@@ -141,6 +168,23 @@ pub enum GatewayEvent {
     DeviceRemoved(Uuid),
     /// Something security-relevant just happened to the account.
     SecurityNotice(SecurityNotice),
+    /// The relation with another user changed (ADR 0020). The friend list
+    /// is to be read again.
+    FriendshipChanged {
+        /// The other user.
+        user_id: Uuid,
+        /// Where this user now stands with them.
+        relation: Relation,
+    },
+    /// A friend enrolled (`added`) or revoked a device.
+    UserDevicesChanged {
+        /// The friend.
+        user_id: Uuid,
+        /// The device.
+        device_id: Uuid,
+        /// `true` for an enrolment.
+        added: bool,
+    },
     /// The connection dropped; the gateway is reconnecting.
     Disconnected,
     /// The session ended. The gateway stopped; the user must log in again.
@@ -427,6 +471,19 @@ async fn connection(
                     Some(ServerPayload::SecurityNotice(notice)) => {
                         SecurityNotice::from_proto(&notice).map(GatewayEvent::SecurityNotice)
                     }
+                    Some(ServerPayload::FriendshipChanged(change)) => uuid(&change.user_id)
+                        .zip(Relation::from_proto(change.state))
+                        .map(|(user_id, relation)| GatewayEvent::FriendshipChanged {
+                            user_id,
+                            relation,
+                        }),
+                    Some(ServerPayload::UserDevicesChanged(change)) => uuid(&change.user_id)
+                        .zip(uuid(&change.device_id))
+                        .map(|(user_id, device_id)| GatewayEvent::UserDevicesChanged {
+                            user_id,
+                            device_id,
+                            added: change.added,
+                        }),
                     Some(ServerPayload::SessionRevoked(revoked)) => {
                         return Ended::Session(session_end(revoked.reason));
                     }

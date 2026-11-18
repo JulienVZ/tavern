@@ -280,13 +280,13 @@ Minor version 1 of the gateway. Each event below is stored for the account and r
 |---|---|
 | `POST /v1/devices/me/key-packages` | Upload up to 100 one-time KeyPackages of this device and, optionally, a new last-resort KeyPackage, which replaces the current one. Each must be valid now, for at most 90 days, and carry the key and certificate the device enrolled with (`INVALID_KEY_PACKAGE` otherwise: one refused package refuses the upload). A package sent again is stored once; a device keeps at most 200. Returns the count below. Implemented (task 5 of M2) |
 | `GET /v1/devices/me/key-packages/count` | One-time KeyPackages of this device the server can still serve. Implemented |
-| `POST /v1/users/{user_id}/key-packages/claim` | One KeyPackage for each active device of the user, the requesting device excepted: the oldest one-time package, deleted in the claiming transaction (two claims at once never get the same one), or the last-resort package, kept, when none is left. A device with neither is absent from the answer: it joins later by external commit. The device certificate travels in each package's credential. Allowed for one's own user, and for a friend (from task 6 of M2); anyone else, an unknown user included, gets `FORBIDDEN`, and nothing is consumed. Rate limits below. Implemented, own user only until task 6 |
+| `POST /v1/users/{user_id}/key-packages/claim` | One KeyPackage for each active device of the user, the requesting device excepted: the oldest one-time package, deleted in the claiming transaction (two claims at once never get the same one), or the last-resort package, kept, when none is left. A device with neither is absent from the answer: it joins later by external commit. The device certificate travels in each package's credential. Allowed for one's own user, and for a friend; anyone else, an unknown user included, gets `FORBIDDEN`, and nothing is consumed. Rate limits below. Implemented |
 | `GET /v1/users/{id}/devices` | Device ids, signature keys and certificates of a user |
-| `GET /v1/friends` | Friends and pending requests |
-| `POST /v1/friends/requests` | Send a request (by handle) |
-| `POST /v1/friends/requests/{user_id}/accept`, `DELETE /v1/friends/requests/{user_id}` | Accept, decline or cancel |
-| `DELETE /v1/friends/{user_id}` | Remove a friend |
-| `PUT /v1/blocks/{user_id}`, `DELETE /v1/blocks/{user_id}` | Block, unblock |
+| `GET /v1/friends` | Friends, requests received, requests sent, and users blocked; each with id, handle, display name, identity key and date. Implemented (task 6 of M2, [ADR 0020](adr/0020-friends-and-blocks.md)) |
+| `POST /v1/friends/requests` | Send a request by handle: `request_sent`, or `friends` when it crosses a request from that user. `NOT_FOUND` for an unknown handle, `BLOCKED` when the sender blocks that user, `ALREADY_EXISTS` between friends; sending again changes nothing (one request per pair). A request to a user who blocks its sender looks sent and stays its sender's alone. At most 20 an hour per user *. Implemented |
+| `POST /v1/friends/requests/{user_id}/accept`, `DELETE /v1/friends/requests/{user_id}` | Accept (the recipient), decline (the recipient) or cancel (the sender). Implemented |
+| `DELETE /v1/friends/{user_id}` | Remove a friend. Implemented |
+| `PUT /v1/blocks/{user_id}`, `DELETE /v1/blocks/{user_id}` | Block (ends a friendship or a request between the two; not disclosed to the blocked user), unblock (deletes what the blocked user sent meanwhile). Implemented |
 | `POST /v1/conversations` | Create a DM with a friend; idempotent: one DM per pair of users, returns the existing one (with its epoch) if any, also when two creations cross |
 | `GET /v1/conversations` | Conversations of the user with their current epoch and last sequence number |
 
@@ -377,7 +377,8 @@ message ConversationCreated {
   repeated bytes member_user_ids = 3;
 }
 
-// A friend enrolled or revoked a device. Clients show a notice in shared
+// A friend enrolled or revoked a device. Sent to the connected devices of
+// the user's friends (since minor 3). Clients show a notice in shared
 // conversations when a device was added.
 message UserDevicesChanged {
   bytes user_id = 1;
@@ -424,13 +425,15 @@ message TypingEvent {
   bytes user_id = 2;
 }
 
+// To the connected devices of both users, each with their own view of the
+// relation. BLOCKED goes to the blocker's devices only. Since minor 3.
 message FriendshipChanged {
   bytes user_id = 1;
-  FriendshipState state = 2;  // NONE | REQUEST_SENT | REQUEST_RECEIVED | FRIENDS
+  FriendshipState state = 2;  // NONE | REQUEST_SENT | REQUEST_RECEIVED | FRIENDS | BLOCKED
 }
 ```
 
-A blocked user receives no presence or typing events from the blocker, and their friend requests are dropped silently.
+A blocked user receives no presence or typing events from the blocker, and is never told of the block: they see what an unfriending shows. Their friend requests to the blocker are dropped silently: such a request looks sent to them, is never shown to the blocker, and is deleted when the block is lifted ([ADR 0020](adr/0020-friends-and-blocks.md)).
 
 ### 5.4 Message content (inside MLS, never seen by the server)
 
@@ -502,7 +505,7 @@ enum ErrorCode {
 }
 ```
 
-REST errors carry a JSON body `{ "code": "INVALID_CREDENTIALS", "message": "...", "retry_after_ms": 1200 }` with the matching HTTP status (400, 401, 403, 404, 409, 410, 413, 429, 500, 503). The REST codes are listed in the OpenAPI document (`ErrorCode`); beyond the generic ones they are `INVALID_CREDENTIALS`, `INVALID_INVITE`, `HANDLE_TAKEN`, `INVALID_HANDLE`, `TOTP_REQUIRED`, `TOTP_INVALID`, `ACCOUNT_DISABLED`, `INVALID_DEVICE_CERTIFICATE`, `EXCHANGE_EXPIRED` (410: a two-step exchange timed out or was already used), `TOO_MANY_DEVICES`, `INVALID_PROOF` and `INVALID_KEY_PACKAGE` (400).
+REST errors carry a JSON body `{ "code": "INVALID_CREDENTIALS", "message": "...", "retry_after_ms": 1200 }` with the matching HTTP status (400, 401, 403, 404, 409, 410, 413, 429, 500, 503). The REST codes are listed in the OpenAPI document (`ErrorCode`); beyond the generic ones they are `INVALID_CREDENTIALS`, `INVALID_INVITE`, `HANDLE_TAKEN`, `INVALID_HANDLE`, `TOTP_REQUIRED`, `TOTP_INVALID`, `ACCOUNT_DISABLED`, `INVALID_DEVICE_CERTIFICATE`, `EXCHANGE_EXPIRED` (410: a two-step exchange timed out or was already used), `TOO_MANY_DEVICES`, `INVALID_PROOF`, `INVALID_KEY_PACKAGE` (400) and `BLOCKED` (403: the requester blocks that user).
 
 WebSocket close codes:
 
@@ -533,6 +536,7 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | MLS Welcome | 512 KiB |
 | MLS GroupInfo | 512 KiB |
 | KeyPackage | 4 KiB each, 100 per upload, 200 stored per device; served while valid for more than an hour |
+| Friend requests | 20 per hour per requesting user, unknown handles included; exact sliding window, in memory * |
 | KeyPackage claims | 60 per hour per requesting user; 3 per hour and 10 per day per (requester, target), claims of one's own devices not counted. Exact sliding windows, counted in memory: they start from zero when the server restarts * |
 | REST JSON body | 64 KiB (512 KiB for KeyPackage upload) |
 | Attachment (M5) | 500 MB * |

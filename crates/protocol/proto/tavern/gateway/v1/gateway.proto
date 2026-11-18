@@ -42,7 +42,9 @@ message ServerFrame {
     SecurityNotice security_notice = 17;
 
     // M2 events (field numbers as in docs/protocol.md, section 3).
+    FriendshipChanged friendship_changed = 45;  // Since minor 3.
     KeyPackagesLow key_packages_low = 48;  // Since minor 2.
+    UserDevicesChanged user_devices_changed = 49;  // Since minor 3.
   }
 }
 
@@ -124,6 +126,34 @@ message DeviceListChanged {
 // device that is not uploads at its next connection anyway. Since minor 2.
 message KeyPackagesLow {
   uint32 remaining = 1;
+}
+
+// The relation of this user with another one changed (ADR 0020). Sent to
+// the connected devices of both users, each with its own view: a request
+// sent to a user who blocks its sender is REQUEST_SENT for the sender and
+// nothing for the other; BLOCKED goes to the blocker's devices only, and the
+// blocked user sees NONE, as after an unfriending. Devices that are not
+// connected read GET /v1/friends. Since minor 3.
+message FriendshipChanged {
+  bytes user_id = 1;
+  FriendshipState state = 2;
+}
+
+enum FriendshipState {
+  FRIENDSHIP_STATE_NONE = 0;
+  FRIENDSHIP_STATE_REQUEST_SENT = 1;
+  FRIENDSHIP_STATE_REQUEST_RECEIVED = 2;
+  FRIENDSHIP_STATE_FRIENDS = 3;
+  FRIENDSHIP_STATE_BLOCKED = 4;
+}
+
+// A friend enrolled or revoked a device. Sent to the connected devices of
+// the user's friends, who show a notice in shared conversations when a
+// device was added (ADR 0003). Since minor 3.
+message UserDevicesChanged {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  bool added = 3;
 }
 
 // Something security-relevant happened to the account. Pushed to the

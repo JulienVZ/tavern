@@ -314,6 +314,164 @@ async fn a_device_learns_when_its_key_packages_run_low() {
     );
 }
 
+/// The next frame, which must be a `FriendshipChanged`: its user and state.
+async fn friendship(socket: &mut Socket) -> (Vec<u8>, proto::FriendshipState) {
+    let frame = expect_frame(socket).await;
+    let Some(ServerPayload::FriendshipChanged(change)) = frame.payload else {
+        panic!("expected FriendshipChanged, got {frame:?}");
+    };
+    let state = change.state();
+    (change.user_id, state)
+}
+
+async fn send_request(app: &TestApp, from: &Device, to: &common::Account) {
+    let _: tavern_protocol::rest::FriendRequestAnswer = app
+        .post(
+            "/v1/friends/requests",
+            Some(&from.session_token),
+            &tavern_protocol::rest::FriendRequest {
+                handle: to.handle.as_str().to_owned(),
+            },
+        )
+        .await;
+}
+
+/// ADR 0020: both users' devices are told of a request and of its answer.
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn both_users_are_told_of_a_request_and_its_answer() {
+    use proto::FriendshipState as State;
+    let app = TestApp::spawn().await;
+    let (alice, alice1) = app.account_with_device("gw", false).await;
+    let (bob, bob1) = app.account_with_device("gw", false).await;
+    let (mut alice_socket, _) = connect(&app, &alice1).await;
+    let (mut bob_socket, _) = connect(&app, &bob1).await;
+    let (alice_id, bob_id) = (
+        alice.user_id.as_bytes().to_vec(),
+        bob.user_id.as_bytes().to_vec(),
+    );
+
+    send_request(&app, &alice1, &bob).await;
+    assert_eq!(
+        friendship(&mut alice_socket).await,
+        (bob_id.clone(), State::RequestSent)
+    );
+    assert_eq!(
+        friendship(&mut bob_socket).await,
+        (alice_id.clone(), State::RequestReceived)
+    );
+    let status = app
+        .status(
+            Method::POST,
+            &format!("/v1/friends/requests/{}/accept", alice.user_id),
+            Some(&bob1.session_token),
+            NO_BODY,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        friendship(&mut alice_socket).await,
+        (bob_id, State::Friends)
+    );
+    assert_eq!(
+        friendship(&mut bob_socket).await,
+        (alice_id, State::Friends)
+    );
+}
+
+/// ADR 0020: the blocked user is told what an unfriending tells, the blocker
+/// is told nothing of the request sent meanwhile, and lifting the block
+/// deletes that request on both sides.
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn a_block_is_not_disclosed_by_events() {
+    use proto::FriendshipState as State;
+    let app = TestApp::spawn().await;
+    let (alice, alice1) = app.account_with_device("gw", false).await;
+    let (bob, bob1) = app.account_with_device("gw", false).await;
+    app.befriend((&alice, &alice1), (&bob, &bob1)).await;
+    let (mut alice_socket, _) = connect(&app, &alice1).await;
+    let (mut bob_socket, _) = connect(&app, &bob1).await;
+    let (alice_id, bob_id) = (
+        alice.user_id.as_bytes().to_vec(),
+        bob.user_id.as_bytes().to_vec(),
+    );
+    let bob_acts = |method: Method, path: String| {
+        let token = bob1.session_token.clone();
+        let app = &app;
+        async move { app.status(method, &path, Some(&token), NO_BODY).await }
+    };
+
+    let status = bob_acts(Method::PUT, format!("/v1/blocks/{}", alice.user_id)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        friendship(&mut bob_socket).await,
+        (alice_id.clone(), State::Blocked)
+    );
+    assert_eq!(
+        friendship(&mut alice_socket).await,
+        (bob_id.clone(), State::None),
+        "what an unfriending tells"
+    );
+
+    send_request(&app, &alice1, &bob).await;
+    assert_eq!(
+        friendship(&mut alice_socket).await,
+        (bob_id.clone(), State::RequestSent)
+    );
+    let status = bob_acts(Method::DELETE, format!("/v1/blocks/{}", alice.user_id)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Bob's next frame is the unblock: the request never reached him.
+    assert_eq!(friendship(&mut bob_socket).await, (alice_id, State::None));
+    assert_eq!(friendship(&mut alice_socket).await, (bob_id, State::None));
+}
+
+/// Protocol, section 5.2: a user's friends are told when they enrol or
+/// revoke a device; other users are not.
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn friends_are_told_of_each_other_s_devices() {
+    let app = TestApp::spawn().await;
+    let (alice, alice1) = app.account_with_device("gw", false).await;
+    let (bob, bob1) = app.account_with_device("gw", false).await;
+    let (carol, carol1) = app.account_with_device("gw", false).await;
+    app.befriend((&alice, &alice1), (&bob, &bob1)).await;
+    let (mut bob_socket, _) = connect(&app, &bob1).await;
+    let (mut carol_socket, _) = connect(&app, &carol1).await;
+
+    let alice2 = app.enrol(&alice).await;
+    let status = app
+        .status(
+            Method::DELETE,
+            &format!("/v1/devices/{}", alice2.device_id),
+            Some(&alice1.session_token),
+            NO_BODY,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for added in [true, false] {
+        let frame = expect_frame(&mut bob_socket).await;
+        assert_eq!(
+            frame.payload,
+            Some(ServerPayload::UserDevicesChanged(
+                proto::UserDevicesChanged {
+                    user_id: alice.user_id.as_bytes().to_vec(),
+                    device_id: alice2.device_id.as_bytes().to_vec(),
+                    added,
+                }
+            ))
+        );
+    }
+
+    // Carol is not Alice's friend: her next frame is about her own device.
+    let carol2 = app.enrol(&carol).await;
+    let frame = expect_frame(&mut carol_socket).await;
+    let Some(ServerPayload::DeviceListChanged(event)) = frame.payload else {
+        panic!("expected DeviceListChanged, got {frame:?}");
+    };
+    assert_eq!(event.device_id, carol2.device_id.as_bytes());
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL"]
 async fn an_offline_device_learns_about_enrolments_when_it_reconnects() {

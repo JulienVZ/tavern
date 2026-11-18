@@ -4,7 +4,7 @@
 //!
 //! The authentication routes are limited per client address and per handle;
 //! KeyPackage claims per requesting user and per (requester, target) pair
-//! (ADR 0019, section 3). Counters live in memory only, and start from zero
+//! (ADR 0019, section 3); friend requests per requesting user (ADR 0020). Counters live in memory only, and start from zero
 //! when the server restarts. Client addresses are never logged or stored.
 
 use std::collections::{HashMap, VecDeque};
@@ -42,6 +42,8 @@ pub struct RateLimits {
     clock: DefaultClock,
     /// KeyPackage claims.
     pub claims: ClaimLimiter,
+    /// Friend requests, per requesting user.
+    pub friend_requests: HourlyLimit,
 }
 
 impl std::fmt::Debug for RateLimits {
@@ -60,19 +62,26 @@ impl Default for RateLimits {
             AUTH_PER_IP_PER_MINUTE,
             AUTH_PER_HANDLE_PER_MINUTE,
             ClaimLimits::default(),
+            crate::config::DEFAULT_FRIEND_REQUESTS_PER_HOUR,
         )
     }
 }
 
 impl RateLimits {
     /// Creates limiters with the given authentication quotas per minute,
-    /// and the given claim limits.
-    pub fn new(per_ip: u32, per_handle: u32, claims: ClaimLimits) -> Self {
+    /// claim limits, and friend requests per hour.
+    pub fn new(
+        per_ip: u32,
+        per_handle: u32,
+        claims: ClaimLimits,
+        friend_requests_per_hour: u32,
+    ) -> Self {
         Self {
             per_ip: RateLimiter::keyed(per_minute(per_ip)),
             per_handle: RateLimiter::keyed(per_minute(per_handle)),
             clock: DefaultClock::default(),
             claims: ClaimLimiter::new(claims),
+            friend_requests: HourlyLimit::new(friend_requests_per_hour),
         }
     }
 
@@ -228,6 +237,33 @@ impl ClaimLimiter {
                     (Err(a), Err(b)) => Err(a.max(b)),
                 }
             })
+            .map_err(refused_for)
+    }
+}
+
+/// At most `limit` events per user in any hour, counted exactly, in memory.
+pub struct HourlyLimit {
+    limit: u32,
+    recent: Recent<Uuid>,
+}
+
+impl HourlyLimit {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            recent: Recent::new(),
+        }
+    }
+
+    /// Counts one event of `user`.
+    pub fn check(&self, user: Uuid) -> ApiResult<()> {
+        self.check_at(user, Instant::now())
+    }
+
+    fn check_at(&self, user: Uuid, now: Instant) -> ApiResult<()> {
+        let limit = self.limit;
+        self.recent
+            .admit(&user, now, |events| room(events, now, HOUR, limit))
             .map_err(refused_for)
     }
 }
@@ -393,6 +429,20 @@ mod tests {
     }
 
     #[test]
+    fn an_hourly_limit_counts_each_user_over_any_hour() {
+        let limit = HourlyLimit::new(2);
+        let (alice, bob) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let start = Instant::now();
+
+        assert!(limit.check_at(alice, start).is_ok());
+        assert!(limit.check_at(alice, minutes(start, 10)).is_ok());
+        let refused = limit.check_at(alice, minutes(start, 20)).unwrap_err();
+        assert_eq!(refused.retry_after_ms, Some(40 * 60 * 1000));
+        assert!(limit.check_at(bob, minutes(start, 20)).is_ok());
+        assert!(limit.check_at(alice, minutes(start, 60)).is_ok());
+    }
+
+    #[test]
     fn every_claim_counts_against_its_requester() {
         let limiter = ClaimLimiter::new(ClaimLimits {
             per_requester_per_hour: 2,
@@ -419,7 +469,7 @@ mod tests {
 
     #[test]
     fn limits_are_per_key_and_report_a_delay() {
-        let limits = RateLimits::new(2, 1, ClaimLimits::default());
+        let limits = RateLimits::new(2, 1, ClaimLimits::default(), 20);
         let a: IpAddr = "203.0.113.1".parse().unwrap();
         let b: IpAddr = "203.0.113.2".parse().unwrap();
 

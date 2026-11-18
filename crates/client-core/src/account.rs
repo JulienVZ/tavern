@@ -29,13 +29,13 @@ use tavern_crypto::secret::Secret;
 use tavern_protocol::handle::Handle;
 use tavern_protocol::rest::{
     AdminUserList, B64, CreateInviteRequest, CreatedInvite, DeviceList, EnrolDeviceRequest,
-    ErrorCode, InviteList, KeyPackageClaim, KeyPackageCount, LoginFinishRequest, LoginGrant,
-    LoginOutcome, LoginStartRequest, LoginStartResponse, LoginTotpRequest, Me,
-    PasswordFinishRequest, PasswordStartRequest, Platform, ReauthFinishRequest, ReauthGrant,
-    ReauthStartRequest, RecoverFinishRequest, RecoverStartRequest, RecoverStartResponse,
-    RegisterFinishRequest, RegisterFinishResponse, RegisterStartRequest, RegistrationResponse,
-    ReopenSessionRequest, RotateRecoveryKeyRequest, SessionResponse, TotpCodeRequest,
-    TotpEnrolment, TotpRecoveryCodes, UploadKeyPackagesRequest,
+    ErrorCode, FriendList, FriendRequest, FriendRequestAnswer, InviteList, KeyPackageClaim,
+    KeyPackageCount, LoginFinishRequest, LoginGrant, LoginOutcome, LoginStartRequest,
+    LoginStartResponse, LoginTotpRequest, Me, PasswordFinishRequest, PasswordStartRequest,
+    Platform, ReauthFinishRequest, ReauthGrant, ReauthStartRequest, RecoverFinishRequest,
+    RecoverStartRequest, RecoverStartResponse, RegisterFinishRequest, RegisterFinishResponse,
+    RegisterStartRequest, RegistrationResponse, ReopenSessionRequest, RotateRecoveryKeyRequest,
+    SessionResponse, TotpCodeRequest, TotpEnrolment, TotpRecoveryCodes, UploadKeyPackagesRequest,
 };
 use uuid::Uuid;
 
@@ -858,6 +858,77 @@ impl Client {
                     .map_err(|_| ClientError::UntrustedKeyMaterial)
             })
             .collect()
+    }
+
+    /// The user's friends, the requests they received and sent, and the
+    /// users they block (ADR 0020).
+    pub async fn friends(&self) -> Result<FriendList, ClientError> {
+        self.api().fetch("v1/friends", self.auth()).await
+    }
+
+    /// Sends a friend request to the user with this handle, as typed. The
+    /// instance answers `NOT_FOUND` for a handle no account has, and
+    /// `BLOCKED` when this user blocks that one. A request crossing one from
+    /// that user makes both friends at once.
+    pub async fn send_friend_request(
+        &self,
+        handle: &str,
+    ) -> Result<FriendRequestAnswer, ClientError> {
+        let handle = Handle::canonicalize(handle)?;
+        let request = FriendRequest {
+            handle: handle.as_str().to_owned(),
+        };
+        self.api()
+            .call(Method::POST, "v1/friends/requests", self.auth(), &request)
+            .await
+    }
+
+    /// Accepts the friend request `user_id` sent.
+    pub async fn accept_friend_request(&self, user_id: Uuid) -> Result<(), ClientError> {
+        self.api()
+            .act(
+                Method::POST,
+                &format!("v1/friends/requests/{user_id}/accept"),
+                self.auth(),
+            )
+            .await
+    }
+
+    /// Declines the request `user_id` sent, or cancels the one sent to them.
+    pub async fn remove_friend_request(&self, user_id: Uuid) -> Result<(), ClientError> {
+        self.api()
+            .act(
+                Method::DELETE,
+                &format!("v1/friends/requests/{user_id}"),
+                self.auth(),
+            )
+            .await
+    }
+
+    /// Ends the friendship with `user_id`.
+    pub async fn remove_friend(&self, user_id: Uuid) -> Result<(), ClientError> {
+        self.api()
+            .act(
+                Method::DELETE,
+                &format!("v1/friends/{user_id}"),
+                self.auth(),
+            )
+            .await
+    }
+
+    /// Blocks `user_id`: a friendship or a request between the two ends, and
+    /// they cannot reach this user any more. They are not told.
+    pub async fn block(&self, user_id: Uuid) -> Result<(), ClientError> {
+        self.api()
+            .act(Method::PUT, &format!("v1/blocks/{user_id}"), self.auth())
+            .await
+    }
+
+    /// Lifts the block on `user_id`. What they sent meanwhile is dropped.
+    pub async fn unblock(&self, user_id: Uuid) -> Result<(), ClientError> {
+        self.api()
+            .act(Method::DELETE, &format!("v1/blocks/{user_id}"), self.auth())
+            .await
     }
 
     /// Revokes a device of the account. Revoking this device signs it out.
