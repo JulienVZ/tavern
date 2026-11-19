@@ -29,6 +29,8 @@ pub mod vars {
     pub const TRUST_FORWARDED_FOR: &str = "TAVERN_TRUST_FORWARDED_FOR";
     /// Days an unused session stays valid.
     pub const SESSION_TTL_DAYS: &str = "TAVERN_SESSION_TTL_DAYS";
+    /// Days a stored message waits for the devices that have not acknowledged it.
+    pub const MESSAGE_RETENTION_DAYS: &str = "TAVERN_MESSAGE_RETENTION_DAYS";
     /// Days a device may stay away before it no longer counts as active.
     pub const DEVICE_INACTIVE_DAYS: &str = "TAVERN_DEVICE_INACTIVE_DAYS";
     /// KeyPackage claims per hour and per requesting user.
@@ -82,6 +84,9 @@ pub struct Config {
     pub trust_forwarded_for: bool,
     /// How long an unused session stays valid.
     pub session_ttl: Duration,
+    /// Days a stored message waits for the devices that have not
+    /// acknowledged it.
+    pub message_retention_days: u32,
     /// Days a device may stay away and still count as active.
     pub device_inactive_days: u32,
     /// How often KeyPackages may be claimed.
@@ -89,6 +94,9 @@ pub struct Config {
     /// Friend requests a user may send per hour.
     pub friend_requests_per_hour: u32,
 }
+
+/// Default and largest `TAVERN_MESSAGE_RETENTION_DAYS` (ADR 0019, section 12).
+pub const MAX_MESSAGE_RETENTION_DAYS: u32 = 30;
 
 /// How often KeyPackages may be claimed (ADR 0019, section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +138,7 @@ impl fmt::Debug for Config {
             .field("source_url", &self.source_url)
             .field("trust_forwarded_for", &self.trust_forwarded_for)
             .field("session_ttl", &self.session_ttl)
+            .field("message_retention_days", &self.message_retention_days)
             .field("device_inactive_days", &self.device_inactive_days)
             .field("claim_limits", &self.claim_limits)
             .field("friend_requests_per_hour", &self.friend_requests_per_hour)
@@ -248,11 +257,27 @@ impl Config {
                 }),
             },
         };
+        let message_retention_days = number(
+            vars::MESSAGE_RETENTION_DAYS,
+            MAX_MESSAGE_RETENTION_DAYS,
+            MAX_MESSAGE_RETENTION_DAYS,
+        )?;
+        // By default the retention; never longer (ADR 0019, section 15).
         let device_inactive_days = number(
             vars::DEVICE_INACTIVE_DAYS,
-            crate::activity::DEFAULT_INACTIVE_DAYS,
+            message_retention_days,
             crate::activity::MAX_INACTIVE_DAYS,
         )?;
+        if device_inactive_days > message_retention_days {
+            return Err(ConfigError::Invalid {
+                name: vars::DEVICE_INACTIVE_DAYS,
+                reason: format!(
+                    "must not exceed {} ({message_retention_days} days): a device away \
+                     longer than the retention has missed messages it can never get",
+                    vars::MESSAGE_RETENTION_DAYS
+                ),
+            });
+        }
         let defaults = ClaimLimits::default();
         let claim_limits = ClaimLimits {
             per_requester_per_hour: number(
@@ -296,6 +321,7 @@ impl Config {
             source_url: get(vars::SOURCE_URL),
             trust_forwarded_for,
             session_ttl: Duration::from_secs(session_ttl_days * 24 * 60 * 60),
+            message_retention_days,
             device_inactive_days,
             claim_limits,
             friend_requests_per_hour,
@@ -339,6 +365,7 @@ mod tests {
         assert_eq!(config.source_url, None);
         assert!(!config.trust_forwarded_for);
         assert_eq!(config.session_ttl, Duration::from_secs(90 * 24 * 60 * 60));
+        assert_eq!(config.message_retention_days, 30);
         assert_eq!(config.device_inactive_days, 30);
         assert_eq!(config.friend_requests_per_hour, 20);
         assert_eq!(
@@ -349,6 +376,47 @@ mod tests {
                 per_pair_per_day: 10,
             }
         );
+    }
+
+    #[test]
+    fn the_inactivity_window_never_exceeds_the_retention() {
+        // By default, the retention.
+        let config = config_from(&[DB, (vars::MESSAGE_RETENTION_DAYS, "10")]).unwrap();
+        assert_eq!(
+            (config.message_retention_days, config.device_inactive_days),
+            (10, 10)
+        );
+        let config = config_from(&[
+            DB,
+            (vars::MESSAGE_RETENTION_DAYS, "10"),
+            (vars::DEVICE_INACTIVE_DAYS, "7"),
+        ])
+        .unwrap();
+        assert_eq!(config.device_inactive_days, 7);
+        // Longer: the server does not start.
+        let err = config_from(&[
+            DB,
+            (vars::MESSAGE_RETENTION_DAYS, "10"),
+            (vars::DEVICE_INACTIVE_DAYS, "11"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                name: vars::DEVICE_INACTIVE_DAYS,
+                ..
+            }
+        ));
+        for value in ["0", "31"] {
+            let err = config_from(&[DB, (vars::MESSAGE_RETENTION_DAYS, value)]).unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::Invalid {
+                    name: vars::MESSAGE_RETENTION_DAYS,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

@@ -18,24 +18,30 @@
 //! is handled under [`panics::guard`]: a panic closes its connection with
 //! 1011, and the server goes on.
 
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use governor::clock::{Clock, DefaultClock};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use prost::Message as _;
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_protocol::{
     DEFAULT_MAX_FRAME_BYTES, GATEWAY_HEARTBEAT_INTERVAL_MS, GATEWAY_HEARTBEAT_TIMEOUT_MS,
-    GATEWAY_HELLO_DEADLINE_MS, GATEWAY_MINOR_VERSION, GATEWAY_SUBPROTOCOL,
+    GATEWAY_HELLO_DEADLINE_MS, GATEWAY_MINOR_VERSION, GATEWAY_REQUEST_BURST,
+    GATEWAY_REQUESTS_PER_10_SECONDS, GATEWAY_SUBPROTOCOL, MAX_APPLICATION_MESSAGE_BYTES,
     MAX_SECURITY_NOTICE_ACKS, close_code,
 };
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::delivery::{self, Refused};
 use crate::error::ApiResult;
 use crate::gateway::{Event, Relation, RevocationReason};
 use crate::notices;
@@ -43,8 +49,8 @@ use crate::panics::{self, Panicked};
 use crate::routes::key_packages;
 use crate::session::{self, Session};
 
-/// Largest application message announced to clients (used from milestone M2).
-const MAX_APPLICATION_MESSAGE_BYTES: u32 = 64 * 1024;
+/// Refused requests in a row after which a connection is closed (4007).
+const STRIKES_BEFORE_CLOSE: u32 = 10;
 /// Largest upload announced to clients (used from milestone M5).
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -103,6 +109,7 @@ fn error_frame(request_id: u64, code: proto::ErrorCode, message: &str) -> Messag
             code: code.into(),
             message: message.to_owned(),
             retry_after_ms: 0,
+            current_epoch: 0,
         }),
     )
 }
@@ -278,7 +285,8 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
         server_time_ms: now_ms(),
         limits: Some(proto::Limits {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
-            max_application_message_bytes: MAX_APPLICATION_MESSAGE_BYTES,
+            max_application_message_bytes: u32::try_from(MAX_APPLICATION_MESSAGE_BYTES)
+                .unwrap_or(u32::MAX),
             max_upload_bytes: MAX_UPLOAD_BYTES,
             heartbeat_interval_ms: GATEWAY_HEARTBEAT_INTERVAL_MS,
         }),
@@ -297,6 +305,8 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
         .is_err()
     {
         None
+    } else if let Err(code) = resend_welcomes(&state, &session, &mut socket).await {
+        code
     } else {
         run(
             &state,
@@ -314,6 +324,93 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
     }
 }
 
+/// Sends again the Welcomes this device has not acknowledged (ADR 0019,
+/// section 4), right after `Ready`. On failure, the close code to send, or
+/// `None` when the peer is gone.
+async fn resend_welcomes(
+    state: &AppState,
+    session: &Session,
+    socket: &mut WebSocket,
+) -> Result<(), Option<u16>> {
+    let welcomes = match panics::guard(delivery::pending_welcomes(state, session)).await {
+        Ok(Ok(welcomes)) => welcomes,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "pending welcomes");
+            return Err(Some(close_code::INTERNAL_ERROR));
+        }
+        Err(Panicked) => return Err(Some(close_code::INTERNAL_ERROR)),
+    };
+    for welcome in welcomes {
+        if socket
+            .send(frame(0, ServerPayload::WelcomeEvent(welcome)))
+            .await
+            .is_err()
+        {
+            return Err(None);
+        }
+    }
+    Ok(())
+}
+
+/// The limit on a connection's requests (`protocol.md`, section 7): 30 per
+/// 10 seconds sustained, bursts of 60. A refused request gets `RATE_LIMITED`;
+/// after ten refused in a row, the connection is closed (4007).
+struct RequestLimit {
+    limiter: DefaultDirectRateLimiter,
+    clock: DefaultClock,
+    strikes: AtomicU32,
+}
+
+impl RequestLimit {
+    fn new() -> Self {
+        let period =
+            Duration::from_millis(10_000 / u64::from(GATEWAY_REQUESTS_PER_10_SECONDS.max(1)));
+        let burst = NonZeroU32::new(GATEWAY_REQUEST_BURST).unwrap_or(NonZeroU32::MIN);
+        let quota = Quota::with_period(period)
+            .unwrap_or_else(|| Quota::per_second(NonZeroU32::MIN))
+            .allow_burst(burst);
+        Self {
+            limiter: RateLimiter::direct(quota),
+            clock: DefaultClock::default(),
+            strikes: AtomicU32::new(0),
+        }
+    }
+
+    /// Counts the request `request_id`: what to do instead, if refused.
+    fn refuse(&self, request_id: u64) -> Option<Next> {
+        match self.limiter.check() {
+            Ok(()) => {
+                self.strikes.store(0, Ordering::Relaxed);
+                None
+            }
+            Err(not_until) => {
+                let strikes = self.strikes.fetch_add(1, Ordering::Relaxed) + 1;
+                if strikes >= STRIKES_BEFORE_CLOSE {
+                    return Some(Next::Close(close_code::RATE_LIMITED));
+                }
+                let wait = not_until.wait_time_from(self.clock.now());
+                Some(Next::Reply(
+                    request_id,
+                    ServerPayload::Error(proto::Error {
+                        code: proto::ErrorCode::RateLimited.into(),
+                        message: "too many requests".to_owned(),
+                        retry_after_ms: u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1),
+                        current_epoch: 0,
+                    }),
+                ))
+            }
+        }
+    }
+}
+
+/// A delivery request's answer.
+fn answer<T>(result: Result<T, Refused>, wrap: impl FnOnce(T) -> ServerPayload) -> ServerPayload {
+    match result {
+        Ok(value) => wrap(value),
+        Err(refused) => ServerPayload::Error(refused.to_proto()),
+    }
+}
+
 /// Serves an authenticated connection until it ends. Returns the close code
 /// to send, or `None` when the peer is already gone.
 async fn run(
@@ -324,6 +421,7 @@ async fn run(
     translate: Translate,
 ) -> Option<u16> {
     let silence = Duration::from_millis(GATEWAY_HEARTBEAT_TIMEOUT_MS);
+    let limit = RequestLimit::new();
     loop {
         tokio::select! {
             incoming = tokio::time::timeout(silence, socket.recv()) => {
@@ -332,7 +430,7 @@ async fn run(
                 };
                 // Untrusted input: a panic while handling it closes this
                 // connection only.
-                let next = match panics::guard(on_message(state, session, message)).await {
+                let next = match panics::guard(on_message(state, session, &limit, message)).await {
                     Ok(next) => next,
                     Err(Panicked) => return Some(close_code::INTERNAL_ERROR),
                 };
@@ -385,6 +483,7 @@ enum Next {
 async fn on_message(
     state: &AppState,
     session: &Session,
+    limit: &RequestLimit,
     message: Option<Result<Message, axum::Error>>,
 ) -> Next {
     let request = match classify(message) {
@@ -393,7 +492,35 @@ async fn on_message(
         Incoming::Malformed => return Next::Close(close_code::MALFORMED_FRAME),
         Incoming::Frame(frame) => frame,
     };
+    if let Some(next) = limit.refuse(request.request_id) {
+        return next;
+    }
     let reply = match request.payload {
+        Some(ClientPayload::SubmitCommit(request)) => answer(
+            delivery::submit_commit(state, session, request).await,
+            ServerPayload::CommitAck,
+        ),
+        Some(ClientPayload::SendMessage(request)) => answer(
+            delivery::send_message(state, session, request).await,
+            ServerPayload::SendMessageAck,
+        ),
+        Some(ClientPayload::FetchMessages(request)) => answer(
+            delivery::fetch_messages(state, session, request).await,
+            ServerPayload::MessageBatch,
+        ),
+        Some(ClientPayload::AckMessages(request)) => answer(
+            delivery::ack_messages(state, session, request).await,
+            |()| ServerPayload::Ack(proto::Ack {}),
+        ),
+        Some(ClientPayload::AckWelcome(request)) => {
+            answer(delivery::ack_welcome(state, session, request).await, |()| {
+                ServerPayload::Ack(proto::Ack {})
+            })
+        }
+        Some(ClientPayload::FetchGroupInfo(request)) => answer(
+            delivery::fetch_group_info(state, session, request).await,
+            ServerPayload::GroupInfo,
+        ),
         Some(ClientPayload::Heartbeat(_)) => {
             // The cheapest place to notice an expired session.
             if !session_is_live(state, session).await {
@@ -413,6 +540,7 @@ async fn on_message(
                     code: proto::ErrorCode::Internal.into(),
                     message: "internal error".to_owned(),
                     retry_after_ms: 0,
+                    current_epoch: 0,
                 })
             } else {
                 ServerPayload::Ack(proto::Ack {})
@@ -426,12 +554,14 @@ async fn on_message(
             code: proto::ErrorCode::InvalidArgument.into(),
             message: "already authenticated".to_owned(),
             retry_after_ms: 0,
+            current_epoch: 0,
         }),
         // A payload this server does not know: a newer client.
         None => ServerPayload::Error(proto::Error {
             code: proto::ErrorCode::UnsupportedMessage.into(),
             message: "unsupported message".to_owned(),
             retry_after_ms: 0,
+            current_epoch: 0,
         }),
     };
     Next::Reply(request.request_id, reply)
@@ -442,6 +572,7 @@ fn error(code: proto::ErrorCode, message: &str) -> ServerPayload {
         code: code.into(),
         message: message.to_owned(),
         retry_after_ms: 0,
+        current_epoch: 0,
     })
 }
 
@@ -515,6 +646,20 @@ pub fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
                 None,
             )
         }
+        Event::Sequenced(message) => {
+            let message = Some(message.as_ref().clone());
+            let payload = match message.as_ref().map(proto::StoredMessage::kind) {
+                Some(proto::MessageKind::Commit) => {
+                    ServerPayload::CommitEvent(proto::CommitEvent { message })
+                }
+                Some(proto::MessageKind::Proposal) => {
+                    ServerPayload::ProposalEvent(proto::ProposalEvent { message })
+                }
+                _ => ServerPayload::MessageEvent(proto::MessageEvent { message }),
+            };
+            (payload, None)
+        }
+        Event::Welcome(welcome) => (ServerPayload::WelcomeEvent(welcome.as_ref().clone()), None),
         Event::ConversationCreated {
             conversation_id,
             members,

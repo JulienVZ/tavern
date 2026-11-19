@@ -179,29 +179,28 @@ async fn an_upload_is_refused_whole_for_one_refused_package() {
     let sibling = app.enrol(&account).await;
     let (_, stranger) = app.account_with_device("kp", false).await;
     // Both certified by the account's identity key, under this device's id.
-    let recertified = Device {
-        device_id: device.device_id,
-        key: DeviceKey::from_seed(&device.key.seed()),
-        certificate: account.identity.certify_device(
+    let recertified = Device::unenrolled(
+        device.device_id,
+        DeviceKey::from_seed(&device.key.seed()),
+        account.identity.certify_device(
             account.user_id.as_bytes(),
             device.device_id.as_bytes(),
             &device.key.public(),
             1,
         ),
-        session_token: B64(vec![]),
-    };
+    );
     let forged_key = DeviceKey::generate();
-    let forged = Device {
-        device_id: device.device_id,
-        certificate: account.identity.certify_device(
+    let forged_public = forged_key.public();
+    let forged = Device::unenrolled(
+        device.device_id,
+        forged_key,
+        account.identity.certify_device(
             account.user_id.as_bytes(),
             device.device_id.as_bytes(),
-            &forged_key.public(),
+            &forged_public,
             1_700_000_000_000,
         ),
-        key: forged_key,
-        session_token: B64(vec![]),
-    };
+    );
 
     let good = device.key_packages(2);
     let refused = (StatusCode::BAD_REQUEST, ErrorCode::InvalidKeyPackage);

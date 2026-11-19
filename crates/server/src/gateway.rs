@@ -10,6 +10,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
+use std::sync::Arc;
+
+use tavern_protocol::gateway::v1 as proto;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -43,8 +46,9 @@ pub enum RevocationReason {
     Replaced,
 }
 
-/// Something a connected device is told.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Something a connected device is told. Messages are shared, not copied,
+/// between the devices they go to.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A device of the account was enrolled (`added`) or revoked.
     DeviceListChanged {
@@ -77,6 +81,11 @@ pub enum Event {
         /// Its two users, smaller id first.
         members: [Uuid; 2],
     },
+    /// A message of a conversation's sequence: application, commit or
+    /// proposal.
+    Sequenced(Arc<proto::StoredMessage>),
+    /// A Welcome for the receiving device.
+    Welcome(Arc<proto::WelcomeEvent>),
     /// A friend of the receiving user enrolled (`added`) or revoked a device.
     UserDevicesChanged {
         /// The friend.
@@ -182,7 +191,7 @@ impl Registry {
             .unwrap_or_else(PoisonError::into_inner);
         for (device_id, connection) in connections.iter() {
             if connection.user_id == user_id && Some(*device_id) != except {
-                let _ = connection.sender.try_send(event);
+                let _ = connection.sender.try_send(event.clone());
             }
         }
     }

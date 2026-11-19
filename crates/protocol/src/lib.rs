@@ -38,8 +38,10 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 ///   device;
 /// - 2: `KeyPackagesLow`, and `Ready.key_packages_remaining` filled (M2);
 /// - 3: `FriendshipChanged` and `UserDevicesChanged` (M2, ADR 0020);
-/// - 4: `ConversationCreated` (M2).
-pub const GATEWAY_MINOR_VERSION: u32 = 4;
+/// - 4: `ConversationCreated` (M2);
+/// - 5: a conversation's sequence: commits, messages, welcomes, and the
+///   limit on requests per connection (M2, ADR 0019).
+pub const GATEWAY_MINOR_VERSION: u32 = 5;
 
 /// Largest number of notices one `AckSecurityNotices` frame may name.
 pub const MAX_SECURITY_NOTICE_ACKS: usize = 64;
@@ -95,12 +97,35 @@ pub mod close_code {
     pub const UNSUPPORTED_VERSION: u16 = 4005;
     /// Heartbeat timeout.
     pub const HEARTBEAT_TIMEOUT: u16 = 4006;
+    /// The connection kept exceeding the limit on requests.
+    pub const RATE_LIMITED: u16 = 4007;
     /// Malformed frame.
     pub const MALFORMED_FRAME: u16 = 4008;
     /// The server failed while handling a frame of this connection (the
     /// standard WebSocket code). The client reconnects.
     pub const INTERNAL_ERROR: u16 = 1011;
 }
+
+/// Gateway requests a connection may send per 10 seconds, sustained.
+pub const GATEWAY_REQUESTS_PER_10_SECONDS: u32 = 30;
+
+/// Gateway requests a connection may send at once, above the sustained rate.
+pub const GATEWAY_REQUEST_BURST: u32 = 60;
+
+/// Largest MLS application message (ciphertext), in bytes.
+pub const MAX_APPLICATION_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Largest MLS commit, in bytes.
+pub const MAX_COMMIT_BYTES: usize = 256 * 1024;
+
+/// Largest MLS Welcome, in bytes.
+pub const MAX_WELCOME_BYTES: usize = 512 * 1024;
+
+/// Largest MLS GroupInfo, in bytes.
+pub const MAX_GROUP_INFO_BYTES: usize = 512 * 1024;
+
+/// Largest page of `FetchMessages`.
+pub const MAX_FETCH_MESSAGES: u32 = 200;
 
 /// Largest JSON body accepted by the REST API by default, in bytes.
 pub const DEFAULT_MAX_REST_BODY_BYTES: usize = 64 * 1024;

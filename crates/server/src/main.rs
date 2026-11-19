@@ -93,6 +93,7 @@ async fn run() -> anyhow::Result<()> {
         pool.clone(),
         secrets,
         Settings {
+            message_retention_days: config.message_retention_days,
             device_inactive_days: config.device_inactive_days,
             claim_limits: config.claim_limits,
             friend_requests_per_hour: config.friend_requests_per_hour,

@@ -220,7 +220,7 @@ message Error {
   ErrorCode code = 1;
   string message = 2;          // English, for logs; UIs localise from the code
   uint32 retry_after_ms = 3;   // set for RATE_LIMITED and UNAVAILABLE
-  uint64 current_epoch = 4;    // set for EPOCH_CONFLICT and STALE_EPOCH
+  uint64 current_epoch = 4;    // set for STALE_EPOCH when known (since minor 5)
 }
 
 // The session of this device ended. The server closes the connection next
@@ -392,10 +392,13 @@ message UserDevicesChanged {
 message KeyPackagesLow { uint32 remaining = 1; }
 ```
 
-Delivery rules:
+Delivery rules (implemented in task 8 of M2, gateway minor 5; removals, purge and recreation come with task 9):
 
-- Each conversation has one sequence, shared by application messages, proposals and commits. A device processes it in order.
-- The server checks, for every message: the device is a current leaf of the group, the device is not blocked for delivery, the conversation-specific authorisation holds, and sizes are within limits.
+- Each conversation has one sequence, shared by application messages, proposals and commits, numbered under the lock of the conversation's row: strictly increasing, without gaps. A device processes it in order. It reads it from the commit that added it to the group, to the commit that removed it if one did (`FetchMessages`, at most 200 a page).
+- The group's devices, who receives what, are computed by the server from the public tree it merged, in the same transaction, never from what a client says. A message goes to every device of the group but its sender's, the sender's other devices included; a commit to the devices that held the group before it; a Welcome to each device the commit added, sent again at each connection until `AckWelcome`.
+- The server checks, for every message: the device is a current leaf of the group, the conversation-specific authorisation holds, and sizes are within limits. Unknown conversations and conversations of others answer the same `NOT_A_MEMBER`.
+- A conversation that has no group yet gets it from any active device of either user: the first commit for epoch 0 wins, the others get `STALE_EPOCH` and join by the winner's Welcome.
+- A DM whose users are not friends any more is read-only: application messages and any new leaf (Add, external commit) are refused, removals and updates of one's own leaf go through. The user who blocks gets `BLOCKED`; the blocked user gets `NOT_FRIENDS`, the same answer as after an unfriending, by the same work. `FetchGroupInfo` stays allowed to the devices of both users.
 - Application messages must be encrypted for the current epoch (`STALE_EPOCH` otherwise) and are refused while removals are pending (`REMOVAL_PENDING`). Both are recovered by the client without user-visible error: it applies or commits what is pending, re-encrypts for the new epoch and resends with the same `client_message_id`. Only repeated failure (three attempts) surfaces as "not sent, retry".
 - A commit is validated against the public group state: it is the submitting device's own, its signature is valid, the clients' policy holds (proposals allowed for the sender, no group context change, new leaves active devices of participants with valid device certificates and the very key and certificate each device enrolled with), and the GroupInfo submitted with it is the new epoch's (same group context and confirmation tag, with the ratchet tree and `ExternalPub`), signed by the committer. A member's commit that leaves out a pending removal is refused with `REMOVAL_PENDING`; after an external commit, which cannot carry them, the server appends its removals again for the new epoch. The epoch update is atomic ([ADR 0019](adr/0019-mls-direct-messages.md), sections 5, 6 and 14).
 - External proposals issued by the server are always `Remove`. Clients reject any other type from an external sender.
@@ -492,8 +495,8 @@ enum ErrorCode {
   REGISTRATION_EXPIRED = 28;  // start/finish state timed out
 
   // MLS and delivery (M2)
-  EPOCH_CONFLICT = 40;        // another commit won this epoch
-  STALE_EPOCH = 41;           // message encrypted for a past epoch
+  // 40 reserved: a commit that loses its epoch gets STALE_EPOCH too
+  STALE_EPOCH = 41;           // a message or a commit for a past epoch
   REMOVAL_PENDING = 42;       // commit the pending Remove proposals first
   INVALID_COMMIT = 43;        // failed validation against the public group state
   INVALID_KEY_PACKAGE = 44;
@@ -551,14 +554,14 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | Enrolment token | 5 min |
 | `FetchMessages` page | 200 messages |
 | Security notices | 32 listed in `Ready`, 64 identifiers per `AckSecurityNotices`, kept 90 days |
-| Gateway requests per device | 30 per 10 s sustained, burst 60 |
+| Gateway requests per device | 30 per 10 s sustained, burst 60, every frame after `Hello` counted (per connection, which is per device) |
 | Typing updates | 1 per 3 s per conversation |
 | Auth routes | 30 per minute per client address, 5 per minute per handle |
 | Stored message retention | until acknowledged by all recipient devices, at most 30 days * |
 | Device inactivity before removal from groups | the retention period, never more * |
 | Password (client-enforced) | at least 12 characters, strength score ≥ 3 of 4 |
 
-Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE_LIMITED` with `retry_after_ms`. A connection that keeps exceeding rates is closed with 4007.
+Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE_LIMITED` with `retry_after_ms`. A gateway connection that keeps exceeding its rate (ten requests refused in a row) is closed with 4007.
 
 ## 8. Security requirements on implementations
 

@@ -104,7 +104,8 @@ Includes a malicious admin running modified software and an intruder who took ov
 | Device ids, device public keys and certificates, KeyPackages, creation and last-seen times | Authentication Service role |
 | Friend list, pending requests, blocks, and the requests a blocked user sent to their blocker, which the blocker never sees ([ADR 0020](adr/0020-friends-and-blocks.md)) | Enforced server side |
 | Membership of servers, channels, private groups and DMs; public MLS tree of each group | Routing and permission checks |
-| For each message: conversation, sending device, time, padded size, MLS epoch, whether it is a handshake or application message | Delivery Service role |
+| For each message: conversation, sending device, time, padded size, MLS epoch, whether it is a handshake or application message; for each device, how far it has read each conversation | Delivery Service role |
+| For each message a device sent: the identifier it chose, with its conversation, number and time, kept twice the retention, after the message itself is gone ([ADR 0019](adr/0019-mls-direct-messages.md), section 7) | A resend gets the original acknowledgement and is never stored nor delivered twice |
 | For each blob: size, uploader, conversation, time | Access control and quotas |
 | Presence (online, idle, do not disturb), typing indicators | Relayed in clear; "invisible" is shown as offline to others but the server knows |
 | Who is in which call, when, for how long, track kinds and bitrates, client IP addresses | LiveKit signalling is TLS only |

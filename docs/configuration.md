@@ -38,7 +38,8 @@ Read by the `tavern-server` binary. The compose file sets them from the variable
 | `TAVERN_SOURCE_URL` | no | empty | URL of this instance's source code, shown by `GET /version`. Set it if you run modified code (AGPL). |
 | `TAVERN_SESSION_TTL_DAYS` | no | `90` | Days an unused session stays valid (1 to 3650). |
 | `TAVERN_TRUST_FORWARDED_FOR` | no | `false` | Use the last `X-Forwarded-For` entry as the client address for rate limiting. The reference compose file sets it to `true` because the server is reachable through Caddy only. Leave it unset if clients can reach the server directly. |
-| `TAVERN_DEVICE_INACTIVE_DAYS` | no | `30` | Days a device may go without connecting and still count as active (1 to 30, counted in whole days). Only active devices are added to new conversations (their KeyPackages are served) and accepted as members of a conversation's group. From tasks 8 and 9 of M2, a device away for longer is also removed from its conversations and rejoins when it comes back, and the value may not exceed `TAVERN_MESSAGE_RETENTION_DAYS`. |
+| `TAVERN_MESSAGE_RETENTION_DAYS` | no | `30` | Days a stored message (encrypted) waits for the devices that have not acknowledged it (1 to 30), and a Welcome for its device. The record that makes sending idempotent is kept twice as long. |
+| `TAVERN_DEVICE_INACTIVE_DAYS` | no | the retention | Days a device may go without connecting and still count as active (1 to 30, counted in whole days). Only active devices are added to new conversations (their KeyPackages are served) and accepted as members of a conversation's group. Never more than `TAVERN_MESSAGE_RETENTION_DAYS`: a larger value stops the server at start-up. From task 9 of M2, a device away for longer is also removed from its conversations and rejoins when it comes back. |
 | `TAVERN_KEY_PACKAGE_CLAIMS_PER_HOUR` | no | `60` | KeyPackage claims a user may make per hour, whoever they are for (1 to 10000). A claim fetches the keys that add devices to a new conversation. |
 | `TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR` | no | `3` | KeyPackage claims a user may make per hour for another user's devices (1 to 10000). A conversation with someone is created, or recreated, at most once an hour, so this leaves room for retries while keeping a friend from using up the one-time KeyPackages of a device that is offline. Claims for one's own devices are not counted. |
 | `TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_DAY` | no | `10` | The same per day (1 to 10000, at least `TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR`). |
@@ -51,14 +52,6 @@ Read by the `tavern-server` binary. The compose file sets them from the variable
 An empty value counts as unset. An invalid value stops the server at start-up with a message naming the variable.
 
 The claim and friend request limits are counted exactly over sliding windows ("3 per hour" is at most 3 in any hour), in memory: they start from zero when the server restarts. They will be reviewed at M3, for private groups, where a user claims for several users at once ([ADR 0019](adr/0019-mls-direct-messages.md), section 3).
-
-### Coming with M2 (not read by the server yet)
-
-Decided in [ADR 0019](adr/0019-mls-direct-messages.md); implemented with tasks 8 and 9 of M2, when it also enters `.env.example`.
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TAVERN_MESSAGE_RETENTION_DAYS` | no | `30` | Days a stored message (encrypted) waits for devices that have not acknowledged it (1 to 30). `TAVERN_DEVICE_INACTIVE_DAYS` may not exceed it: a larger value stops the server at start-up. |
 
 ## Secrets
 

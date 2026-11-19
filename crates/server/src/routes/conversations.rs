@@ -140,7 +140,7 @@ pub(crate) async fn create(
             conversation_id: id,
             members: [low, high],
         };
-        state.gateway.notify_user(me, None, event);
+        state.gateway.notify_user(me, None, event.clone());
         state.gateway.notify_user(peer, None, event);
     }
     Ok((status, Json(view(row))))

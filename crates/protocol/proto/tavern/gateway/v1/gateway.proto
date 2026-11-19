@@ -22,6 +22,14 @@ message ClientFrame {
     Heartbeat heartbeat = 11;
     AckDeviceList ack_device_list = 12;
     AckSecurityNotices ack_security_notices = 13;
+
+    // M2: a conversation's sequence (ADR 0019). Since minor 5.
+    SendMessage send_message = 20;
+    SubmitCommit submit_commit = 21;
+    FetchMessages fetch_messages = 22;
+    AckMessages ack_messages = 23;
+    AckWelcome ack_welcome = 24;
+    FetchGroupInfo fetch_group_info = 25;
   }
 }
 
@@ -36,12 +44,22 @@ message ServerFrame {
     HeartbeatAck heartbeat_ack = 11;
     Ack ack = 12;
 
+    // M2 responses. Since minor 5.
+    SendMessageAck send_message_ack = 20;
+    CommitAck commit_ack = 21;
+    MessageBatch message_batch = 22;
+    GroupInfo group_info = 25;
+
     // Events (request_id = 0).
     SessionRevoked session_revoked = 15;
     DeviceListChanged device_list_changed = 16;
     SecurityNotice security_notice = 17;
 
     // M2 events (field numbers as in docs/protocol.md, section 3).
+    MessageEvent message_event = 40;  // Since minor 5.
+    CommitEvent commit_event = 41;  // Since minor 5.
+    ProposalEvent proposal_event = 42;  // Since minor 5.
+    WelcomeEvent welcome_event = 43;  // Since minor 5.
     ConversationCreated conversation_created = 44;  // Since minor 4.
     FriendshipChanged friendship_changed = 45;  // Since minor 3.
     KeyPackagesLow key_packages_low = 48;  // Since minor 2.
@@ -225,6 +243,9 @@ message Error {
   string message = 2;
   // Set for RATE_LIMITED and UNAVAILABLE.
   uint32 retry_after_ms = 3;
+  // Set for STALE_EPOCH when the server knows it: the group's current epoch.
+  // Since minor 5.
+  uint64 current_epoch = 4;
 }
 
 enum ErrorCode {
@@ -240,4 +261,112 @@ enum ErrorCode {
   ERROR_CODE_UNSUPPORTED_MESSAGE = 9;
   ERROR_CODE_INTERNAL = 10;
   ERROR_CODE_UNAVAILABLE = 11;
+
+  // MLS and delivery (M2). Since minor 5.
+  // 40 is reserved: a commit that loses its epoch gets STALE_EPOCH too.
+  ERROR_CODE_STALE_EPOCH = 41;  // for a past epoch: apply what is new, then resend
+  ERROR_CODE_REMOVAL_PENDING = 42;  // commit the server's pending removals first
+  ERROR_CODE_INVALID_COMMIT = 43;  // fails validation against the group's public state
+  ERROR_CODE_INVALID_KEY_PACKAGE = 44;
+  ERROR_CODE_NOT_A_MEMBER = 45;  // not a device of the group, or not a participant
+  ERROR_CODE_GROUP_INFO_REQUIRED = 46;
+
+  // Social (M2). Since minor 5.
+  ERROR_CODE_BLOCKED = 60;  // the sender blocks the other user; never sent to the blocked one
+  ERROR_CODE_NOT_FRIENDS = 61;  // a read-only DM: the users are not friends any more
+}
+
+// --- A conversation's sequence (ADR 0019, sections 4 to 7). Since minor 5. ---
+
+// An MLS PrivateMessage carrying application content, encrypted for the
+// group's current epoch.
+message SendMessage {
+  bytes conversation_id = 1;
+  // UUID chosen by the sending device: a resend with the same one gets the
+  // original acknowledgement, and is never stored nor delivered twice.
+  bytes client_message_id = 2;
+  bytes mls_message = 3;
+}
+
+message SendMessageAck {
+  uint64 seq = 1;
+  uint64 server_time_ms = 2;
+}
+
+// An MLS commit (PublicMessage) for the group's current epoch; exactly one
+// commit is accepted per epoch. With epoch 0 and no group yet, the group's
+// first commit, from any active device of a participant.
+message SubmitCommit {
+  bytes conversation_id = 1;
+  uint64 epoch = 2;
+  bytes mls_commit = 3;
+  bytes mls_welcome = 4;      // present when the commit adds devices
+  bytes mls_group_info = 5;   // required: the new epoch's GroupInfo, with its ratchet tree
+  bool external = 6;          // an external commit: this device joins
+}
+
+message CommitAck {
+  uint64 seq = 1;
+  uint64 new_epoch = 2;
+  uint64 server_time_ms = 3;
+}
+
+// The conversation's sequence after `after_seq`, in order.
+message FetchMessages {
+  bytes conversation_id = 1;
+  uint64 after_seq = 2;
+  uint32 limit = 3;           // at most 200; 0 means 200
+}
+
+message MessageBatch {
+  repeated StoredMessage messages = 1;
+  bool more = 2;
+}
+
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  MESSAGE_KIND_APPLICATION = 1;
+  MESSAGE_KIND_COMMIT = 2;
+  MESSAGE_KIND_PROPOSAL = 3;
+}
+
+message StoredMessage {
+  bytes conversation_id = 1;
+  uint64 seq = 2;
+  uint64 epoch = 3;
+  MessageKind kind = 4;
+  bytes sender_device_id = 5; // empty for the server's own proposals
+  uint64 server_time_ms = 6;
+  bytes mls_message = 7;
+}
+
+// This device has durably processed the sequence up to `up_to_seq`.
+message AckMessages {
+  bytes conversation_id = 1;
+  uint64 up_to_seq = 2;
+}
+
+// This device has joined, or refused, the group of a Welcome.
+message AckWelcome { bytes welcome_id = 1; }
+
+// The latest GroupInfo of a conversation's group, to join it by external
+// commit.
+message FetchGroupInfo { bytes conversation_id = 1; }
+
+message GroupInfo {
+  uint64 epoch = 1;
+  bytes mls_group_info = 2;
+}
+
+// Each carries one StoredMessage of the sequence.
+message MessageEvent  { StoredMessage message = 1; }
+message CommitEvent   { StoredMessage message = 1; }
+message ProposalEvent { StoredMessage message = 1; }  // the server's own Remove proposals
+
+// A Welcome for this device. Sent again at each connection until
+// acknowledged.
+message WelcomeEvent {
+  bytes welcome_id = 1;
+  bytes conversation_id = 2;
+  bytes mls_welcome = 3;
 }

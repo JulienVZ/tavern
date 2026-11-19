@@ -15,15 +15,16 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{State, WebSocketUpgrade};
 use axum::routing::get;
 
+use common::ws::{
+    Received, Socket, connect, connect_at, expect_close, expect_frame, hello, open, receive, send,
+};
 use common::{Device, TestApp};
-use futures_util::{SinkExt, StreamExt};
-use prost::Message as _;
+use futures_util::SinkExt;
 use reqwest::{Method, StatusCode};
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
@@ -32,113 +33,10 @@ use tavern_protocol::rest::B64;
 use tavern_protocol::{GATEWAY_PATH, GATEWAY_SUBPROTOCOL, close_code};
 use tavern_server::gateway::Event;
 use tavern_server::{AppState, routes, with_layers};
-use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
 const NO_BODY: Option<&()> = None;
-
-async fn open(app: &TestApp, subprotocol: Option<&str>) -> Result<Socket, StatusCode> {
-    open_at(app.addr, subprotocol).await
-}
-
-async fn open_at(addr: SocketAddr, subprotocol: Option<&str>) -> Result<Socket, StatusCode> {
-    let mut request = format!("ws://{addr}{GATEWAY_PATH}")
-        .into_client_request()
-        .unwrap();
-    if let Some(subprotocol) = subprotocol {
-        request
-            .headers_mut()
-            .insert("sec-websocket-protocol", subprotocol.parse().unwrap());
-    }
-    match tokio_tungstenite::connect_async(request).await {
-        Ok((socket, _)) => Ok(socket),
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            Err(StatusCode::from_u16(response.status().as_u16()).unwrap())
-        }
-        Err(error) => panic!("unexpected connection error: {error}"),
-    }
-}
-
-async fn send(socket: &mut Socket, request_id: u64, payload: ClientPayload) {
-    let frame = proto::ClientFrame {
-        request_id,
-        payload: Some(payload),
-    };
-    socket
-        .send(Message::Binary(frame.encode_to_vec().into()))
-        .await
-        .unwrap();
-}
-
-/// What the server sent next: a frame, or the code it closed with.
-#[derive(Debug)]
-enum Received {
-    Frame(proto::ServerFrame),
-    Closed(Option<u16>),
-}
-
-async fn receive(socket: &mut Socket) -> Received {
-    loop {
-        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
-            .await
-            .expect("the server did not answer in time");
-        match message {
-            Some(Ok(Message::Binary(bytes))) => {
-                return Received::Frame(proto::ServerFrame::decode(bytes.as_ref()).unwrap());
-            }
-            Some(Ok(Message::Close(frame))) => {
-                return Received::Closed(frame.map(|frame| u16::from(frame.code)));
-            }
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-            Some(Ok(other)) => panic!("unexpected message: {other:?}"),
-            Some(Err(_)) | None => return Received::Closed(None),
-        }
-    }
-}
-
-async fn expect_frame(socket: &mut Socket) -> proto::ServerFrame {
-    match receive(socket).await {
-        Received::Frame(frame) => frame,
-        Received::Closed(code) => panic!("the server closed the connection ({code:?})"),
-    }
-}
-
-async fn expect_close(socket: &mut Socket) -> Option<u16> {
-    match receive(socket).await {
-        Received::Closed(code) => code,
-        Received::Frame(frame) => panic!("expected a close, got {frame:?}"),
-    }
-}
-
-fn hello(token: &B64) -> ClientPayload {
-    ClientPayload::Hello(proto::Hello {
-        session_token: token.0.clone(),
-        protocol_minor: 0,
-        client_version: "test".to_owned(),
-        client_platform: "linux".to_owned(),
-    })
-}
-
-/// Opens an authenticated connection and returns it with its `Ready`.
-async fn connect(app: &TestApp, device: &Device) -> (Socket, proto::Ready) {
-    connect_at(app.addr, device).await
-}
-
-async fn connect_at(addr: SocketAddr, device: &Device) -> (Socket, proto::Ready) {
-    let mut socket = open_at(addr, Some(GATEWAY_SUBPROTOCOL)).await.unwrap();
-    send(&mut socket, 1, hello(&device.session_token)).await;
-    let frame = expect_frame(&mut socket).await;
-    assert_eq!(frame.request_id, 1);
-    let Some(ServerPayload::Ready(ready)) = frame.payload else {
-        panic!("expected Ready, got {frame:?}");
-    };
-    (socket, ready)
-}
 
 /// The event the test gateway below panics on.
 const PANICS: Event = Event::KeyPackagesLow { remaining: 4242 };

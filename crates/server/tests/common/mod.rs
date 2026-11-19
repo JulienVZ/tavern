@@ -14,6 +14,8 @@
     reason = "test helpers panic on failure, and not every test file uses every helper"
 )]
 
+pub mod ws;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -85,15 +87,28 @@ pub struct Device {
     /// The certificate it enrolled with.
     pub certificate: Vec<u8>,
     pub session_token: B64,
+    /// Its MLS store, which keeps the private parts of its KeyPackages and
+    /// the state of its groups, as its client's local store would.
+    pub provider: Provider<MemoryStorage>,
 }
 
 impl Device {
-    /// A KeyPackage of this device, built as its client would. The private
-    /// parts are dropped: these tests never join a group with it.
+    /// A device that is not enrolled, with this id, key and certificate.
+    pub fn unenrolled(device_id: Uuid, key: DeviceKey, certificate: Vec<u8>) -> Self {
+        Self {
+            device_id,
+            key,
+            certificate,
+            session_token: B64(vec![]),
+            provider: Provider::new(MemoryStorage::default()),
+        }
+    }
+
+    /// A KeyPackage of this device, built as its client would, its private
+    /// parts kept in the device's store.
     pub fn key_package(&self, last_resort: bool) -> B64 {
-        let provider = Provider::new(MemoryStorage::default());
         let package = key_package::build(
-            &provider,
+            &self.provider,
             &DeviceSigner::new(&self.key),
             for_device(&self.certificate, &self.key.public()),
             last_resort,
@@ -478,6 +493,7 @@ impl TestApp {
             key,
             certificate,
             session_token: session.session_token,
+            provider: Provider::new(MemoryStorage::default()),
         }
     }
 

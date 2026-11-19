@@ -559,12 +559,7 @@ async fn a_session_proof_is_refused_when_it_does_not_match() {
 
     // A proof signed by another device's key.
     let grant = app.direct_grant(&account);
-    let stranger = common::Device {
-        device_id: device.device_id,
-        key: DeviceKey::generate(),
-        certificate: Vec::new(),
-        session_token: B64(vec![]),
-    };
+    let stranger = common::Device::unenrolled(device.device_id, DeviceKey::generate(), Vec::new());
     let request = ReopenSessionRequest {
         proof: session_proof(&grant, &account, &stranger),
     };

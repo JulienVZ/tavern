@@ -13,6 +13,7 @@
 pub mod activity;
 pub mod config;
 pub mod db;
+pub mod delivery;
 pub mod error;
 pub mod gateway;
 pub mod mls;
@@ -134,6 +135,9 @@ pub struct Settings {
     pub auth_per_ip_per_minute: u32,
     /// Authentication attempts allowed per minute and per handle.
     pub auth_per_handle_per_minute: u32,
+    /// Days a stored message waits for the devices that have not
+    /// acknowledged it; its idempotency record is kept twice as long.
+    pub message_retention_days: u32,
     /// Days a device may stay away and still count as active.
     pub device_inactive_days: u32,
     /// How often KeyPackages may be claimed.
@@ -156,6 +160,7 @@ impl Settings {
             session_ttl,
             auth_per_ip_per_minute: rate_limit::AUTH_PER_IP_PER_MINUTE,
             auth_per_handle_per_minute: rate_limit::AUTH_PER_HANDLE_PER_MINUTE,
+            message_retention_days: config::MAX_MESSAGE_RETENTION_DAYS,
             device_inactive_days: activity::DEFAULT_INACTIVE_DAYS,
             claim_limits: ClaimLimits::default(),
             friend_requests_per_hour: config::DEFAULT_FRIEND_REQUESTS_PER_HOUR,
