@@ -618,6 +618,43 @@ fn key_packages_last_ninety_days_and_say_whether_they_are_last_resort() {
     }
 }
 
+/// The server reads an application message's group and epoch before it
+/// sequences it, and nothing that is not an application message.
+#[test]
+fn the_server_reads_the_group_and_epoch_of_an_application_message() {
+    let mut dm = Dm::new();
+    let message = dm.send(0, b"hello");
+    let header = application_header(&message).unwrap();
+    assert_eq!(header.group, identity());
+    assert_eq!(header.epoch, dm.groups[0].epoch());
+
+    let commit = {
+        let device = &dm.devices[0];
+        let pins = dm.pins.clone();
+        dm.groups[0]
+            .self_update(&device.provider, &device.signer(), &pins)
+            .unwrap()
+            .commit
+    };
+    assert!(matches!(
+        application_header(&commit),
+        Err(MlsError::Malformed)
+    ));
+    assert!(matches!(
+        application_header(b"garbage"),
+        Err(MlsError::Malformed)
+    ));
+    let mut trailing = message.clone();
+    trailing.push(0);
+    assert!(matches!(
+        application_header(&trailing),
+        Err(MlsError::Malformed)
+    ));
+    for length in 0..message.len() {
+        assert!(application_header(&message[..length]).is_err());
+    }
+}
+
 #[test]
 fn the_server_accepts_a_device_s_own_valid_key_packages() {
     let alice = Account::new(1);

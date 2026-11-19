@@ -49,7 +49,7 @@ pnpm --filter tavern-ui check
 pnpm --filter tavern-ui test
 ```
 
-Fuzz the protocol decoders and the server's KeyPackage checks (needs the nightly toolchain and `cargo install cargo-fuzz`; CI does it weekly). The targets are `client_frame`, `server_frame`, `device_certificate` and `key_package_upload`:
+Fuzz the protocol decoders and the server's KeyPackage checks (needs the nightly toolchain and `cargo install cargo-fuzz`; CI does it weekly). The targets are `client_frame`, `server_frame`, `device_certificate`, `key_package_upload`, `application_message` and `commit`:
 
 ```bash
 cd crates/protocol/fuzz

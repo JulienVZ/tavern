@@ -20,6 +20,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 prost = "0.14.6"
+openmls_memory_storage = "=0.6.0"
 tavern-crypto = { path = "../../crypto" }
 tavern-protocol = { path = ".." }
 
@@ -53,3 +54,17 @@ bench = false
 
 # Not a member of the repository workspace.
 [workspace]
+
+[[bin]]
+name = "application_message"
+path = "fuzz_targets/application_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commit"
+path = "fuzz_targets/commit.rs"
+test = false
+doc = false
+bench = false

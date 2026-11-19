@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [client_frame, server_frame, device_certificate, key_package_upload]
+        target: [client_frame, server_frame, device_certificate, key_package_upload, application_message, commit]
     steps:
       - uses: actions/checkout@v7
       - name: Install the nightly toolchain and cargo-fuzz

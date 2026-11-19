@@ -38,7 +38,10 @@ pub use credential::{LeafError, Roster, VerifiedLeaf};
 pub use group::{Commit, ExpectedGroup, Group, Incoming, Joined, MembershipChanges, Plaintext};
 pub use key_package::ClaimedKeyPackage;
 pub use policy::{Alarm, PolicyError};
-pub use public::{MergedCommit, PublicEntries, PublicState, ValidatedCommit};
+pub use public::{
+    ApplicationHeader, MergedCommit, PROPOSAL_QUEUE_KIND, PublicEntries, PublicState,
+    ValidatedCommit, application_header,
+};
 pub use signer::{DeviceSigner, ServerSigner};
 
 /// The only ciphersuite of Tavern's groups.

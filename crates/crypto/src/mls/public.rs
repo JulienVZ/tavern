@@ -38,6 +38,45 @@ use super::policy::{self, Alarm, GroupView};
 use super::{MembershipChanges, MlsError, Refusal, ServerSigner, library};
 use crate::identity::PUBLIC_KEY_LEN;
 
+/// The kind of the row that lists a group's queued proposals, present only
+/// while some are queued. The server queues its own `Remove` proposals only
+/// (section 6): a group with such a row has removals pending, and its
+/// members may send no application message (`REMOVAL_PENDING`).
+pub const PROPOSAL_QUEUE_KIND: i16 = 5;
+
+/// What the server reads of an application message before it sequences it:
+/// its group and its epoch, which a `PrivateMessage` carries in clear (RFC
+/// 9420, section 6.3). Nothing else is readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationHeader {
+    /// The group: conversation and generation.
+    pub group: GroupIdentity,
+    /// The epoch it is encrypted for.
+    pub epoch: u64,
+}
+
+/// Reads the header of an application message: an MLS `PrivateMessage`
+/// carrying application content, and nothing after it. Anything else is
+/// refused: commits and proposals travel as `PublicMessage`s, and
+/// application content never does.
+pub fn application_header(bytes: &[u8]) -> Result<ApplicationHeader, MlsError> {
+    let (message, rest) =
+        MlsMessageIn::tls_deserialize_bytes(bytes).map_err(|_| MlsError::Malformed)?;
+    if !rest.is_empty() {
+        return Err(MlsError::Malformed);
+    }
+    let MlsMessageBodyIn::PrivateMessage(message) = message.extract() else {
+        return Err(MlsError::Malformed);
+    };
+    if message.content_type() != ContentType::Application {
+        return Err(MlsError::Malformed);
+    }
+    Ok(ApplicationHeader {
+        group: GroupIdentity::from_group_id(message.group_id())?,
+        epoch: message.epoch().as_u64(),
+    })
+}
+
 /// What a row holds. The numbers are stored: never change or reuse one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -741,6 +780,14 @@ impl PublicState {
             .collect()
     }
 
+    /// The devices in the group, each with the index of its leaf.
+    pub fn leaves(&self) -> Vec<(u32, VerifiedLeaf)> {
+        policy::named_leaves(self.group.members())
+            .into_iter()
+            .map(|(index, leaf)| (index.u32(), leaf))
+            .collect()
+    }
+
     /// The leaf of a device, if it is in the group.
     pub fn leaf_of(&self, device: VerifiedLeaf) -> Option<LeafNodeIndex> {
         policy::named_leaves(self.group.members())
@@ -932,5 +979,15 @@ impl PublicState {
             .add_proposal(&self.entries, *queued)
             .map_err(library)?;
         Ok(Some(bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_proposal_queue_kind_is_the_stored_one() {
+        assert_eq!(PROPOSAL_QUEUE_KIND, Kind::ProposalQueue.code());
     }
 }
