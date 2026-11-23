@@ -11,10 +11,10 @@
 //! says; they are who receives what.
 //!
 //! A DM whose users are not friends any more is read-only (section 16): no
-//! application message and no new leaf, while removals and updates of one's
-//! own leaf go through. The blocked user is answered what an unfriended one
-//! is (`NOT_FRIENDS`), by the same work; only the blocker gets `BLOCKED`
-//! (ADR 0020).
+//! application message, no new leaf and no GroupInfo, while removals and
+//! updates of one's own leaf go through. The blocked user is answered what
+//! an unfriended one is (`NOT_FRIENDS`), by the same work; only the blocker
+//! gets `BLOCKED` (ADR 0020).
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use sqlx::PgConnection;
 use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::{
     ExpectedGroup, MlsError, PROPOSAL_QUEUE_KIND, PublicState, Refusal, ServerSigner, VerifiedLeaf,
-    application_header,
+    application_header, first_commit_sender, welcome_key_packages,
 };
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::{
@@ -101,6 +101,13 @@ impl Refused {
         Self::new(
             proto::ErrorCode::InvalidCommit,
             "the commit fails validation against the group",
+        )
+    }
+
+    fn wrong_welcome() -> Self {
+        Self::new(
+            proto::ErrorCode::InvalidCommit,
+            "the Welcome is not for exactly the KeyPackages the commit adds",
         )
     }
 }
@@ -374,6 +381,65 @@ async fn sync_leaves(
     Ok(())
 }
 
+/// Checks that `welcome` is for exactly the KeyPackages `added` (their
+/// references), the ones a member's commit adds; no Welcome when it adds
+/// none.
+fn welcome_covers(welcome: &[u8], mut added: Vec<Vec<u8>>) -> Result<()> {
+    if added.is_empty() {
+        return if welcome.is_empty() {
+            Ok(())
+        } else {
+            Err(Refused::wrong_welcome())
+        };
+    }
+    let mut covered = welcome_key_packages(welcome).map_err(|_| Refused::wrong_welcome())?;
+    covered.sort_unstable();
+    added.sort_unstable();
+    if covered == added {
+        Ok(())
+    } else {
+        Err(Refused::wrong_welcome())
+    }
+}
+
+/// Checks that the Welcome of a group's first commit is for exactly the
+/// KeyPackages it adds. The server cannot read that commit (it has no state
+/// of epoch 0, section 4), but the tree has, for each device the commit
+/// adds, the leaf of the package that added it, whose key the server kept
+/// with the package (`key_packages.leaf_key`) when it served it.
+async fn first_welcome_covers(
+    conn: &mut PgConnection,
+    welcome: &[u8],
+    mut added: Vec<(Uuid, Vec<u8>)>,
+) -> Result<()> {
+    if added.is_empty() {
+        return if welcome.is_empty() {
+            Ok(())
+        } else {
+            Err(Refused::wrong_welcome())
+        };
+    }
+    let references = welcome_key_packages(welcome).map_err(|_| Refused::wrong_welcome())?;
+    let mut covered: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+        "SELECT device_id, leaf_key FROM key_packages \
+         WHERE reference = ANY($1) AND (served_at IS NOT NULL OR last_resort)",
+    )
+    .bind(&references)
+    .fetch_all(conn)
+    .await?;
+    // References are unique: one row per reference the server served.
+    if covered.len() != references.len() {
+        return Err(Refused::wrong_welcome());
+    }
+    covered.sort_unstable();
+    added.sort_unstable();
+    if covered == added {
+        Ok(())
+    } else {
+        Err(Refused::wrong_welcome())
+    }
+}
+
 fn conversation_id(bytes: &[u8]) -> Result<Uuid> {
     Uuid::from_slice(bytes).map_err(|_| Refused::invalid("invalid conversation id"))
 }
@@ -401,10 +467,20 @@ fn stored(
     })
 }
 
+/// What a commit adds, which its Welcome must be for.
+enum Packages {
+    /// A member's or an external commit: the references of the KeyPackages
+    /// its Add proposals carry.
+    Member(Vec<Vec<u8>>),
+    /// A group's first commit: each device added, with its leaf's key.
+    First(Vec<(Uuid, Vec<u8>)>),
+}
+
 /// `SubmitCommit`: the group's first commit, from any active device of a
 /// participant when the conversation has none (section 4); a member's
 /// commit; or an external commit (section 5). One commit per epoch: the
-/// others get `STALE_EPOCH`.
+/// others get `STALE_EPOCH`. The Welcome is for exactly the KeyPackages the
+/// commit adds.
 pub async fn submit_commit(
     state: &AppState,
     session: &Session,
@@ -438,7 +514,7 @@ pub async fn submit_commit(
         .map_err(state_refused)?;
     let before = members(&mut tx, conversation).await?;
 
-    let (old_epoch, new_epoch, leaves, reissued, welcomed) =
+    let (old_epoch, new_epoch, leaves, reissued, welcomed, packages) =
         match group_of(&mut tx, conversation).await? {
             None => {
                 if request.epoch != 0 {
@@ -462,12 +538,33 @@ pub async fn submit_commit(
                 )
                 .map_err(|error| commit_refused(error, 0))?;
                 let leaves = public.leaves();
+                let added = public
+                    .leaf_keys()
+                    .into_iter()
+                    .filter(|(leaf, _)| *leaf != submitter)
+                    .map(|(leaf, key)| (Uuid::from_bytes(leaf.device_id), key))
+                    .collect();
+                // What the server can check of a commit it cannot process: a
+                // commit of this group at epoch 0, by the submitter's leaf.
+                let committer = first_commit_sender(&request.mls_commit, expected.identity)
+                    .map_err(|_| Refused::invalid_commit())?;
+                if !leaves
+                    .iter()
+                    .any(|(index, leaf)| *index == committer && *leaf == submitter)
+                {
+                    return Err(Refused::invalid_commit());
+                }
                 mls::insert(&mut tx, public).await.map_err(state_refused)?;
-                (0, 1, leaves, Vec::new(), devices)
+                (0, 1, leaves, Vec::new(), devices, Packages::First(added))
             }
             Some((generation, epoch)) => {
                 if request.epoch < epoch {
                     return Err(Refused::stale_at(epoch));
+                }
+                // An epoch the group has not reached: the device is confused,
+                // and its commit could not be valid.
+                if request.epoch > epoch {
+                    return Err(Refused::invalid_commit());
                 }
                 let expected = ExpectedGroup {
                     identity: GroupIdentity {
@@ -495,6 +592,7 @@ pub async fn submit_commit(
                 if !validated.changes().added.is_empty() {
                     writable(&mut tx, me, dm.peer(me)).await?;
                 }
+                let added = validated.added_key_packages().to_vec();
                 let merged = loaded
                     .state
                     .merge(
@@ -510,6 +608,7 @@ pub async fn submit_commit(
                     leaves,
                     merged.reissued,
                     merged.changes.added,
+                    Packages::Member(added),
                 )
             }
         };
@@ -518,8 +617,11 @@ pub async fn submit_commit(
         .filter(|device| *device != submitter)
         .map(|device| Uuid::from_bytes(device.device_id))
         .collect();
-    if !welcomed.is_empty() && request.mls_welcome.is_empty() {
-        return Err(Refused::invalid_commit());
+    match packages {
+        Packages::Member(added) => welcome_covers(&request.mls_welcome, added)?,
+        Packages::First(added) => {
+            first_welcome_covers(&mut tx, &request.mls_welcome, added).await?
+        }
     }
 
     let commit = append(
@@ -636,9 +738,7 @@ pub async fn send_message(
     .await?;
     if let Some((sent_in, seq, at_ms)) = sent {
         if sent_in != conversation {
-            return Err(Refused::invalid(
-                "this client message id was used elsewhere",
-            ));
+            return Err(used_elsewhere());
         }
         return Ok(proto::SendMessageAck {
             seq: u64::try_from(seq).unwrap_or_default(),
@@ -696,11 +796,15 @@ pub async fn send_message(
         retention,
     )
     .await?;
-    sqlx::query(
+    // The same id sent at once in another conversation, under another lock:
+    // the first to commit keeps it, and this transaction, its number with it,
+    // goes back.
+    let recorded = sqlx::query(
         "INSERT INTO sent_messages \
              (device_id, client_message_id, conversation_id, seq, sent_at, expires_at) \
          VALUES ($1, $2, $3, $4, to_timestamp($5::double precision / 1000), \
-                 now() + make_interval(days => $6))",
+                 now() + make_interval(days => $6)) \
+         ON CONFLICT (device_id, client_message_id) DO NOTHING",
     )
     .bind(session.device_id)
     .bind(client_message_id)
@@ -710,6 +814,9 @@ pub async fn send_message(
     .bind(i32::try_from(retention.saturating_mul(2)).unwrap_or(i32::MAX))
     .execute(&mut *tx)
     .await?;
+    if recorded.rows_affected() == 0 {
+        return Err(used_elsewhere());
+    }
     let recipients = members(&mut tx, conversation).await?;
     tx.commit().await?;
 
@@ -730,6 +837,10 @@ pub async fn send_message(
         seq: u64::try_from(entry.seq).unwrap_or_default(),
         server_time_ms: u64::try_from(entry.at_ms).unwrap_or_default(),
     })
+}
+
+fn used_elsewhere() -> Refused {
+    Refused::invalid("this client message id was used elsewhere")
 }
 
 type MessageRow = (i64, i64, i16, Option<Uuid>, i64, Vec<u8>);
@@ -844,36 +955,40 @@ pub async fn ack_welcome(
 type GroupInfoRow = (Uuid, Uuid, Option<i64>, Option<Vec<u8>>);
 
 /// `FetchGroupInfo`: the group's latest GroupInfo, to join it by external
-/// commit. Any device of a participant may read it, in a read-only DM too:
-/// it is the external commit that a read-only DM refuses.
+/// commit. Any device of a participant may read it, between friends only:
+/// in a read-only DM, where an external commit is refused anyway, the tree
+/// it holds would tell the other user of every change of devices. The
+/// blocked user is answered what an unfriended one is.
 pub async fn fetch_group_info(
     state: &AppState,
     session: &Session,
     request: proto::FetchGroupInfo,
 ) -> Result<proto::GroupInfo> {
     let conversation = conversation_id(&request.conversation_id)?;
+    let mut conn = state.db.acquire().await?;
     let row: Option<GroupInfoRow> = sqlx::query_as(
         "SELECT d.user_low, d.user_high, g.epoch, g.group_info FROM dm_conversations d \
          LEFT JOIN mls_groups g ON g.conversation_id = d.conversation_id \
          WHERE d.conversation_id = $1",
     )
     .bind(conversation)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *conn)
     .await?;
-    match row {
-        Some((low, high, epoch, info)) if session.user_id == low || session.user_id == high => {
-            match (epoch, info) {
-                (Some(epoch), Some(info)) => Ok(proto::GroupInfo {
-                    epoch: u64::try_from(epoch).unwrap_or_default(),
-                    mls_group_info: info,
-                }),
-                _ => Err(Refused::new(
-                    proto::ErrorCode::NotFound,
-                    "the conversation has no group yet",
-                )),
-            }
-        }
-        _ => Err(Refused::not_a_member()),
+    let me = session.user_id;
+    let Some((low, high, epoch, info)) = row.filter(|(low, high, ..)| me == *low || me == *high)
+    else {
+        return Err(Refused::not_a_member());
+    };
+    writable(&mut conn, me, if me == low { high } else { low }).await?;
+    match (epoch, info) {
+        (Some(epoch), Some(info)) => Ok(proto::GroupInfo {
+            epoch: u64::try_from(epoch).unwrap_or_default(),
+            mls_group_info: info,
+        }),
+        _ => Err(Refused::new(
+            proto::ErrorCode::NotFound,
+            "the conversation has no group yet",
+        )),
     }
 }
 

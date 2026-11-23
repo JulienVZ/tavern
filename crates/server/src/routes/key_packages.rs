@@ -130,12 +130,14 @@ async fn insert<'c>(
     // The same package sent again (a retried upload) is already there, or
     // was served and keeps its reference until it expires: not stored again.
     sqlx::query(
-        "INSERT INTO key_packages (device_id, key_package, reference, last_resort, expires_at) \
-         VALUES ($1, $2, $3, $4, to_timestamp($5)) ON CONFLICT (reference) DO NOTHING",
+        "INSERT INTO key_packages \
+             (device_id, key_package, reference, leaf_key, last_resort, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) ON CONFLICT (reference) DO NOTHING",
     )
     .bind(device)
     .bind(bytes)
     .bind(&uploaded.reference)
+    .bind(&uploaded.leaf_key)
     .bind(last_resort)
     .bind(not_after)
     .execute(db)

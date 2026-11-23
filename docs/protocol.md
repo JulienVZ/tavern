@@ -110,7 +110,9 @@ Rules:
 4. The client sends `Heartbeat` every 30 seconds. The server closes a connection that has been silent for 75 seconds.
 5. On every `Heartbeat` the server checks that the session is still valid, and closes with 4003 when it is not. `Ready` lists the devices enrolled while this device was away; the client shows them, then sends `AckDeviceList`. `Ready` also lists the security notices this device has not acknowledged; the client shows them until the user dismisses them, then sends `AckSecurityNotices`.
 6. From M2: after `Ready`, the client catches up: for each conversation, `FetchMessages` from its last acknowledged sequence number. Pending welcomes are re-sent by the server as `WelcomeEvent` until acknowledged.
-7. On disconnect the client reconnects with exponential backoff and jitter (1 s up to 60 s). It does not reconnect after 4002 or 4003: the session is gone and the user must log in again.
+7. On disconnect the client reconnects with exponential backoff and jitter (1 s up to 60 s). It does not reconnect after 4002 or 4003: the session is gone and the user must log in again. After 4009 (it did not keep up with its events) it reconnects and catches up as in step 6.
+
+Pushed events are notifications, not a reliable source. An event may be missed (the connection dropped, or its queue was full: the server then closes with 4009 rather than drop an event in silence) and events may arrive out of order (each request notifies after its own transaction). The source is the stored sequence, and from M2 the client follows one rule: it processes each conversation's sequence in the order of its numbers, from the last one it processed. Given an event with number N+2 when it has processed N, it puts N+2 aside, fetches the gap with `FetchMessages` (after N), and processes N+1, then N+2. Welcomes, security notices and the device list come back at each connection.
 
 One connection per device. A second connection with the same session closes the first (4004).
 
@@ -394,12 +396,13 @@ message KeyPackagesLow { uint32 remaining = 1; }
 
 Delivery rules (implemented in task 8 of M2, gateway minor 5; removals, purge and recreation come with task 9):
 
-- Each conversation has one sequence, shared by application messages, proposals and commits, numbered under the lock of the conversation's row: strictly increasing, without gaps. A device processes it in order. It reads it from the commit that added it to the group, to the commit that removed it if one did (`FetchMessages`, at most 200 a page).
+- Each conversation has one sequence, shared by application messages, proposals and commits, numbered under the lock of the conversation's row: strictly increasing, without gaps. A device processes it in the order of its numbers, whatever the order its events arrive in, and fills a gap with `FetchMessages` (section 3, connection lifecycle). It reads it from the commit that added it to the group, to the commit that removed it if one did (`FetchMessages`, at most 200 a page).
 - The group's devices, who receives what, are computed by the server from the public tree it merged, in the same transaction, never from what a client says. A message goes to every device of the group but its sender's, the sender's other devices included; a commit to the devices that held the group before it; a Welcome to each device the commit added, sent again at each connection until `AckWelcome`.
 - The server checks, for every message: the device is a current leaf of the group, the conversation-specific authorisation holds, and sizes are within limits. Unknown conversations and conversations of others answer the same `NOT_A_MEMBER`.
 - A conversation that has no group yet gets it from any active device of either user: the first commit for epoch 0 wins, the others get `STALE_EPOCH` and join by the winner's Welcome.
-- A DM whose users are not friends any more is read-only: application messages and any new leaf (Add, external commit) are refused, removals and updates of one's own leaf go through. The user who blocks gets `BLOCKED`; the blocked user gets `NOT_FRIENDS`, the same answer as after an unfriending, by the same work. `FetchGroupInfo` stays allowed to the devices of both users.
+- A DM whose users are not friends any more is read-only: application messages, any new leaf (Add, external commit) and `FetchGroupInfo` are refused, removals and updates of one's own leaf go through. The GroupInfo is refused because its tree would tell the other user of every change of devices, and an external commit is refused anyway. The user who blocks gets `BLOCKED`; the blocked user gets `NOT_FRIENDS`, the same answer as after an unfriending, by the same work.
 - Application messages must be encrypted for the current epoch (`STALE_EPOCH` otherwise) and are refused while removals are pending (`REMOVAL_PENDING`). Both are recovered by the client without user-visible error: it applies or commits what is pending, re-encrypts for the new epoch and resends with the same `client_message_id`. Only repeated failure (three attempts) surfaces as "not sent, retry".
+- A commit is announced for the group's current epoch (`STALE_EPOCH` for a past one, `INVALID_COMMIT` for one the group has not reached) and carries a Welcome for exactly the KeyPackages it adds (their `KeyPackageRef`s), and none when it adds no one. A group's first commit, which the server cannot process (it has no state of epoch 0), is checked for its framing: a `PublicMessage` carrying a commit of this group at epoch 0, by the submitting device's leaf. Its Welcome is matched to the tree: for each device the commit adds, the leaf's encryption key is the one of a KeyPackage of that device the server served, and the Welcome is for exactly these packages.
 - A commit is validated against the public group state: it is the submitting device's own, its signature is valid, the clients' policy holds (proposals allowed for the sender, no group context change, new leaves active devices of participants with valid device certificates and the very key and certificate each device enrolled with), and the GroupInfo submitted with it is the new epoch's (same group context and confirmation tag, with the ratchet tree and `ExternalPub`), signed by the committer. A member's commit that leaves out a pending removal is refused with `REMOVAL_PENDING`; after an external commit, which cannot carry them, the server appends its removals again for the new epoch. The epoch update is atomic ([ADR 0019](adr/0019-mls-direct-messages.md), sections 5, 6 and 14).
 - External proposals issued by the server are always `Remove`. Clients reject any other type from an external sender.
 - `SendMessage` is idempotent on (`device`, `client_message_id`): a retry returns the original acknowledgement, and a message already accepted is never stored or delivered twice, even re-encrypted. The idempotency record outlives the message, for twice the retention period; a client never resends a message older than the retention period.
@@ -523,8 +526,9 @@ WebSocket close codes:
 | 4004 | Replaced by a newer connection of the same device |
 | 4005 | Unsupported protocol version |
 | 4006 | Heartbeat timeout |
-| 4007 | Rate limit exceeded repeatedly |
+| 4007 | Rate limit exceeded repeatedly, or `Hello`s too often |
 | 4008 | Malformed frame |
+| 4009 | The device did not keep up with its events; it reconnects and fetches what it has not read |
 | 1011 | The server failed while handling a frame of this connection; the client reconnects |
 
 ## 7. Limits
@@ -534,7 +538,7 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | Item | Limit |
 |---|---|
 | Gateway frame | 1 MiB * |
-| MLS application message (ciphertext) | 64 KiB * |
+| MLS application message (ciphertext) | 65 KiB *: a content of up to 64 KiB, padded (ADR 0019, section 8), plus MLS's overhead, measured at 324 bytes, with the rest of a KiB as margin |
 | Text of one message (plaintext) | 4 000 characters, enforced by clients |
 | MLS commit | 256 KiB |
 | MLS Welcome | 512 KiB |
@@ -554,14 +558,16 @@ Defaults; those marked * are configurable per instance and announced in `Ready.l
 | Enrolment token | 5 min |
 | `FetchMessages` page | 200 messages |
 | Security notices | 32 listed in `Ready`, 64 identifiers per `AckSecurityNotices`, kept 90 days |
-| Gateway requests per device | 30 per 10 s sustained, burst 60, every frame after `Hello` counted (per connection, which is per device) |
+| Gateway requests per device | 30 per 10 s sustained, burst 60, every frame after `Hello` counted, across the device's connections: reconnecting gives no new budget |
+| Gateway `Hello`s per device | 10 per minute; beyond, `RATE_LIMITED` and a close with 4007 |
+| Gateway events queued per connection | 32; beyond, the connection is closed with 4009 once it has sent them |
 | Typing updates | 1 per 3 s per conversation |
 | Auth routes | 30 per minute per client address, 5 per minute per handle |
 | Stored message retention | until acknowledged by all recipient devices, at most 30 days * |
 | Device inactivity before removal from groups | the retention period, never more * |
 | Password (client-enforced) | at least 12 characters, strength score ≥ 3 of 4 |
 
-Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE_LIMITED` with `retry_after_ms`. A gateway connection that keeps exceeding its rate (ten requests refused in a row) is closed with 4007.
+Exceeding a size limit yields `PAYLOAD_TOO_LARGE`; exceeding a rate yields `RATE_LIMITED` with `retry_after_ms`. A gateway connection that keeps exceeding its rate (ten requests refused in a row) is closed with 4007, and so is a `Hello` beyond its limit, after its `RATE_LIMITED` answer.
 
 ## 8. Security requirements on implementations
 

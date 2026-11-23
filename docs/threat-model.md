@@ -101,9 +101,9 @@ Includes a malicious admin running modified software and an intruder who took ov
 | **Profile: display name, avatar, banner, bio, custom status** | Stored in clear in v1; encryption planned in [ADR 0008](adr/0008-encrypted-profiles.md) |
 | **Names of servers, channels, categories and roles**, role colours and permissions, channel order | Needed for permissions and invitations |
 | Server nicknames | Treated like profile data |
-| Device ids, device public keys and certificates, KeyPackages, creation and last-seen times | Authentication Service role |
+| Device ids, device public keys and certificates, KeyPackages, creation and last-seen times; for each KeyPackage, its leaf's encryption key, kept once served until it expires | Authentication Service role; the key tells which package added a device to a group, which the group's tree shows anyway, so that the Welcome of a first commit can be checked ([ADR 0019](adr/0019-mls-direct-messages.md), task 8 review) |
 | Friend list, pending requests, blocks, and the requests a blocked user sent to their blocker, which the blocker never sees ([ADR 0020](adr/0020-friends-and-blocks.md)) | Enforced server side |
-| Membership of servers, channels, private groups and DMs; public MLS tree of each group | Routing and permission checks |
+| Membership of servers, channels, private groups and DMs; public MLS tree of each group | Routing and permission checks. The tree, in the GroupInfo, is given to the devices of a DM's users while they are friends only: in a DM made read-only by an unfriending or a block, it would tell either user of every change of the other's devices ([ADR 0019](adr/0019-mls-direct-messages.md), section 16) |
 | For each message: conversation, sending device, time, padded size, MLS epoch, whether it is a handshake or application message; for each device, how far it has read each conversation | Delivery Service role |
 | For each message a device sent: the identifier it chose, with its conversation, number and time, kept twice the retention, after the message itself is gone ([ADR 0019](adr/0019-mls-direct-messages.md), section 7) | A resend gets the original acknowledgement and is never stored nor delivered twice |
 | For each blob: size, uploader, conversation, time | Access control and quotas |

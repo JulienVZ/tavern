@@ -11,14 +11,18 @@
 //!    acknowledged;
 //! 4. the client sends `Heartbeat` every thirty seconds; the server checks on
 //!    each one that the session is still valid;
-//! 5. the server pushes events from the [`Registry`](crate::gateway::Registry).
+//! 5. the server pushes events from the [`Registry`](crate::gateway::Registry):
+//!    notifications, which a device that falls behind may miss (it is then
+//!    closed with 4009, and fetches what it has not read).
+//!
+//! Requests and `Hello`s are limited per device, across its connections
+//! ([`GatewayLimits`]).
 //!
 //! Every frame is decoded from untrusted bytes: sizes are bounded by the
 //! WebSocket layer, and anything malformed closes the connection. Each frame
 //! is handled under [`panics::guard`]: a panic closes its connection with
 //! 1011, and the server goes on.
 
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -26,26 +30,24 @@ use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use governor::clock::{Clock, DefaultClock};
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use prost::Message as _;
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_protocol::{
     DEFAULT_MAX_FRAME_BYTES, GATEWAY_HEARTBEAT_INTERVAL_MS, GATEWAY_HEARTBEAT_TIMEOUT_MS,
-    GATEWAY_HELLO_DEADLINE_MS, GATEWAY_MINOR_VERSION, GATEWAY_REQUEST_BURST,
-    GATEWAY_REQUESTS_PER_10_SECONDS, GATEWAY_SUBPROTOCOL, MAX_APPLICATION_MESSAGE_BYTES,
-    MAX_SECURITY_NOTICE_ACKS, close_code,
+    GATEWAY_HELLO_DEADLINE_MS, GATEWAY_MINOR_VERSION, GATEWAY_SUBPROTOCOL,
+    MAX_APPLICATION_MESSAGE_BYTES, MAX_SECURITY_NOTICE_ACKS, close_code,
 };
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::delivery::{self, Refused};
 use crate::error::ApiResult;
-use crate::gateway::{Event, Relation, RevocationReason};
+use crate::gateway::{Event, Relation, RevocationReason, Subscription};
 use crate::notices;
 use crate::panics::{self, Panicked};
+use crate::rate_limit::GatewayLimits;
 use crate::routes::key_packages;
 use crate::session::{self, Session};
 
@@ -112,6 +114,16 @@ fn error_frame(request_id: u64, code: proto::ErrorCode, message: &str) -> Messag
             current_epoch: 0,
         }),
     )
+}
+
+/// `RATE_LIMITED`, to retry after `wait`.
+fn rate_limited(wait: Duration, message: &str) -> ServerPayload {
+    ServerPayload::Error(proto::Error {
+        code: proto::ErrorCode::RateLimited.into(),
+        message: message.to_owned(),
+        retry_after_ms: u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1),
+        current_epoch: 0,
+    })
 }
 
 async fn close(mut socket: WebSocket, code: u16) {
@@ -231,6 +243,14 @@ async fn handshake(state: &AppState, mut socket: WebSocket) -> Option<(WebSocket
         close(socket, close_code::AUTHENTICATION_FAILED).await;
         return None;
     };
+    // Counted per device: reconnecting gives no new budget of requests, and
+    // a device that connects without end is turned away.
+    if let Err(wait) = state.rate_limits.gateway.check_hello(session.device_id) {
+        let refused = rate_limited(wait, "connecting too often");
+        let _ = socket.send(frame(first.request_id, refused)).await;
+        close(socket, close_code::RATE_LIMITED).await;
+        return None;
+    }
     Some((socket, session, first.request_id))
 }
 
@@ -308,14 +328,7 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
     } else if let Err(code) = resend_welcomes(&state, &session, &mut socket).await {
         code
     } else {
-        run(
-            &state,
-            &mut socket,
-            &session,
-            &mut subscription.events,
-            translate,
-        )
-        .await
+        run(&state, &mut socket, &session, &mut subscription, translate).await
     };
     // Out of the registry before the peer sees the close.
     drop(registered);
@@ -352,51 +365,40 @@ async fn resend_welcomes(
     Ok(())
 }
 
-/// The limit on a connection's requests (`protocol.md`, section 7): 30 per
-/// 10 seconds sustained, bursts of 60. A refused request gets `RATE_LIMITED`;
-/// after ten refused in a row, the connection is closed (4007).
-struct RequestLimit {
-    limiter: DefaultDirectRateLimiter,
-    clock: DefaultClock,
+/// The limit on a device's requests (`protocol.md`, section 7): 30 per 10
+/// seconds sustained, bursts of 60, counted across the device's connections
+/// ([`GatewayLimits`]). A refused request gets `RATE_LIMITED`; after ten
+/// refused in a row, the connection is closed (4007).
+struct RequestLimit<'a> {
+    limits: &'a GatewayLimits,
+    device: Uuid,
     strikes: AtomicU32,
 }
 
-impl RequestLimit {
-    fn new() -> Self {
-        let period =
-            Duration::from_millis(10_000 / u64::from(GATEWAY_REQUESTS_PER_10_SECONDS.max(1)));
-        let burst = NonZeroU32::new(GATEWAY_REQUEST_BURST).unwrap_or(NonZeroU32::MIN);
-        let quota = Quota::with_period(period)
-            .unwrap_or_else(|| Quota::per_second(NonZeroU32::MIN))
-            .allow_burst(burst);
+impl<'a> RequestLimit<'a> {
+    fn new(limits: &'a GatewayLimits, device: Uuid) -> Self {
         Self {
-            limiter: RateLimiter::direct(quota),
-            clock: DefaultClock::default(),
+            limits,
+            device,
             strikes: AtomicU32::new(0),
         }
     }
 
     /// Counts the request `request_id`: what to do instead, if refused.
     fn refuse(&self, request_id: u64) -> Option<Next> {
-        match self.limiter.check() {
+        match self.limits.check_request(self.device) {
             Ok(()) => {
                 self.strikes.store(0, Ordering::Relaxed);
                 None
             }
-            Err(not_until) => {
+            Err(wait) => {
                 let strikes = self.strikes.fetch_add(1, Ordering::Relaxed) + 1;
                 if strikes >= STRIKES_BEFORE_CLOSE {
                     return Some(Next::Close(close_code::RATE_LIMITED));
                 }
-                let wait = not_until.wait_time_from(self.clock.now());
                 Some(Next::Reply(
                     request_id,
-                    ServerPayload::Error(proto::Error {
-                        code: proto::ErrorCode::RateLimited.into(),
-                        message: "too many requests".to_owned(),
-                        retry_after_ms: u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1),
-                        current_epoch: 0,
-                    }),
+                    rate_limited(wait, "too many requests"),
                 ))
             }
         }
@@ -417,11 +419,11 @@ async fn run(
     state: &AppState,
     socket: &mut WebSocket,
     session: &Session,
-    events: &mut tokio::sync::mpsc::Receiver<Event>,
+    subscription: &mut Subscription,
     translate: Translate,
 ) -> Option<u16> {
     let silence = Duration::from_millis(GATEWAY_HEARTBEAT_TIMEOUT_MS);
-    let limit = RequestLimit::new();
+    let limit = RequestLimit::new(&state.rate_limits.gateway, session.device_id);
     loop {
         tokio::select! {
             incoming = tokio::time::timeout(silence, socket.recv()) => {
@@ -444,10 +446,15 @@ async fn run(
                     return None;
                 }
             }
-            event = events.recv() => {
+            event = subscription.events.recv() => {
                 let Some(event) = event else {
-                    // The registry dropped this connection.
-                    return Some(close_code::REPLACED);
+                    // The registry let this connection go, once its queue
+                    // was sent: replaced, or it did not keep up.
+                    return Some(if subscription.overflowed() {
+                        close_code::EVENT_QUEUE_FULL
+                    } else {
+                        close_code::REPLACED
+                    });
                 };
                 // Like a frame, an event is handled under the guard: a panic
                 // closes this connection only.
@@ -483,7 +490,7 @@ enum Next {
 async fn on_message(
     state: &AppState,
     session: &Session,
-    limit: &RequestLimit,
+    limit: &RequestLimit<'_>,
     message: Option<Result<Message, axum::Error>>,
 ) -> Next {
     let request = match classify(message) {

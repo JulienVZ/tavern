@@ -3,17 +3,20 @@
 //! Registry of connected devices, used to push events to them.
 //!
 //! The WebSocket endpoint that feeds this registry is in `routes/gateway.rs`.
-//! Events are best effort: a device that is offline learns about missed
-//! enrolments and security notices from the `Ready` message at its next
-//! connection.
+//! Events are notifications, never the only copy of anything: a device that
+//! is offline learns about missed enrolments and security notices from the
+//! `Ready` message at its next connection, gets its Welcomes again, and
+//! fetches the sequences it has not read. An event is never dropped in
+//! silence either: a connection whose queue is full is taken out of the
+//! registry, and closed with 4009 once it has sent what its queue holds.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
-
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tavern_protocol::gateway::v1 as proto;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use crate::notices::Notice;
@@ -97,8 +100,9 @@ pub enum Event {
     },
 }
 
-/// Events queued per connection before the device is considered too slow.
-const QUEUE_LEN: usize = 32;
+/// Events queued per connection. A device that lets more wait is
+/// disconnected (4009): it reconnects, and fetches what it missed.
+pub const EVENT_QUEUE_LEN: usize = 32;
 
 #[derive(Debug)]
 struct Connection {
@@ -106,6 +110,23 @@ struct Connection {
     /// Distinguishes two successive connections of the same device.
     generation: u64,
     sender: mpsc::Sender<Event>,
+    /// Set when an event found the queue full.
+    overflowed: Arc<AtomicBool>,
+}
+
+impl Connection {
+    /// Queues `event`. `false` when the queue is full: the event is not
+    /// delivered, and the connection must leave the registry.
+    fn deliver(&self, event: Event) -> bool {
+        match self.sender.try_send(event) {
+            Err(TrySendError::Full(_)) => {
+                self.overflowed.store(true, Ordering::Release);
+                false
+            }
+            // Closed: the connection is ending, and leaves by itself.
+            Ok(()) | Err(TrySendError::Closed(_)) => true,
+        }
+    }
 }
 
 /// Connected devices, by device id.
@@ -118,10 +139,20 @@ pub struct Registry {
 /// Handle returned by [`Registry::connect`].
 #[derive(Debug)]
 pub struct Subscription {
-    /// Events for this connection.
+    /// Events for this connection. They end when the registry lets the
+    /// connection go: replaced, or its queue full ([`Self::overflowed`]).
     pub events: mpsc::Receiver<Event>,
     /// Identifies this connection in [`Registry::disconnect`].
     pub generation: u64,
+    overflowed: Arc<AtomicBool>,
+}
+
+impl Subscription {
+    /// Whether the registry let this connection go because an event found
+    /// its queue full.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
 }
 
 impl Registry {
@@ -136,7 +167,8 @@ impl Registry {
             *next += 1;
             *next
         };
-        let (sender, events) = mpsc::channel(QUEUE_LEN);
+        let (sender, events) = mpsc::channel(EVENT_QUEUE_LEN);
+        let overflowed = Arc::new(AtomicBool::new(false));
         let previous = self
             .connections
             .lock()
@@ -147,15 +179,21 @@ impl Registry {
                     user_id,
                     generation,
                     sender,
+                    overflowed: Arc::clone(&overflowed),
                 },
             );
         if let Some(previous) = previous {
-            // Best effort: if its queue is full the old connection times out anyway.
+            // Dropped next, which ends its events: if its queue is full, it
+            // closes as replaced all the same.
             let _ = previous
                 .sender
                 .try_send(Event::SessionRevoked(RevocationReason::Replaced));
         }
-        Subscription { events, generation }
+        Subscription {
+            events,
+            generation,
+            overflowed,
+        }
     }
 
     /// Removes a connection, unless a newer one of the same device replaced it.
@@ -172,28 +210,32 @@ impl Registry {
         }
     }
 
-    /// Sends an event to one device, if connected.
+    /// Sends an event to one device, if connected. A device whose queue is
+    /// full is let go instead (4009).
     pub fn notify_device(&self, device_id: Uuid, event: Event) {
-        let connections = self
+        let mut connections = self
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(connection) = connections.get(&device_id) {
-            let _ = connection.sender.try_send(event);
+        if connections
+            .get(&device_id)
+            .is_some_and(|connection| !connection.deliver(event))
+        {
+            connections.remove(&device_id);
         }
     }
 
-    /// Sends an event to every connected device of an account, except `except`.
+    /// Sends an event to every connected device of an account, except
+    /// `except`. A device whose queue is full is let go instead (4009).
     pub fn notify_user(&self, user_id: Uuid, except: Option<Uuid>, event: Event) {
-        let connections = self
-            .connections
+        self.connections
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        for (device_id, connection) in connections.iter() {
-            if connection.user_id == user_id && Some(*device_id) != except {
-                let _ = connection.sender.try_send(event.clone());
-            }
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|device_id, connection| {
+                connection.user_id != user_id
+                    || Some(*device_id) == except
+                    || connection.deliver(event.clone())
+            });
     }
 
     /// Number of connected devices.
@@ -255,14 +297,49 @@ mod tests {
         assert_eq!(registry.connected(), 0);
     }
 
+    /// An event that finds the queue full is not dropped in silence: the
+    /// connection is let go, after the events it holds, and knows why.
     #[test]
-    fn a_full_queue_drops_events_instead_of_blocking() {
+    fn a_full_queue_lets_the_connection_go_instead_of_dropping_events() {
         let registry = Registry::default();
         let (user, device) = (Uuid::from_u128(1), Uuid::from_u128(11));
-        let _subscription = registry.connect(user, device);
+        let other = Uuid::from_u128(12);
+        let mut subscription = registry.connect(user, device);
+        let mut other_subscription = registry.connect(user, other);
 
-        for _ in 0..(QUEUE_LEN * 2) {
+        for _ in 0..EVENT_QUEUE_LEN {
             registry.notify_device(device, ADDED);
         }
+        assert_eq!(registry.connected(), 2);
+        assert!(!subscription.overflowed());
+        registry.notify_user(user, None, ADDED);
+        assert_eq!(registry.connected(), 1, "the full one is let go");
+        assert!(subscription.overflowed());
+        for _ in 0..EVENT_QUEUE_LEN {
+            assert_eq!(subscription.events.try_recv().unwrap(), ADDED);
+        }
+        assert_eq!(
+            subscription.events.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(other_subscription.events.try_recv().unwrap(), ADDED);
+        assert!(!other_subscription.overflowed());
+
+        // Through notify_device as well.
+        for _ in 0..=EVENT_QUEUE_LEN {
+            registry.notify_device(other, ADDED);
+        }
+        assert_eq!(registry.connected(), 0);
+        assert!(other_subscription.overflowed());
+    }
+
+    /// A replaced connection is not one that overflowed.
+    #[test]
+    fn a_replaced_connection_did_not_overflow() {
+        let registry = Registry::default();
+        let (user, device) = (Uuid::from_u128(1), Uuid::from_u128(11));
+        let first = registry.connect(user, device);
+        let _second = registry.connect(user, device);
+        assert!(!first.overflowed());
     }
 }

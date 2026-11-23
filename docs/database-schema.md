@@ -152,7 +152,11 @@ Profile fields added at M5 (`bio`, `custom_status`, `avatar_blob_id`, `banner_bl
 -- one-time package is left and kept until the device replaces it. A served
 -- one-time package keeps its row, without its bytes, until it expires: its
 -- reference stays taken, so that the same package sent again is never
--- stored nor served a second time. Public MLS data only: the private parts
+-- stored nor served a second time, and its leaf's encryption key: the
+-- server cannot read a group's first commit, but finds in its tree the leaf
+-- of the package that added each device, and checks that the Welcome is for
+-- exactly those packages (migration 0011; packages uploaded before have an
+-- empty key, and no first commit can add them). Public MLS data only: the private parts
 -- stay on the device. A revoked device's packages are deleted with its
 -- revocation.
 CREATE TABLE key_packages (
@@ -164,10 +168,12 @@ CREATE TABLE key_packages (
     expires_at   timestamptz NOT NULL,                       -- META  end of the KeyPackage's lifetime
     created_at   timestamptz NOT NULL DEFAULT now(),         -- META
     served_at    timestamptz,                                -- META  when a claim served it (one-time packages; migration 0009)
+    leaf_key     bytea NOT NULL,                             -- PUB   encryption key of the package's leaf, kept once served (migration 0011)
     CHECK (octet_length(key_package) <= 4096),
     CONSTRAINT key_packages_served CHECK (
         served_at IS NULL OR (NOT last_resort AND octet_length(key_package) = 0)
-    )
+    ),
+    CONSTRAINT key_packages_leaf_key CHECK (octet_length(leaf_key) <= 256)
 );
 -- A claim serves a device's oldest one-time package first.
 CREATE INDEX key_packages_device_idx ON key_packages (device_id, last_resort, created_at);

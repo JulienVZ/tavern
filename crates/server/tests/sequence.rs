@@ -19,15 +19,18 @@ mod common;
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use common::ws::{Received, Socket, connect, expect_frame, receive, send};
+use common::ws::{
+    Received, Socket, connect, expect_close, expect_frame, hello, open, receive, send,
+};
 use common::{Account, Device, TestApp};
+use openmls_memory_storage::MemoryStorage;
 use reqwest::Method;
 use tavern_crypto::identity::{ID_LEN, IdentityPublicKey};
 use tavern_crypto::mls::credential::for_device;
 use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::{
-    ClaimedKeyPackage, Commit, DeviceSigner, ExpectedGroup, Group, Incoming, Roster, ServerSigner,
-    VerifiedLeaf, key_package,
+    ClaimedKeyPackage, Commit, DeviceSigner, ExpectedGroup, Group, Incoming, Provider, Roster,
+    ServerSigner, VerifiedLeaf, key_package, padding,
 };
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
@@ -35,9 +38,14 @@ use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_protocol::rest::{
     Conversation, CreateDmRequest, KeyPackageClaim, KeyPackageCount, UploadKeyPackagesRequest,
 };
-use tavern_protocol::{GATEWAY_REQUEST_BURST, close_code};
+use tavern_protocol::{
+    GATEWAY_HELLOS_PER_MINUTE, GATEWAY_REQUEST_BURST, GATEWAY_SUBPROTOCOL,
+    MAX_APPLICATION_MESSAGE_BYTES, close_code,
+};
 use tavern_server::delivery::{self, Kind};
+use tavern_server::gateway::EVENT_QUEUE_LEN;
 use tavern_server::mls;
+use tavern_server::session::Session;
 use uuid::Uuid;
 
 /// The identity keys the clients of these tests trust.
@@ -492,6 +500,110 @@ async fn waiting_for(app: &TestApp, holder: i32, count: i64) {
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
         .expect("the requests never waited for the conversation");
+}
+
+/// Holds `device`'s read position in `conversation` (its row of
+/// `conversation_devices`) until the returned transaction ends, with its
+/// backend: the device's `AckMessages` waits meanwhile, and its connection
+/// with it.
+async fn hold_cursor(
+    app: &TestApp,
+    conversation: Uuid,
+    device: Uuid,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut tx = app.state.db.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT 1 FROM conversation_devices \
+         WHERE conversation_id = $1 AND device_id = $2 FOR UPDATE",
+    )
+    .bind(conversation)
+    .bind(device)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    (tx, pid)
+}
+
+/// A trigger that runs `body` (PL/pgSQL) after each row inserted into
+/// `table` for `conversation`, and for no other: the tests share one
+/// database. It makes a request fail, or wait, at a precise point.
+struct Trigger {
+    name: String,
+    table: &'static str,
+}
+
+impl Trigger {
+    async fn install(app: &TestApp, table: &'static str, conversation: Uuid, body: &str) -> Self {
+        let name = format!("test_{}", Uuid::new_v4().simple());
+        // Built from a random name, a table and a body of this file, and a
+        // UUID: nothing from outside.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN {body} RETURN NULL; END $$; \
+             CREATE TRIGGER {name} AFTER INSERT ON {table} FOR EACH ROW \
+             WHEN (NEW.conversation_id = '{conversation}') EXECUTE FUNCTION {name}();"
+        )))
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+        Self { name, table }
+    }
+
+    async fn remove(self, app: &TestApp) {
+        let Self { name, table } = self;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER {name} ON {table}; DROP FUNCTION {name}();"
+        )))
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    }
+}
+
+/// The session of `device`, to call the server's handlers directly: two
+/// requests of one device at once, which one connection never sends.
+fn session(account: &Account, device: &Device) -> Session {
+    Session {
+        user_id: account.user_id,
+        device_id: device.device_id,
+        is_admin: false,
+    }
+}
+
+async fn last_seq(app: &TestApp, conversation: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT last_seq FROM conversations WHERE id = $1")
+        .bind(conversation)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap()
+}
+
+async fn group_epoch(app: &TestApp, conversation: Uuid) -> Option<i64> {
+    sqlx::query_scalar("SELECT epoch FROM mls_groups WHERE conversation_id = $1")
+        .bind(conversation)
+        .fetch_optional(&app.state.db)
+        .await
+        .unwrap()
+}
+
+async fn welcomes_of(app: &TestApp, conversation: Uuid) -> Vec<(Uuid, Uuid)> {
+    sqlx::query_as(
+        "SELECT id, recipient_device_id FROM welcomes WHERE conversation_id = $1 ORDER BY id",
+    )
+    .bind(conversation)
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap()
+}
+
+fn group_info_request(dm: &Dm) -> ClientPayload {
+    ClientPayload::FetchGroupInfo(proto::FetchGroupInfo {
+        conversation_id: dm.conversation.as_bytes().to_vec(),
+    })
 }
 
 /// Alice and Bob's DM, its group created by Alice's first device with Bob's
@@ -951,6 +1063,11 @@ async fn a_read_only_dm_takes_nothing_new_and_never_discloses_a_block() {
     let (alice, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
     let alice2 = app.enrol(&alice).await;
     let mut alice2 = Member::connect(&app, alice2).await;
+    // Read while they were friends: an external commit is tried below.
+    let answer = alice2.request(group_info_request(&dm)).await;
+    let ServerPayload::GroupInfo(info) = answer else {
+        panic!("{answer:?}");
+    };
     let status = app
         .status::<()>(
             Method::PUT,
@@ -969,15 +1086,19 @@ async fn a_read_only_dm_takes_nothing_new_and_never_discloses_a_block() {
     let id = bob1.send_message(&dm, Uuid::new_v4(), message).await;
     assert_eq!(code(&bob1.answer(id).await), proto::ErrorCode::Blocked);
 
-    // A new leaf: refused, though the GroupInfo may be read.
-    let answer = alice2
-        .request(ClientPayload::FetchGroupInfo(proto::FetchGroupInfo {
-            conversation_id: dm.conversation.as_bytes().to_vec(),
-        }))
-        .await;
-    let ServerPayload::GroupInfo(info) = answer else {
-        panic!("{answer:?}");
-    };
+    // The GroupInfo: refused, the same way; its tree would tell Alice of
+    // every change of Bob's devices.
+    assert_eq!(
+        error_text(&alice2.request(group_info_request(&dm)).await),
+        while_blocked,
+        "the same answer"
+    );
+    assert_eq!(
+        code(&bob1.request(group_info_request(&dm)).await),
+        proto::ErrorCode::Blocked
+    );
+
+    // A new leaf: refused, the same way.
     let (_, commit, _) = Group::join_by_external_commit(
         &alice2.device.provider,
         &DeviceSigner::new(&alice2.device.key),
@@ -1014,6 +1135,15 @@ async fn a_read_only_dm_takes_nothing_new_and_never_discloses_a_block() {
     let message = alice1.encrypt(b"still refused");
     let id = alice1.send_message(&dm, Uuid::new_v4(), message).await;
     assert_eq!(error_text(&alice1.answer(id).await), while_blocked);
+    // Ex-friends, neither blocking: NOT_FRIENDS for both.
+    assert_eq!(
+        error_text(&alice2.request(group_info_request(&dm)).await),
+        while_blocked
+    );
+    assert_eq!(
+        error_text(&bob1.request(group_info_request(&dm)).await),
+        while_blocked
+    );
 
     // Bob's device saw the update, and nothing of what was refused.
     let ServerPayload::CommitEvent(event) = bob1.event().await else {
@@ -1260,4 +1390,744 @@ async fn requests_from_outside_or_malformed_are_refused() {
             proto::ErrorCode::InvalidArgument
         );
     }
+}
+
+/// Section 8: the largest content, 64 KiB padded, goes through and is read;
+/// the client refuses a larger one, and the server any application message
+/// beyond its limit, before reading it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn the_largest_message_goes_through_and_one_byte_more_does_not() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    let largest = vec![0x61; padding::MAX_CONTENT];
+    let message = alice1.encrypt(&largest);
+    assert!(message.len() > padding::BUCKETS[padding::BUCKETS.len() - 1]);
+    assert!(message.len() <= MAX_APPLICATION_MESSAGE_BYTES);
+    let id = alice1
+        .send_message(&dm, Uuid::new_v4(), message.clone())
+        .await;
+    let ack = message_ack(&alice1.answer(id).await);
+    assert_eq!(bob1.receive_text(&dm).await, (ack.seq, largest));
+
+    let too_long = {
+        let Member { group, device, .. } = &mut alice1;
+        group.as_mut().unwrap().encrypt(
+            &device.provider,
+            &DeviceSigner::new(&device.key),
+            &vec![0x61; padding::MAX_CONTENT + 1],
+        )
+    };
+    assert!(too_long.is_err(), "beyond the largest bucket");
+
+    let mut over = message;
+    over.resize(MAX_APPLICATION_MESSAGE_BYTES + 1, 0);
+    let id = alice1.send_message(&dm, Uuid::new_v4(), over.clone()).await;
+    assert_eq!(
+        code(&alice1.answer(id).await),
+        proto::ErrorCode::PayloadTooLarge
+    );
+    // At the limit, the size passes; what follows the message does not.
+    over.truncate(MAX_APPLICATION_MESSAGE_BYTES);
+    let id = alice1.send_message(&dm, Uuid::new_v4(), over).await;
+    assert_eq!(
+        code(&alice1.answer(id).await),
+        proto::ErrorCode::InvalidArgument
+    );
+    assert_eq!(sequence(&app, dm.conversation).await, [(1, 2), (2, 1)]);
+}
+
+/// `protocol.md`, section 3: events are notifications. A device that does
+/// not keep up (its connection busy here, while more events than its queue
+/// holds arrive) is closed with 4009 once its queue is sent, instead of
+/// losing an event in silence; reconnected, it fetches what it missed.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_device_that_falls_behind_is_closed_and_misses_nothing() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    let (held, holder) = hold_cursor(&app, dm.conversation, bob1.device.device_id).await;
+    let ack_id = bob1
+        .send_request(ClientPayload::AckMessages(proto::AckMessages {
+            conversation_id: dm.conversation.as_bytes().to_vec(),
+            up_to_seq: 1,
+        }))
+        .await;
+    waiting_for(&app, holder, 1).await;
+
+    let texts: Vec<Vec<u8>> = (0..=EVENT_QUEUE_LEN)
+        .map(|i| format!("message {i}").into_bytes())
+        .collect();
+    for text in &texts {
+        let message = alice1.encrypt(text);
+        let id = alice1.send_message(&dm, Uuid::new_v4(), message).await;
+        message_ack(&alice1.answer(id).await);
+    }
+    held.commit().await.unwrap();
+
+    let mut pushed = Vec::new();
+    let closed = loop {
+        match receive(&mut bob1.socket).await {
+            Received::Frame(frame) => match frame.payload.unwrap() {
+                ServerPayload::Ack(_) => assert_eq!(frame.request_id, ack_id),
+                ServerPayload::MessageEvent(event) => pushed.push(event.message.unwrap()),
+                other => panic!("{other:?}"),
+            },
+            Received::Closed(code) => break code,
+        }
+    };
+    assert_eq!(closed, Some(close_code::EVENT_QUEUE_FULL));
+    let seqs: Vec<u64> = pushed.iter().map(|message| message.seq).collect();
+    let pushed_count = u64::try_from(EVENT_QUEUE_LEN).unwrap();
+    assert_eq!(seqs, (2..2 + pushed_count).collect::<Vec<u64>>());
+
+    let Member { device, group, .. } = bob1;
+    let mut bob1 = Member::connect(&app, device).await;
+    bob1.group = group;
+    let mut read = Vec::new();
+    for message in &pushed {
+        match bob1.process(&dm, &message.mls_message) {
+            Incoming::Application { content, .. } => read.push(content.expose().to_vec()),
+            other => panic!("{other:?}"),
+        }
+    }
+    let missed = bob1.fetch(&dm, *seqs.last().unwrap(), 0).await;
+    assert_eq!(missed.messages.len(), 1);
+    match bob1.process(&dm, &missed.messages[0].mls_message) {
+        Incoming::Application { content, .. } => read.push(content.expose().to_vec()),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(read, texts, "nothing lost");
+}
+
+/// `protocol.md`, section 3: events may arrive out of order (each request
+/// notifies after its own transaction). A device processes the sequence in
+/// the order of its numbers: given N+2 without N+1, it puts N+2 aside and
+/// fetches the gap. Here a commit and a message of its new epoch arrive the
+/// other way round.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn events_out_of_order_are_read_in_the_order_of_the_sequence() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    let commit = alice1.self_update(&dm);
+    let id = alice1.submit(&dm, 1, commit, false).await;
+    assert_eq!(commit_ack(&alice1.answer(id).await).seq, 2);
+    alice1.merge();
+    let message = alice1.encrypt(b"after the commit");
+    let id = alice1.send_message(&dm, Uuid::new_v4(), message).await;
+    assert_eq!(message_ack(&alice1.answer(id).await).seq, 3);
+    let ServerPayload::CommitEvent(commit_event) = bob1.event().await else {
+        panic!("expected the commit");
+    };
+    let ServerPayload::MessageEvent(message_event) = bob1.event().await else {
+        panic!("expected the message");
+    };
+    let (first_seen, second_seen) = (
+        message_event.message.unwrap(),
+        commit_event.message.unwrap(),
+    );
+
+    // Processed as it comes, the message cannot be read: it is of an epoch
+    // the device has not reached.
+    {
+        let Member { group, device, .. } = &mut bob1;
+        let early =
+            group
+                .as_mut()
+                .unwrap()
+                .process(&device.provider, &first_seen.mls_message, &dm.keys);
+        assert!(early.is_err());
+    }
+    // The contract: the device has read up to 1, so 3 waits, and the gap is
+    // fetched; the sequence comes back in order.
+    let read = 1;
+    assert!(first_seen.seq > read + 1);
+    let gap = bob1.fetch(&dm, read, 0).await;
+    let seqs: Vec<u64> = gap.messages.iter().map(|message| message.seq).collect();
+    assert_eq!(seqs, [2, 3]);
+    assert_eq!(gap.messages[0], second_seen);
+    assert!(matches!(
+        bob1.process(&dm, &gap.messages[0].mls_message),
+        Incoming::Commit { .. }
+    ));
+    match bob1.process(&dm, &first_seen.mls_message) {
+        Incoming::Application { content, .. } => assert_eq!(content.expose(), b"after the commit"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `protocol.md`, section 7: the limit on requests is the device's, across
+/// its connections, so that reconnecting gives no new budget; and a device
+/// may say `Hello` 10 times a minute.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn reconnecting_gives_no_new_budget_and_hellos_are_limited() {
+    let app = TestApp::spawn().await;
+    let (_, device) = app.account_with_device("sq", false).await;
+    let (mut socket, _) = connect(&app, &device).await;
+    let burst = u64::from(GATEWAY_REQUEST_BURST);
+    for id in 2..2 + burst {
+        send(
+            &mut socket,
+            id,
+            ClientPayload::Heartbeat(proto::Heartbeat {}),
+        )
+        .await;
+    }
+    let mut answered = 0;
+    while answered < burst {
+        let frame = expect_frame(&mut socket).await;
+        assert!(
+            matches!(frame.payload, Some(ServerPayload::HeartbeatAck(_))),
+            "{frame:?}"
+        );
+        answered += 1;
+    }
+    drop(socket);
+
+    let (mut socket, _) = connect(&app, &device).await;
+    for id in 2..5 {
+        send(
+            &mut socket,
+            id,
+            ClientPayload::Heartbeat(proto::Heartbeat {}),
+        )
+        .await;
+    }
+    let mut limited = 0;
+    for _ in 2..5 {
+        if let Some(ServerPayload::Error(error)) = expect_frame(&mut socket).await.payload {
+            assert_eq!(error.code(), proto::ErrorCode::RateLimited);
+            limited += 1;
+        }
+    }
+    assert!(limited >= 1, "the new connection has no new budget");
+    drop(socket);
+
+    // Two Hellos so far: the next ones are answered up to the limit (one
+    // more, if the minute's budget grew meanwhile), then refused.
+    let mut hellos = 2;
+    let refused = loop {
+        let mut socket = open(&app, Some(GATEWAY_SUBPROTOCOL)).await.unwrap();
+        send(&mut socket, 1, hello(&device.session_token)).await;
+        let frame = expect_frame(&mut socket).await;
+        match frame.payload {
+            Some(ServerPayload::Ready(_)) => hellos += 1,
+            Some(ServerPayload::Error(error)) => {
+                assert_eq!(frame.request_id, 1);
+                break (error, expect_close(&mut socket).await);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(hellos <= GATEWAY_HELLOS_PER_MINUTE + 1, "never refused");
+    };
+    assert!(hellos >= GATEWAY_HELLOS_PER_MINUTE, "{hellos}");
+    assert_eq!(refused.0.code(), proto::ErrorCode::RateLimited);
+    assert!(refused.0.retry_after_ms > 0);
+    assert_eq!(refused.1, Some(close_code::RATE_LIMITED));
+}
+
+/// A second DM of Alice's first device, with Carol, and its group (Carol's
+/// device joins later, if ever): the group as Alice's device keeps it.
+async fn second_dm(app: &TestApp, alice: &Account, alice1: &Member) -> (Dm, Group) {
+    let carol = app.register("sq", false).await;
+    let dm = dm_between(app, (alice, &alice1.device), &carol).await;
+    let carol1 = app.enrol(&carol).await;
+    upload(app, &carol1, 3).await;
+    let claimed = claim(app, &alice1.device, &carol, &dm.keys).await;
+    let device = &alice1.device;
+    let (mut group, commit) = Group::create(
+        &device.provider,
+        &DeviceSigner::new(&device.key),
+        for_device(&device.certificate, &device.key.public()),
+        &dm.expected(),
+        &dm.external_sender,
+        &claimed,
+        &dm.keys,
+    )
+    .unwrap();
+    let acked = delivery::submit_commit(
+        &app.state,
+        &session(alice, device),
+        proto::SubmitCommit {
+            conversation_id: dm.conversation.as_bytes().to_vec(),
+            epoch: 0,
+            mls_commit: commit.commit,
+            mls_welcome: commit.welcome.unwrap_or_default(),
+            mls_group_info: commit.group_info,
+            external: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(acked.seq, 1);
+    group.merge_pending_commit(&device.provider).unwrap();
+    (dm, group)
+}
+
+/// Section 7: one `client_message_id` sent at once in two conversations,
+/// under two locks. The second request waits for the first's record, then
+/// gets INVALID_ARGUMENT, as when they come one after the other: never
+/// INTERNAL. It took a number, and gives it back.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn one_client_message_id_at_once_in_two_conversations() {
+    let app = TestApp::spawn_unlimited().await;
+    let (alice, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    let (other_dm, mut other_group) = second_dm(&app, &alice, &alice1).await;
+    let in_first = alice1.encrypt(b"first");
+    let in_other = other_group
+        .encrypt(
+            &alice1.device.provider,
+            &DeviceSigner::new(&alice1.device.key),
+            b"other",
+        )
+        .unwrap();
+    let id = Uuid::new_v4();
+
+    // The first request records the id, then waits for this gate before it
+    // commits.
+    let mut gate = app.state.db.begin().await.unwrap();
+    let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+    let key: i64 = rand_key();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let trigger = Trigger::install(
+        &app,
+        "sent_messages",
+        dm.conversation,
+        &format!("PERFORM pg_advisory_xact_lock({key});"),
+    )
+    .await;
+    let send = |conversation: Uuid, message: Vec<u8>| {
+        let (state, session) = (app.state.clone(), session(&alice, &alice1.device));
+        tokio::spawn(async move {
+            delivery::send_message(
+                &state,
+                &session,
+                proto::SendMessage {
+                    conversation_id: conversation.as_bytes().to_vec(),
+                    client_message_id: id.as_bytes().to_vec(),
+                    mls_message: message,
+                },
+            )
+            .await
+        })
+    };
+    let first = send(dm.conversation, in_first);
+    waiting_for(&app, gate_pid, 1).await;
+    let second = send(other_dm.conversation, in_other);
+    waiting_for(&app, gate_pid, 2).await;
+    gate.commit().await.unwrap();
+
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(first.seq, 2);
+    let refused = second.await.unwrap().unwrap_err();
+    assert_eq!(
+        (refused.code, refused.message),
+        (
+            proto::ErrorCode::InvalidArgument,
+            "this client message id was used elsewhere"
+        )
+    );
+    assert_eq!(sequence(&app, other_dm.conversation).await, [(1, 2)]);
+    assert_eq!(last_seq(&app, other_dm.conversation).await, 1, "given back");
+    assert_eq!(bob1.receive_text(&dm).await, (2, b"first".to_vec()));
+    trigger.remove(&app).await;
+}
+
+fn rand_key() -> i64 {
+    i64::from_be_bytes(Uuid::new_v4().as_bytes()[..8].try_into().unwrap())
+}
+
+/// Section 7: the same message sent twice at once (a device that resends
+/// while its first try is still in flight): both wait for the conversation;
+/// one stores it, the other gets its acknowledgement; delivered once.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_message_sent_twice_at_once_is_stored_once() {
+    let app = TestApp::spawn_unlimited().await;
+    let (alice, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    let request = proto::SendMessage {
+        conversation_id: dm.conversation.as_bytes().to_vec(),
+        client_message_id: Uuid::new_v4().as_bytes().to_vec(),
+        mls_message: alice1.encrypt(b"twice"),
+    };
+    let (held, holder) = hold(&app, dm.conversation).await;
+    let tries: Vec<_> = (0..2)
+        .map(|_| {
+            let (state, session) = (app.state.clone(), session(&alice, &alice1.device));
+            let request = request.clone();
+            tokio::spawn(async move { delivery::send_message(&state, &session, request).await })
+        })
+        .collect();
+    waiting_for(&app, holder, 2).await;
+    held.commit().await.unwrap();
+    let mut acks = Vec::new();
+    for task in tries {
+        acks.push(task.await.unwrap().unwrap());
+    }
+    assert_eq!(acks[0], acks[1], "one acknowledgement");
+    assert_eq!(acks[0].seq, 2);
+    assert_eq!(sequence(&app, dm.conversation).await, [(1, 2), (2, 1)]);
+    assert_eq!(bob1.receive_text(&dm).await, (2, b"twice".to_vec()));
+    bob1.nothing_waiting().await;
+}
+
+/// The maintainer's requirement for task 8, on real requests: one that
+/// fails after it took its number (here a write that follows it fails)
+/// takes it back with everything else, and the next one gets it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_request_that_fails_after_taking_a_number_gives_it_back() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, bob, mut bob1, dm) = group_of_two(&app).await;
+
+    // A message: its idempotency record cannot be written.
+    let trigger = Trigger::install(
+        &app,
+        "sent_messages",
+        dm.conversation,
+        "RAISE EXCEPTION 'injected failure';",
+    )
+    .await;
+    let id = Uuid::new_v4();
+    let message = alice1.encrypt(b"after a failure");
+    let request = alice1.send_message(&dm, id, message.clone()).await;
+    assert_eq!(
+        code(&alice1.answer(request).await),
+        proto::ErrorCode::Internal
+    );
+    assert_eq!(last_seq(&app, dm.conversation).await, 1);
+    assert_eq!(sequence(&app, dm.conversation).await, [(1, 2)]);
+    trigger.remove(&app).await;
+    let request = alice1.send_message(&dm, id, message).await;
+    assert_eq!(message_ack(&alice1.answer(request).await).seq, 2);
+    assert_eq!(
+        bob1.receive_text(&dm).await,
+        (2, b"after a failure".to_vec())
+    );
+    bob1.nothing_waiting().await;
+
+    // A commit adding a device: its Welcome cannot be written.
+    let bob2 = app.enrol(&bob).await;
+    upload(&app, &bob2, 3).await;
+    let for_bob2: Vec<ClaimedKeyPackage> = claim(&app, &alice1.device, &bob, &dm.keys)
+        .await
+        .into_iter()
+        .filter(|package| {
+            package.device().map(|device| device.device_id) == Some(*bob2.device_id.as_bytes())
+        })
+        .collect();
+    let mut bob2 = Member::connect(&app, bob2).await;
+    let commit = add(&mut alice1, &dm, &for_bob2);
+    let routed_before = routed(&app, dm.conversation).await;
+    let trigger = Trigger::install(
+        &app,
+        "welcomes",
+        dm.conversation,
+        "RAISE EXCEPTION 'injected failure';",
+    )
+    .await;
+    let request = alice1.submit(&dm, 1, commit.clone(), false).await;
+    assert_eq!(
+        code(&alice1.answer(request).await),
+        proto::ErrorCode::Internal
+    );
+    assert_eq!(last_seq(&app, dm.conversation).await, 2);
+    assert_eq!(sequence(&app, dm.conversation).await, [(1, 2), (2, 1)]);
+    assert_eq!(group_epoch(&app, dm.conversation).await, Some(1));
+    assert_eq!(routed(&app, dm.conversation).await, routed_before);
+    assert_eq!(
+        welcomes_of(&app, dm.conversation).await.len(),
+        1,
+        "Bob's first"
+    );
+    bob1.nothing_waiting().await;
+    bob2.nothing_waiting().await;
+    trigger.remove(&app).await;
+    let request = alice1.submit(&dm, 1, commit, false).await;
+    let ack = alice1.answer(request).await;
+    assert_eq!((commit_ack(&ack).seq, commit_ack(&ack).new_epoch), (3, 2));
+    alice1.merge();
+    bob2.join(&dm).await;
+    let ServerPayload::CommitEvent(event) = bob1.event().await else {
+        panic!("expected the commit");
+    };
+    assert_eq!(event.message.unwrap().seq, 3);
+}
+
+/// Alice's device adds `packages` to its group: the commit, not merged.
+fn add(alice1: &mut Member, dm: &Dm, packages: &[ClaimedKeyPackage]) -> Commit {
+    let Member { group, device, .. } = alice1;
+    group
+        .as_mut()
+        .unwrap()
+        .add(
+            &device.provider,
+            &DeviceSigner::new(&device.key),
+            packages,
+            &dm.keys,
+        )
+        .unwrap()
+}
+
+/// Section 4: what the server checks of a group's first commit, which it
+/// cannot process: a commit of this group at epoch 0, by the submitter,
+/// whose Welcome is for exactly the KeyPackages its tree shows added.
+/// Nothing refused is stored.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_first_commit_is_checked_for_what_can_be_checked() {
+    let app = TestApp::spawn_unlimited().await;
+    let (alice, mut alice1, _, _bob1, first_dm) = group_of_two(&app).await;
+    let carol = app.register("sq", false).await;
+    let dm = dm_between(&app, (&alice, &alice1.device), &carol).await;
+    let carol1 = app.enrol(&carol).await;
+    upload(&app, &carol1, 3).await;
+    let claimed = claim(&app, &alice1.device, &carol, &dm.keys).await;
+    let other_package = claim(&app, &alice1.device, &carol, &dm.keys).await;
+    let create = |packages: &[ClaimedKeyPackage], provider: &Provider<MemoryStorage>| {
+        let device = &alice1.device;
+        Group::create(
+            provider,
+            &DeviceSigner::new(&device.key),
+            for_device(&device.certificate, &device.key.public()),
+            &dm.expected(),
+            &dm.external_sender,
+            packages,
+            &dm.keys,
+        )
+        .unwrap()
+        .1
+    };
+    let commit = create(&claimed, &alice1.device.provider);
+    // The same group created with Carol's other package, elsewhere.
+    let other = create(&other_package, &Provider::new(MemoryStorage::default()));
+    let welcome = commit.welcome.clone().unwrap();
+    let of_the_first_dm = alice1.self_update(&first_dm).commit;
+    alice1.discard();
+
+    let alice_session = session(&alice, &alice1.device);
+    let submit = |mls_commit: Vec<u8>, mls_welcome: Vec<u8>| {
+        delivery::submit_commit(
+            &app.state,
+            &alice_session,
+            proto::SubmitCommit {
+                conversation_id: dm.conversation.as_bytes().to_vec(),
+                epoch: 0,
+                mls_commit,
+                mls_welcome,
+                mls_group_info: commit.group_info.clone(),
+                external: false,
+            },
+        )
+    };
+    let refused = [
+        (b"garbage".to_vec(), welcome.clone()),
+        (welcome.clone(), welcome.clone()),
+        (of_the_first_dm, welcome.clone()),
+        (forge_sender(&commit.commit, 1), welcome.clone()),
+        (commit.commit.clone(), Vec::new()),
+        (commit.commit.clone(), other.welcome.clone().unwrap()),
+        (commit.commit.clone(), commit.group_info.clone()),
+    ];
+    for (case, (mls_commit, mls_welcome)) in refused.into_iter().enumerate() {
+        let answer = submit(mls_commit, mls_welcome).await;
+        assert_eq!(
+            answer.map_err(|refused| refused.code),
+            Err(proto::ErrorCode::InvalidCommit),
+            "case {case}"
+        );
+    }
+    assert_eq!(group_epoch(&app, dm.conversation).await, None);
+    assert!(sequence(&app, dm.conversation).await.is_empty());
+    assert!(welcomes_of(&app, dm.conversation).await.is_empty());
+    assert!(routed(&app, dm.conversation).await.is_empty());
+
+    let acked = submit(commit.commit.clone(), welcome).await.unwrap();
+    assert_eq!((acked.seq, acked.new_epoch), (1, 1));
+    let welcomed: Vec<Uuid> = welcomes_of(&app, dm.conversation)
+        .await
+        .into_iter()
+        .map(|(_, device)| device)
+        .collect();
+    assert_eq!(welcomed, [carol1.device_id]);
+}
+
+/// `commit` (an MLS `PublicMessage`) claiming to be from leaf `index`: its
+/// signature no longer matches, which the server cannot check for a first
+/// commit, but its framing still does. RFC 9420: version and wire format
+/// (2 bytes each), the group id (a one-byte length here, then its bytes),
+/// the epoch (8 bytes), the sender's type (1 byte) and leaf index (4 bytes).
+fn forge_sender(commit: &[u8], index: u32) -> Vec<u8> {
+    let length = usize::from(commit[4]);
+    assert!(length < 0x40, "a one-byte length");
+    let at = 4 + 1 + length + 8;
+    assert_eq!(commit[at], 1, "a member sender");
+    let mut forged = commit.to_vec();
+    forged[at + 1..at + 5].copy_from_slice(&index.to_be_bytes());
+    forged
+}
+
+/// Sections 4 and 7: a member's commit is refused when its Welcome is not
+/// for exactly the KeyPackages it adds (none, or another's), when it comes
+/// with a Welcome and adds no one, and when it is for an epoch the group
+/// has not reached. Nothing refused is stored.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_member_commit_whose_welcome_or_epoch_does_not_fit_is_refused() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, bob, mut bob1, dm) = group_of_two(&app).await;
+    let bob2 = app.enrol(&bob).await;
+    let bob3 = app.enrol(&bob).await;
+    upload(&app, &bob2, 3).await;
+    upload(&app, &bob3, 3).await;
+    let claimed = claim(&app, &alice1.device, &bob, &dm.keys).await;
+    let of = |device: &Device| -> Vec<ClaimedKeyPackage> {
+        claimed
+            .iter()
+            .filter(|package| {
+                package.device().map(|leaf| leaf.device_id) == Some(*device.device_id.as_bytes())
+            })
+            .cloned()
+            .collect()
+    };
+    let (for_bob2, for_bob3) = (of(&bob2), of(&bob3));
+    let welcome_for_bob3 = add(&mut alice1, &dm, &for_bob3).welcome.unwrap();
+    alice1.discard();
+    let adding_bob2 = add(&mut alice1, &dm, &for_bob2);
+
+    let mut refused = Vec::new();
+    for welcome in [Vec::new(), welcome_for_bob3] {
+        let id = alice1
+            .submit(
+                &dm,
+                1,
+                Commit {
+                    welcome: Some(welcome),
+                    ..adding_bob2.clone()
+                },
+                false,
+            )
+            .await;
+        refused.push(alice1.answer(id).await);
+    }
+    alice1.discard();
+    let update = alice1.self_update(&dm);
+    let id = alice1
+        .submit(
+            &dm,
+            1,
+            Commit {
+                welcome: Some(adding_bob2.welcome.clone().unwrap()),
+                ..update.clone()
+            },
+            false,
+        )
+        .await;
+    refused.push(alice1.answer(id).await);
+    // Announced for the next epoch, then built for it.
+    let id = alice1.submit(&dm, 2, update, false).await;
+    refused.push(alice1.answer(id).await);
+    alice1.merge();
+    let ahead = alice1.self_update(&dm);
+    let id = alice1.submit(&dm, 2, ahead.clone(), false).await;
+    refused.push(alice1.answer(id).await);
+    let id = alice1.submit(&dm, 1, ahead, false).await;
+    refused.push(alice1.answer(id).await);
+
+    for answer in &refused {
+        assert_eq!(code(answer), proto::ErrorCode::InvalidCommit, "{answer:?}");
+    }
+    assert_eq!(group_epoch(&app, dm.conversation).await, Some(1));
+    assert_eq!(sequence(&app, dm.conversation).await, [(1, 2)]);
+    assert_eq!(welcomes_of(&app, dm.conversation).await.len(), 1);
+    bob1.nothing_waiting().await;
+}
+
+/// A device's read position never moves past what it may read, nor back;
+/// a device acknowledges its own Welcomes only.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn acknowledgements_stay_within_what_the_device_may_read() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, bob, mut bob1, dm) = group_of_two(&app).await;
+    let message = alice1.encrypt(b"two");
+    let id = alice1.send_message(&dm, Uuid::new_v4(), message).await;
+    message_ack(&alice1.answer(id).await);
+    bob1.receive_text(&dm).await;
+    let acked = |device: Uuid| {
+        let db = app.state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT acked_seq FROM conversation_devices \
+                 WHERE conversation_id = $1 AND device_id = $2",
+            )
+            .bind(dm.conversation)
+            .bind(device)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    for up_to_seq in [1_000, 1] {
+        let answer = bob1
+            .request(ClientPayload::AckMessages(proto::AckMessages {
+                conversation_id: dm.conversation.as_bytes().to_vec(),
+                up_to_seq,
+            }))
+            .await;
+        assert!(matches!(answer, ServerPayload::Ack(_)), "{answer:?}");
+        assert_eq!(acked(bob1.device.device_id).await, 2, "after {up_to_seq}");
+    }
+    let message = alice1.encrypt(b"three");
+    let id = alice1.send_message(&dm, Uuid::new_v4(), message).await;
+    message_ack(&alice1.answer(id).await);
+    assert_eq!(bob1.receive_text(&dm).await, (3, b"three".to_vec()));
+    let unread = bob1.fetch(&dm, 2, 0).await;
+    assert_eq!(unread.messages.len(), 1, "still to acknowledge");
+
+    // Another device's Welcome: not found, and left as it is.
+    let bob2 = app.enrol(&bob).await;
+    upload(&app, &bob2, 3).await;
+    let for_bob2: Vec<ClaimedKeyPackage> = claim(&app, &alice1.device, &bob, &dm.keys)
+        .await
+        .into_iter()
+        .filter(|package| {
+            package.device().map(|device| device.device_id) == Some(*bob2.device_id.as_bytes())
+        })
+        .collect();
+    let commit = add(&mut alice1, &dm, &for_bob2);
+    let id = alice1.submit(&dm, 1, commit, false).await;
+    commit_ack(&alice1.answer(id).await);
+    alice1.merge();
+    let (welcome_id, _) = welcomes_of(&app, dm.conversation)
+        .await
+        .into_iter()
+        .find(|(_, device)| *device == bob2.device_id)
+        .unwrap();
+    let answer = bob1
+        .request(ClientPayload::AckWelcome(proto::AckWelcome {
+            welcome_id: welcome_id.as_bytes().to_vec(),
+        }))
+        .await;
+    assert_eq!(code(&answer), proto::ErrorCode::NotFound);
+    let still: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM acked_at))::bigint FROM welcomes WHERE id = $1",
+    )
+    .bind(welcome_id)
+    .fetch_optional(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(still, Some(None));
+    let mut bob2 = Member::connect(&app, bob2).await;
+    bob2.join(&dm).await;
 }

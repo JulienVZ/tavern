@@ -107,8 +107,8 @@ async fn a_client_counts_claims_and_checks_what_it_is_served() {
     )
     .unwrap();
     sqlx::query(
-        "INSERT INTO key_packages (device_id, key_package, reference, expires_at) \
-         VALUES ($1, $2, $3, now() + interval '30 days')",
+        "INSERT INTO key_packages (device_id, key_package, reference, leaf_key, expires_at) \
+         VALUES ($1, $2, $3, '', now() + interval '30 days')",
     )
     .bind(phone.device_id())
     .bind(key_package::to_bytes(&package).unwrap())

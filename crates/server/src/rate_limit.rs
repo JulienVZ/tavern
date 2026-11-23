@@ -4,8 +4,10 @@
 //!
 //! The authentication routes are limited per client address and per handle;
 //! KeyPackage claims per requesting user and per (requester, target) pair
-//! (ADR 0019, section 3); friend requests per requesting user (ADR 0020). Counters live in memory only, and start from zero
-//! when the server restarts. Client addresses are never logged or stored.
+//! (ADR 0019, section 3); friend requests per requesting user (ADR 0020);
+//! gateway requests and `Hello`s per device (`protocol.md`, section 7).
+//! Counters live in memory only, and start from zero when the server
+//! restarts. Client addresses are never logged or stored.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -22,6 +24,9 @@ use axum::response::Response;
 use governor::clock::{Clock, DefaultClock};
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use tavern_protocol::handle::Handle;
+use tavern_protocol::{
+    GATEWAY_HELLOS_PER_MINUTE, GATEWAY_REQUEST_BURST, GATEWAY_REQUESTS_PER_10_SECONDS,
+};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -44,6 +49,8 @@ pub struct RateLimits {
     pub claims: ClaimLimiter,
     /// Friend requests, per requesting user.
     pub friend_requests: HourlyLimit,
+    /// Gateway requests and `Hello`s, per device.
+    pub gateway: GatewayLimits,
 }
 
 impl std::fmt::Debug for RateLimits {
@@ -82,6 +89,7 @@ impl RateLimits {
             clock: DefaultClock::default(),
             claims: ClaimLimiter::new(claims),
             friend_requests: HourlyLimit::new(friend_requests_per_hour),
+            gateway: GatewayLimits::new(),
         }
     }
 
@@ -111,6 +119,53 @@ impl RateLimits {
     ) -> ApiError {
         let wait = not_until.wait_time_from(self.clock.now());
         ApiError::rate_limited(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1))
+    }
+}
+
+/// The gateway's limits, per device (`protocol.md`, section 7): its
+/// requests, 30 per 10 seconds with bursts of 60, and its `Hello`s, 10 a
+/// minute. Both are counted across the device's successive connections, so
+/// that reconnecting gives no new budget.
+pub struct GatewayLimits {
+    requests: DefaultKeyedRateLimiter<Uuid>,
+    hellos: DefaultKeyedRateLimiter<Uuid>,
+    clock: DefaultClock,
+}
+
+impl GatewayLimits {
+    fn new() -> Self {
+        let period =
+            Duration::from_millis(10_000 / u64::from(GATEWAY_REQUESTS_PER_10_SECONDS.max(1)));
+        let burst = NonZeroU32::new(GATEWAY_REQUEST_BURST).unwrap_or(NonZeroU32::MIN);
+        let requests = Quota::with_period(period)
+            .unwrap_or_else(|| Quota::per_second(NonZeroU32::MIN))
+            .allow_burst(burst);
+        Self {
+            requests: RateLimiter::keyed(requests),
+            hellos: RateLimiter::keyed(per_minute(GATEWAY_HELLOS_PER_MINUTE)),
+            clock: DefaultClock::default(),
+        }
+    }
+
+    /// Counts one request of `device`. If refused, how long until there is
+    /// room.
+    pub fn check_request(&self, device: Uuid) -> Result<(), Duration> {
+        self.check(&self.requests, device)
+    }
+
+    /// Counts one `Hello` of `device`. If refused, how long until there is
+    /// room.
+    pub fn check_hello(&self, device: Uuid) -> Result<(), Duration> {
+        self.check(&self.hellos, device)
+    }
+
+    fn check(&self, limiter: &DefaultKeyedRateLimiter<Uuid>, device: Uuid) -> Result<(), Duration> {
+        if limiter.len() > PRUNE_THRESHOLD {
+            limiter.retain_recent();
+        }
+        limiter
+            .check_key(&device)
+            .map_err(|not_until| not_until.wait_time_from(self.clock.now()))
     }
 }
 
@@ -488,5 +543,21 @@ mod tests {
         assert!(limits.check_handle(&alice).is_ok());
         assert!(limits.check_handle(&alice).is_err());
         assert!(limits.check_handle(&bob).is_ok());
+    }
+    #[test]
+    fn the_gateway_limits_count_each_device_whatever_its_connections() {
+        let limits = GatewayLimits::new();
+        let (device, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        for _ in 0..GATEWAY_REQUEST_BURST {
+            assert!(limits.check_request(device).is_ok());
+        }
+        assert!(limits.check_request(device).unwrap_err() > Duration::ZERO);
+        assert!(limits.check_request(other).is_ok());
+
+        for _ in 0..GATEWAY_HELLOS_PER_MINUTE {
+            assert!(limits.check_hello(device).is_ok());
+        }
+        assert!(limits.check_hello(device).unwrap_err() > Duration::ZERO);
+        assert!(limits.check_hello(other).is_ok());
     }
 }
