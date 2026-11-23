@@ -23,6 +23,7 @@ use openmls::prelude::{
     OpenMlsSignaturePublicKey, ProcessedMessageContent, ProposalStore, ProtocolMessage,
     PublicGroup, PublicProcessMessageError, Sender, SenderExtensionIndex, StagedCommit, Verifiable,
 };
+use openmls::treesync::EncryptionKey;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::public_storage::PublicStorageProvider;
 use openmls_traits::storage::CURRENT_VERSION;
@@ -75,6 +76,53 @@ pub fn application_header(bytes: &[u8]) -> Result<ApplicationHeader, MlsError> {
         group: GroupIdentity::from_group_id(message.group_id())?,
         epoch: message.epoch().as_u64(),
     })
+}
+
+/// Checks the framing of a group's first commit, which the server cannot
+/// check otherwise (it has no state of epoch 0, section 4): a
+/// `PublicMessage` carrying a commit, for `identity`'s group at epoch 0,
+/// from a member. Returns the committer's leaf index.
+pub fn first_commit_sender(bytes: &[u8], identity: GroupIdentity) -> Result<u32, MlsError> {
+    let (message, rest) =
+        MlsMessageIn::tls_deserialize_bytes(bytes).map_err(|_| MlsError::Malformed)?;
+    if !rest.is_empty() {
+        return Err(MlsError::Malformed);
+    }
+    let MlsMessageBodyIn::PublicMessage(message) = message.extract() else {
+        return Err(MlsError::Malformed);
+    };
+    if message.content_type() != ContentType::Commit
+        || *message.group_id() != identity.to_group_id()
+        || message.epoch().as_u64() != 0
+    {
+        return Err(MlsError::Malformed);
+    }
+    match message.sender() {
+        Sender::Member(index) => Ok(index.u32()),
+        _ => Err(MlsError::Malformed),
+    }
+}
+
+/// The KeyPackages a Welcome is for (their `KeyPackageRef`s, in clear in
+/// it), in order. Refused unless it is a Welcome of Tavern's ciphersuite,
+/// with nothing after it.
+pub fn welcome_key_packages(bytes: &[u8]) -> Result<Vec<Vec<u8>>, MlsError> {
+    let (message, rest) =
+        MlsMessageIn::tls_deserialize_bytes(bytes).map_err(|_| MlsError::Malformed)?;
+    if !rest.is_empty() {
+        return Err(MlsError::Malformed);
+    }
+    let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
+        return Err(MlsError::Malformed);
+    };
+    if welcome.ciphersuite() != super::CIPHERSUITE {
+        return Err(MlsError::Parameters);
+    }
+    Ok(welcome
+        .secrets()
+        .iter()
+        .map(|secret| secret.new_member().as_slice().to_vec())
+        .collect())
 }
 
 /// What a row holds. The numbers are stored: never change or reuse one.
@@ -535,6 +583,7 @@ pub struct ValidatedCommit {
     changes: MembershipChanges,
     removed: HashSet<LeafNodeIndex>,
     group_info: Vec<u8>,
+    added_key_packages: Vec<Vec<u8>>,
 }
 
 impl ValidatedCommit {
@@ -546,6 +595,12 @@ impl ValidatedCommit {
     /// The epoch the commit starts.
     pub fn epoch(&self) -> u64 {
         self.staged.epoch().as_u64()
+    }
+
+    /// The `KeyPackageRef`s of the KeyPackages the commit adds: the ones
+    /// its Welcome must be for, exactly.
+    pub fn added_key_packages(&self) -> &[Vec<u8>] {
+        &self.added_key_packages
     }
 }
 
@@ -788,6 +843,22 @@ impl PublicState {
             .collect()
     }
 
+    /// The devices in the group, each with the encryption key of its leaf:
+    /// for a device a commit just added, the key of the KeyPackage that
+    /// added it ([`UploadedKeyPackage::leaf_key`](super::key_package::UploadedKeyPackage)).
+    pub fn leaf_keys(&self) -> Vec<(VerifiedLeaf, Vec<u8>)> {
+        self.group
+            .members()
+            .filter_map(|member| {
+                let leaf = policy::member_leaf(&member)?;
+                let key = EncryptionKey::from(member.encryption_key)
+                    .tls_serialize_detached()
+                    .ok()?;
+                Some((leaf, key))
+            })
+            .collect()
+    }
+
     /// The leaf of a device, if it is in the group.
     pub fn leaf_of(&self, device: VerifiedLeaf) -> Option<LeafNodeIndex> {
         policy::named_leaves(self.group.members())
@@ -899,11 +970,22 @@ impl PublicState {
             return Err(MlsError::GroupInfo);
         }
 
+        let added_key_packages = staged
+            .add_proposals()
+            .map(|add| {
+                add.add_proposal()
+                    .key_package()
+                    .hash_ref(&self.crypto)
+                    .map(|reference| reference.as_slice().to_vec())
+                    .map_err(library)
+            })
+            .collect::<Result<_, _>>()?;
         Ok(ValidatedCommit {
             staged: *staged,
             changes,
             removed,
             group_info: group_info.to_vec(),
+            added_key_packages,
         })
     }
 

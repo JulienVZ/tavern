@@ -165,6 +165,11 @@ impl Roster for Uploader {
 pub struct UploadedKeyPackage {
     /// Its `KeyPackageRef`, the hash that names it.
     pub reference: Vec<u8>,
+    /// The encryption key of its leaf (TLS-encoded): the key the device's
+    /// leaf has in a group this package added it to, until the device
+    /// updates its leaf. It tells the server which package a group's first
+    /// commit added.
+    pub leaf_key: Vec<u8>,
     /// The end of its lifetime, in seconds since the Unix epoch.
     pub not_after: u64,
 }
@@ -193,6 +198,11 @@ pub fn validate_upload(
         .map_err(|error| KeyPackageError::Invalid(error.to_string()))?;
     Ok(UploadedKeyPackage {
         reference: reference.as_slice().to_vec(),
+        leaf_key: key_package
+            .leaf_node()
+            .encryption_key()
+            .tls_serialize_detached()
+            .map_err(|error| KeyPackageError::Invalid(error.to_string()))?,
         not_after: key_package.life_time().not_after(),
     })
 }

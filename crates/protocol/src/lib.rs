@@ -39,8 +39,9 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 /// - 2: `KeyPackagesLow`, and `Ready.key_packages_remaining` filled (M2);
 /// - 3: `FriendshipChanged` and `UserDevicesChanged` (M2, ADR 0020);
 /// - 4: `ConversationCreated` (M2);
-/// - 5: a conversation's sequence: commits, messages, welcomes, and the
-///   limit on requests per connection (M2, ADR 0019).
+/// - 5: a conversation's sequence: commits, messages, welcomes; the limits
+///   on requests and on `Hello`s per device; the close code 4009 when a
+///   device does not keep up with its events (M2, ADR 0019).
 pub const GATEWAY_MINOR_VERSION: u32 = 5;
 
 /// Largest number of notices one `AckSecurityNotices` frame may name.
@@ -97,23 +98,39 @@ pub mod close_code {
     pub const UNSUPPORTED_VERSION: u16 = 4005;
     /// Heartbeat timeout.
     pub const HEARTBEAT_TIMEOUT: u16 = 4006;
-    /// The connection kept exceeding the limit on requests.
+    /// The device kept exceeding the limit on requests, or connects too
+    /// often.
     pub const RATE_LIMITED: u16 = 4007;
     /// Malformed frame.
     pub const MALFORMED_FRAME: u16 = 4008;
+    /// The device did not keep up with the events pushed to it, and missed
+    /// some. It reconnects, then fetches the sequences it has not read:
+    /// events are notifications, the stored sequence is what counts.
+    pub const EVENT_QUEUE_FULL: u16 = 4009;
     /// The server failed while handling a frame of this connection (the
     /// standard WebSocket code). The client reconnects.
     pub const INTERNAL_ERROR: u16 = 1011;
 }
 
-/// Gateway requests a connection may send per 10 seconds, sustained.
+/// Gateway requests a device may send per 10 seconds, sustained, counted
+/// across its successive connections.
 pub const GATEWAY_REQUESTS_PER_10_SECONDS: u32 = 30;
 
-/// Gateway requests a connection may send at once, above the sustained rate.
+/// Gateway requests a device may send at once, above the sustained rate.
 pub const GATEWAY_REQUEST_BURST: u32 = 60;
 
-/// Largest MLS application message (ciphertext), in bytes.
-pub const MAX_APPLICATION_MESSAGE_BYTES: usize = 64 * 1024;
+/// `Hello`s a device may send per minute, which is also the burst: a device
+/// that reconnects does not get a new budget of requests, nor does it make
+/// the server authenticate it without end.
+pub const GATEWAY_HELLOS_PER_MINUTE: u32 = 10;
+
+/// Largest MLS application message (ciphertext), in bytes: the largest
+/// padding bucket of a message's content (64 KiB, ADR 0019, section 8),
+/// plus MLS's overhead, measured at 324 bytes (header, encrypted sender
+/// data, signature, AEAD tag, OpenMLS's padding to 256 bytes), with the rest
+/// of a KiB as margin. A test of `tavern-crypto` keeps at least 512 bytes of
+/// it.
+pub const MAX_APPLICATION_MESSAGE_BYTES: usize = 65 * 1024;
 
 /// Largest MLS commit, in bytes.
 pub const MAX_COMMIT_BYTES: usize = 256 * 1024;

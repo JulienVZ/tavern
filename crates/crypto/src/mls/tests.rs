@@ -618,6 +618,167 @@ fn key_packages_last_ninety_days_and_say_whether_they_are_last_resort() {
     }
 }
 
+/// Section 4: the server checks the framing of a group's first commit, the
+/// only check it can make without a state of epoch 0, and reads which
+/// KeyPackages a Welcome is for.
+#[test]
+fn the_server_reads_the_framing_of_a_first_commit_and_whom_its_welcome_is_for() {
+    let alice = Account::new(1);
+    let bob = Account::new(2);
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let joiner = bob.device(0xb1);
+    let package = joiner.key_package();
+    let claimed = claim(&joiner, &package, &pins);
+    let server = ExternalSenderKey::generate();
+    let (mut group, commit) = Group::create(
+        &creator.provider,
+        &creator.signer(),
+        creator.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[claimed],
+        &pins,
+    )
+    .unwrap();
+
+    let creator_leaf = group
+        .leaf_of(&creator.user_id, &creator.device_id)
+        .unwrap()
+        .u32();
+    assert_eq!(
+        first_commit_sender(&commit.commit, identity()).unwrap(),
+        creator_leaf
+    );
+    let other = GroupIdentity {
+        generation: 1,
+        ..identity()
+    };
+    assert!(matches!(
+        first_commit_sender(&commit.commit, other),
+        Err(MlsError::Malformed)
+    ));
+    let welcome = commit.welcome.unwrap();
+    assert!(matches!(
+        first_commit_sender(&welcome, identity()),
+        Err(MlsError::Malformed)
+    ));
+    let reference = package
+        .hash_ref(creator.provider.crypto())
+        .unwrap()
+        .as_slice()
+        .to_vec();
+    assert_eq!(welcome_key_packages(&welcome).unwrap(), [reference]);
+    assert!(matches!(
+        welcome_key_packages(&commit.commit),
+        Err(MlsError::Malformed)
+    ));
+
+    // A later commit is not a first one.
+    group.merge_pending_commit(&creator.provider).unwrap();
+    let update = group
+        .self_update(&creator.provider, &creator.signer(), &pins)
+        .unwrap();
+    assert!(matches!(
+        first_commit_sender(&update.commit, identity()),
+        Err(MlsError::Malformed)
+    ));
+}
+
+/// The server learns which KeyPackages a member's commit adds, which its
+/// Welcome must be for.
+#[test]
+fn a_validated_commit_names_the_key_packages_it_adds() {
+    let mut dm = Dm::new();
+    let state = public_state(&dm);
+    let bob3 = dm.bob.device(0xb3);
+    let package = bob3.key_package();
+    let claimed = claim(&bob3, &package, &dm.pins);
+    let pins = dm.pins.clone();
+    let commit = {
+        let device = &dm.devices[0];
+        dm.groups[0]
+            .add(&device.provider, &device.signer(), &[claimed], &pins)
+            .unwrap()
+    };
+    let mut roster = ServerRoster::of(&dm);
+    roster
+        .enrolled
+        .insert(bob3.leaf(), bob3.key.public().to_bytes().to_vec());
+    let validated = submit(
+        &state,
+        &dm.devices[0],
+        &commit.commit,
+        &commit.group_info,
+        &roster,
+    )
+    .unwrap();
+    let reference = package
+        .hash_ref(bob3.provider.crypto())
+        .unwrap()
+        .as_slice()
+        .to_vec();
+    assert_eq!(
+        validated.added_key_packages(),
+        std::slice::from_ref(&reference)
+    );
+    assert_eq!(
+        welcome_key_packages(&commit.welcome.unwrap()).unwrap(),
+        [reference]
+    );
+
+    // The leaf the package added has the key the server stored with it.
+    let uploaded = key_package::validate_upload(
+        &key_package::to_bytes(&package).unwrap(),
+        &uploader(&dm.bob, &bob3),
+        false,
+    )
+    .unwrap();
+    let mut state = state;
+    state
+        .merge(validated, &ServerSigner::new(&dm.server))
+        .unwrap();
+    let keys = state.leaf_keys();
+    assert_eq!(
+        keys.iter()
+            .find(|(leaf, _)| *leaf == bob3.leaf())
+            .map(|(_, key)| key),
+        Some(&uploaded.leaf_key)
+    );
+    let others: Vec<&Vec<u8>> = keys
+        .iter()
+        .filter(|(leaf, _)| *leaf != bob3.leaf())
+        .map(|(_, key)| key)
+        .collect();
+    assert_eq!(others.len(), 4);
+    assert!(!others.contains(&&uploaded.leaf_key));
+}
+
+/// Section 8: the largest content (64 KiB, padded) fits in the largest
+/// application message the server accepts, with the margin it documents
+/// above MLS's own overhead (measured at 324 bytes: header, encrypted
+/// sender data, signature, AEAD tag, OpenMLS's padding to 256 bytes).
+#[test]
+fn the_largest_content_fits_in_the_largest_message_with_a_margin() {
+    let dm = Dm::new();
+    let device = &dm.devices[0];
+    let mut group = dm.groups.into_iter().next().unwrap();
+    let message = group
+        .encrypt(
+            &device.provider,
+            &device.signer(),
+            &vec![0x42; padding::MAX_CONTENT],
+        )
+        .unwrap();
+    let largest_bucket = padding::BUCKETS[padding::BUCKETS.len() - 1];
+    assert!(message.len() > largest_bucket);
+    assert!(
+        message.len() + 512 <= tavern_protocol::MAX_APPLICATION_MESSAGE_BYTES,
+        "{} bytes: less than 512 bytes of margin left",
+        message.len()
+    );
+}
+
 /// The server reads an application message's group and epoch before it
 /// sequences it, and nothing that is not an application message.
 #[test]

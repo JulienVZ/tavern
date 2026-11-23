@@ -159,7 +159,7 @@ pub(crate) fn check_standalone(queued: &QueuedProposal) -> Result<(), PolicyErro
     }
 }
 
-fn member_leaf(member: &Member) -> Option<VerifiedLeaf> {
+pub(crate) fn member_leaf(member: &Member) -> Option<VerifiedLeaf> {
     name_leaf(&member.credential)
 }
 
