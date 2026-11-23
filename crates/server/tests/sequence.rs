@@ -16,7 +16,7 @@
 
 mod common;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use common::ws::{
@@ -183,6 +183,18 @@ struct Member {
     next_request: u64,
     events: VecDeque<ServerPayload>,
     group: Option<Group>,
+    /// The Welcomes it acknowledged. A Welcome may arrive twice, pushed
+    /// and sent again at connection (`protocol.md`, section 3): like a
+    /// client, the device goes by its id.
+    acked_welcomes: HashSet<Vec<u8>>,
+}
+
+impl Member {
+    /// Whether `event` is a Welcome this device already acknowledged.
+    fn seen(&self, event: &ServerPayload) -> bool {
+        matches!(event, ServerPayload::WelcomeEvent(welcome)
+            if self.acked_welcomes.contains(&welcome.welcome_id))
+    }
 }
 
 impl Member {
@@ -194,6 +206,7 @@ impl Member {
             next_request: 1,
             events: VecDeque::new(),
             group: None,
+            acked_welcomes: HashSet::new(),
         }
     }
 
@@ -238,6 +251,7 @@ impl Member {
                 | ServerPayload::UserDevicesChanged(_)
                 | ServerPayload::DeviceListChanged(_)
                 | ServerPayload::KeyPackagesLow(_) => {}
+                event if self.seen(&event) => {}
                 event => return event,
             }
         }
@@ -252,13 +266,14 @@ impl Member {
         assert!(matches!(answer, ServerPayload::HeartbeatAck(_)));
         while let Some(event) = self.events.pop_front() {
             assert!(
-                matches!(
-                    event,
-                    ServerPayload::FriendshipChanged(_)
-                        | ServerPayload::UserDevicesChanged(_)
-                        | ServerPayload::DeviceListChanged(_)
-                        | ServerPayload::KeyPackagesLow(_)
-                ),
+                self.seen(&event)
+                    || matches!(
+                        event,
+                        ServerPayload::FriendshipChanged(_)
+                            | ServerPayload::UserDevicesChanged(_)
+                            | ServerPayload::DeviceListChanged(_)
+                            | ServerPayload::KeyPackagesLow(_)
+                    ),
                 "unexpected {event:?}"
             );
         }
@@ -369,10 +384,11 @@ impl Member {
         self.group = Some(joined.group);
         let ack = self
             .request(ClientPayload::AckWelcome(proto::AckWelcome {
-                welcome_id: welcome.welcome_id,
+                welcome_id: welcome.welcome_id.clone(),
             }))
             .await;
         assert!(matches!(ack, ServerPayload::Ack(_)), "{ack:?}");
+        self.acked_welcomes.insert(welcome.welcome_id);
     }
 
     /// The next application message, decrypted: its sequence number and
@@ -1471,6 +1487,7 @@ async fn a_device_that_falls_behind_is_closed_and_misses_nothing() {
             Received::Frame(frame) => match frame.payload.unwrap() {
                 ServerPayload::Ack(_) => assert_eq!(frame.request_id, ack_id),
                 ServerPayload::MessageEvent(event) => pushed.push(event.message.unwrap()),
+                other if bob1.seen(&other) => {}
                 other => panic!("{other:?}"),
             },
             Received::Closed(code) => break code,
