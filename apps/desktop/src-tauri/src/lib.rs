@@ -149,6 +149,9 @@ struct SecurityNoticeView {
     notice_id: Uuid,
     kind: &'static str,
     created_at_ms: u64,
+    /// `instance_restored` only, when the instance knows the backup's date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_taken_at_ms: Option<u64>,
 }
 
 impl From<SecurityNotice> for SecurityNoticeView {
@@ -161,9 +164,11 @@ impl From<SecurityNotice> for SecurityNoticeView {
                 SecurityNoticeKind::AccountRecovered => "account_recovered",
                 SecurityNoticeKind::DeviceRevoked => "device_revoked",
                 SecurityNoticeKind::RecoveryKeyReplaced => "recovery_key_replaced",
+                SecurityNoticeKind::InstanceRestored => "instance_restored",
                 SecurityNoticeKind::Other => "other",
             },
             created_at_ms: notice.created_at_ms,
+            backup_taken_at_ms: notice.backup_taken_at_ms,
         }
     }
 }
@@ -199,9 +204,12 @@ impl GatewayView {
     /// conversations are not shown before the interface of M2's task 12.
     fn of(event: GatewayEvent) -> Option<Self> {
         Some(match event {
+            // The instance generation is for the recreation of groups, from
+            // M2's tasks 10 and 11.
             GatewayEvent::Connected {
                 new_devices,
                 security_notices,
+                instance_generation: _,
             } => Self::Connected {
                 new_devices: new_devices
                     .into_iter()
@@ -753,6 +761,7 @@ mod tests {
             json(GatewayEvent::Connected {
                 new_devices: Vec::new(),
                 security_notices: Vec::new(),
+                instance_generation: 3,
             }),
             r#"{"type":"connected","newDevices":[],"securityNotices":[]}"#
         );
@@ -761,9 +770,21 @@ mod tests {
                 notice_id: id,
                 kind: SecurityNoticeKind::RecoveryKeyReplaced,
                 created_at_ms: 5,
+                backup_taken_at_ms: None,
             })),
             format!(
                 r#"{{"type":"security_notice","notice":{{"noticeId":"{id}","kind":"recovery_key_replaced","createdAtMs":5}}}}"#
+            )
+        );
+        assert_eq!(
+            json(GatewayEvent::SecurityNotice(SecurityNotice {
+                notice_id: id,
+                kind: SecurityNoticeKind::InstanceRestored,
+                created_at_ms: 5,
+                backup_taken_at_ms: Some(2),
+            })),
+            format!(
+                r#"{{"type":"security_notice","notice":{{"noticeId":"{id}","kind":"instance_restored","createdAtMs":5,"backupTakenAtMs":2}}}}"#
             )
         );
     }

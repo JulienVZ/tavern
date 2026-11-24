@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use tavern_server::config::Config;
 use tavern_server::secrets::InstanceSecrets;
-use tavern_server::{AppState, Settings, app, db, panics, purge, routes, telemetry};
+use tavern_server::{AppState, Settings, app, db, panics, purge, restore, routes, telemetry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -89,6 +89,16 @@ async fn run() -> anyhow::Result<()> {
         tracing::warn!("database migrations are disabled");
     }
 
+    // Before serving anything: a database restored from a backup revokes
+    // every session first (ADR 0019, section 15).
+    let (start, marker) = restore::at_start(&pool, &config.data_dir)
+        .await
+        .context("cannot start on this database")?;
+    if start == restore::Start::Unchanged {
+        tracing::info!("the database was not restored since the last start");
+    }
+    let marker = restore::spawn_marker(pool.clone(), config.data_dir.clone(), marker);
+
     let state = AppState::new(
         pool.clone(),
         secrets,
@@ -120,6 +130,11 @@ async fn run() -> anyhow::Result<()> {
     .context("HTTP server failed")?;
 
     purge.abort();
+    marker.abort();
+    // The marker as the database is at the stop.
+    if let Err(error) = restore::record(&pool, &config.data_dir).await {
+        tracing::error!(%error, "cannot update the instance marker");
+    }
     pool.close().await;
     tracing::info!("shut down cleanly");
     Ok(())

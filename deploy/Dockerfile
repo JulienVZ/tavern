@@ -23,10 +23,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --profile server --locked --package tavern-server \
     && cp target/server/tavern-server /tavern-server
+# The server's data directory (TAVERN_DATA_DIR), owned by the runtime user:
+# a named volume mounted on it starts with this owner.
+RUN mkdir -p /data/tavern
 
 # Distroless: no shell, no package manager, runs as an unprivileged user.
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /tavern-server /usr/local/bin/tavern-server
+COPY --from=build --chown=65532:65532 /data/tavern /var/lib/tavern
 USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/tavern-server"]

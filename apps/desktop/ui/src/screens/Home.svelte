@@ -21,6 +21,16 @@
     signedOut(result.ok ? null : "ended.logout_unconfirmed");
   }
 
+  /** A notice's text; a restore's gives the date of the backup, if known. */
+  function noticeText(notice: SecurityNotice): string {
+    if (notice.kind === "instance_restored") {
+      return notice.backupTakenAtMs === undefined
+        ? t("notice.instance_restored_undated")
+        : t("notice.instance_restored", { backup: formatDate(notice.backupTakenAtMs) });
+    }
+    return t(`notice.${notice.kind}`, { date: formatDate(notice.createdAtMs) });
+  }
+
   async function acknowledgeDevices(): Promise<void> {
     error = null;
     const result = await guarded(() => api.ackNewDevices());
@@ -93,7 +103,7 @@
 
       {#each session.securityNotices as notice (notice.noticeId)}
         <section class="alert warn stack" role="alert">
-          <p>{t(`notice.${notice.kind}`, { date: formatDate(notice.createdAtMs) })}</p>
+          <p>{noticeText(notice)}</p>
           <div>
             <button type="button" onclick={() => acknowledgeNotice(notice)}>
               {t("notice.ack")}

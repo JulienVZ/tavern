@@ -3,10 +3,15 @@
 #
 # Backs up a Tavern instance into deploy/backups/tavern-<timestamp>.tar.gz:
 #   - db.dump       PostgreSQL dump (custom format)
+#   - taken_at      when the dump started (UTC), for the restore notice
 #   - .env          configuration AND instance secrets
 #   - Caddyfile, livekit.yaml
 #
 # The archive contains secrets. Store it encrypted and off the machine.
+#
+# The server's data volume (server-data) is left out on purpose: its marker
+# is what tells the server, after a restore, that the database went back in
+# time (docs/self-hosting.md, "Backups").
 #
 # .env holds the instance secrets: the OPAQUE server setup (without it no
 # password works any more), the MLS external sender key (without it the server
@@ -36,6 +41,9 @@ trap 'rm -rf "$work"' EXIT
 umask 077
 mkdir -p "$out_dir" "$work/$name"
 
+# Taken before the dump starts: what the dump holds is at least this
+# recent, so "messages sent after this date may be missing" holds.
+date -u +%Y-%m-%dT%H:%M:%SZ >"$work/$name/taken_at"
 echo "Dumping PostgreSQL..."
 docker compose exec -T postgres sh -c \
     'pg_dump --format=custom --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \

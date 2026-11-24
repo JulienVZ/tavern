@@ -158,7 +158,7 @@ cd deploy
 ./scripts/restore.sh backups/tavern-<timestamp>.tar.gz
 ```
 
-A backup contains the PostgreSQL dump, `.env` (configuration **and secrets**), `Caddyfile` and `livekit.yaml`. Encrypt it and copy it off the machine. The dump alone is not enough: without the matching `.env` the restored instance cannot be used.
+A backup contains the PostgreSQL dump, the date it was taken, `.env` (configuration **and secrets**), `Caddyfile` and `livekit.yaml`. Encrypt it and copy it off the machine. The dump alone is not enough: without the matching `.env` the restored instance cannot be used.
 
 What the secrets protect, and why they must be backed up together with the database:
 
@@ -170,11 +170,29 @@ What a backup does **not** contain: readable messages. The server only stores ci
 
 The database does hold, for each device, the server's part of the key of that device's local history ([ADR 0017](adr/0017-device-identity-and-sign-out.md)). It is useless on its own, but a device cannot open its local history without it. **Back up often:** after restoring a backup, devices enrolled since that backup are unknown to the instance. Their users must sign in again, and those devices start over as new devices, without their local history. Devices that existed at the time of the backup keep everything.
 
-What restoring does to users, once milestone M2 is complete (until then, restore only test instances; see [ADR 0019](adr/0019-mls-direct-messages.md), section 15):
+**Back up often**, at least daily, and keep the backups off the machine: a restore undoes everything done on the instance since the backup, and the more recent the backup, the less there is for your users to do again.
 
-- **Everyone signs in again.** The server revokes every session the first time it starts on the restored database. Each device must sign in again with the password, and the TOTP code if it is enabled, before it can do anything. This matters because the backup lists as active the devices that were revoked after it, a stolen one included: without the password, such a device can do nothing.
-- **Everyone is told.** After signing in, each user sees a notice with the date of the backup, asking them to check their list of devices and to **revoke again** those they had revoked since.
+What restoring does to users, once milestone M2 is complete (until then, restore only test instances; the clients recreate conversations from M2's tasks 10 and 11; see [ADR 0019](adr/0019-mls-direct-messages.md), section 15):
+
+- **Everyone signs in again.** The server revokes every session the first time it starts on the restored database, before it serves anything. Each device must sign in again with the password, and the TOTP code if it is enabled, before it can do anything. This matters because the backup lists as active the devices that were revoked after it, a stolen one included: without the password, such a device can do nothing.
+- **What users changed after the backup is undone**: a password changed since (the old one works again), a recovery key replaced since (the old one works again), revoked devices, blocks, unfriendings, and TOTP enabled or disabled since. The server cannot redo it: the restored database knows nothing of it.
+- **Everyone is told.** After signing in, each user sees a notice with the date of the backup. It says what the restore undid and asks them to do it again: first change their password and create a new recovery key if they had changed them, then check their devices (and **revoke again** those they had revoked), the people they block or unfriended, and their two-factor authentication. Tell your users too, by another channel.
 - **Conversations are recreated** with the same members. Encrypted messages sent after the backup and not yet delivered are lost; history already on the devices is kept.
+- **One-time KeyPackages are deleted**: those handed out after the backup would otherwise be handed out a second time. Devices upload new ones when they reconnect.
+
+### How the server knows it was restored
+
+Two independent ways, so that a restore is handled even when `restore.sh` was not used:
+
+- `restore.sh` raises the **instance generation** in the database and records the date of the backup.
+- The server keeps a **marker** in its data directory (`TAVERN_DATA_DIR`, the `server-data` volume, outside the PostgreSQL volume): the instance generation and a counter that every write to the database advances. It writes it at start-up, every 10 seconds when something changed, and when it stops. If, at start-up, the database is behind the marker (a lower generation, or a lower counter at the same generation), the server treats it as restored and raises the generation itself; the date of the backup is then its last record before it, a few seconds earlier at most.
+
+Rules that keep this working:
+
+- **Never back up or restore the `server-data` volume** with the database (`backup.sh` leaves it out). If it is restored together with an older database, the marker is old too, and the restore goes unnoticed unless `restore.sh` recorded it. A VM or disk snapshot of the whole machine restores both: after restoring one, run `restore.sh` on a backup instead, or tell the server by hand (`UPDATE instance_state SET generation = generation + 1;` before it starts).
+- Losing the volume only disables the check until the next start, which writes a new marker; it never makes the server think it was restored. A marker of another database (a new instance on the same volume) is replaced.
+- The server refuses to start if it cannot write the marker, or if the file is not a marker. Delete it only if you know the database was not restored.
+- What it cannot see: after a crash, which leaves no update at shutdown, a database restored from a backup taken in the last 10 seconds before the crash. What changed in those seconds is undone without the notice. Use `restore.sh`, which records the restore whatever the marker says.
 
 `restore.sh --db-only` restores the database and keeps the current configuration files. Uploaded files (attachments) will be added to both scripts when they exist (milestone M5).
 

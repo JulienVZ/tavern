@@ -38,16 +38,20 @@ pub enum NoticeKind {
     DeviceRevoked = 4,
     /// The recovery key was replaced.
     RecoveryKeyReplaced = 5,
+    /// The instance was restored from a backup ([`crate::restore`]):
+    /// recorded for every account, with the date of the backup.
+    InstanceRestored = 6,
 }
 
 impl NoticeKind {
     /// Every kind, for tests and documentation checks.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::TotpDisabledByAdmin,
         Self::PasswordChanged,
         Self::AccountRecovered,
         Self::DeviceRevoked,
         Self::RecoveryKeyReplaced,
+        Self::InstanceRestored,
     ];
 
     /// Kinds also shown to devices enrolled after the event, until one device
@@ -57,10 +61,15 @@ impl NoticeKind {
     /// done, and that the user meets on any device without an explanation:
     /// with TOTP disabled, sign-in stops asking for a code; after a recovery
     /// the password no longer works and every device is signed out, and the
-    /// user may well come back on a new computer. The other kinds are
-    /// acknowledged at once by the device that acted.
-    pub const SHOWN_TO_LATER_DEVICES: [Self; 2] =
-        [Self::TotpDisabledByAdmin, Self::AccountRecovered];
+    /// user may well come back on a new computer. After a restore, every
+    /// device is signed out, and one enrolled after the backup is unknown to
+    /// the restored database: it is enrolled anew, after the notice. The
+    /// other kinds are acknowledged at once by the device that acted.
+    pub const SHOWN_TO_LATER_DEVICES: [Self; 3] = [
+        Self::TotpDisabledByAdmin,
+        Self::AccountRecovered,
+        Self::InstanceRestored,
+    ];
 
     fn from_db(value: i16) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| *kind as i16 == value)
@@ -74,6 +83,7 @@ impl NoticeKind {
             Self::AccountRecovered => proto::SecurityNoticeKind::AccountRecovered,
             Self::DeviceRevoked => proto::SecurityNoticeKind::DeviceRevoked,
             Self::RecoveryKeyReplaced => proto::SecurityNoticeKind::RecoveryKeyReplaced,
+            Self::InstanceRestored => proto::SecurityNoticeKind::InstanceRestored,
         }
     }
 }
@@ -87,6 +97,9 @@ pub struct Notice {
     pub kind: NoticeKind,
     /// When, in milliseconds since the Unix epoch.
     pub created_at_ms: u64,
+    /// [`NoticeKind::InstanceRestored`] only: when the restored backup was
+    /// taken, in milliseconds since the Unix epoch, if the server knows.
+    pub backup_taken_at_ms: Option<u64>,
 }
 
 impl Notice {
@@ -96,6 +109,7 @@ impl Notice {
             kind: self.kind.to_proto().into(),
             notice_id: self.id.as_bytes().to_vec(),
             created_at_ms: self.created_at_ms,
+            backup_taken_at_ms: self.backup_taken_at_ms.unwrap_or_default(),
         }
     }
 }
@@ -140,6 +154,7 @@ pub async fn insert(
         id,
         kind,
         created_at_ms: u64::try_from(created).unwrap_or_default(),
+        backup_taken_at_ms: None,
     })
 }
 
@@ -189,8 +204,9 @@ pub async fn pending(state: &AppState, session: &Session) -> ApiResult<Vec<Notic
         .iter()
         .map(|kind| *kind as i16)
         .collect();
-    let rows: Vec<(Uuid, i16, i64)> = sqlx::query_as(
-        "SELECT n.id, n.kind, (extract(epoch FROM n.created_at) * 1000)::bigint \
+    let rows: Vec<(Uuid, i16, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT n.id, n.kind, (extract(epoch FROM n.created_at) * 1000)::bigint, \
+                (extract(epoch FROM n.backup_taken_at) * 1000)::bigint \
          FROM security_notices n JOIN devices me ON me.id = $2 \
          WHERE n.user_id = $1 \
            AND (n.created_at >= me.created_at \
@@ -211,11 +227,12 @@ pub async fn pending(state: &AppState, session: &Session) -> ApiResult<Vec<Notic
 
     Ok(rows
         .into_iter()
-        .filter_map(|(id, kind, created)| {
+        .filter_map(|(id, kind, created, backup)| {
             Some(Notice {
                 id,
                 kind: NoticeKind::from_db(kind)?,
                 created_at_ms: u64::try_from(created).unwrap_or_default(),
+                backup_taken_at_ms: backup.and_then(|at| u64::try_from(at).ok()),
             })
         })
         .collect())
@@ -255,13 +272,13 @@ mod tests {
     #[test]
     fn kinds_keep_their_codes_and_match_the_protocol() {
         let codes: Vec<i16> = NoticeKind::ALL.iter().map(|kind| *kind as i16).collect();
-        assert_eq!(codes, [1, 2, 3, 4, 5]);
+        assert_eq!(codes, [1, 2, 3, 4, 5, 6]);
         for kind in NoticeKind::ALL {
             // Database and wire codes are the same numbers.
             assert_eq!(i32::from(kind as i16), i32::from(kind.to_proto()));
             assert_eq!(NoticeKind::from_db(kind as i16), Some(kind));
         }
         assert_eq!(NoticeKind::from_db(0), None);
-        assert_eq!(NoticeKind::from_db(6), None);
+        assert_eq!(NoticeKind::from_db(7), None);
     }
 }

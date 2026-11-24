@@ -48,6 +48,7 @@ use crate::gateway::{Event, Relation, RevocationReason, Subscription};
 use crate::notices;
 use crate::panics::{self, Panicked};
 use crate::rate_limit::GatewayLimits;
+use crate::restore;
 use crate::routes::key_packages;
 use crate::session::{self, Session};
 
@@ -288,16 +289,18 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
     let pending = async {
         let notices = notices::pending(&state, &session).await?;
         let key_packages = key_packages::remaining(&state.db, session.device_id).await?;
-        Ok::<_, crate::error::ApiError>((notices, key_packages))
+        let generation = restore::generation(&state.db).await?;
+        Ok::<_, crate::error::ApiError>((notices, key_packages, generation))
     };
-    let (security_notices, key_packages_remaining) = match failed(panics::guard(pending).await) {
-        Ok(pending) => pending,
-        Err(code) => {
-            drop(registered);
-            close(socket, code).await;
-            return;
-        }
-    };
+    let (security_notices, key_packages_remaining, instance_generation) =
+        match failed(panics::guard(pending).await) {
+            Ok(pending) => pending,
+            Err(code) => {
+                drop(registered);
+                close(socket, code).await;
+                return;
+            }
+        };
     let ready = proto::Ready {
         user_id: session.user_id.as_bytes().to_vec(),
         device_id: session.device_id.as_bytes().to_vec(),
@@ -313,6 +316,7 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
         mls_external_sender_key: state.secrets.external_sender.public_bytes().to_vec(),
         key_packages_remaining,
         new_devices,
+        instance_generation,
         security_notices: security_notices
             .into_iter()
             .map(notices::Notice::to_proto)
@@ -783,6 +787,7 @@ mod tests {
             id: Uuid::from_u128(9),
             kind: notices::NoticeKind::PasswordChanged,
             created_at_ms: 1,
+            backup_taken_at_ms: None,
         };
         assert_eq!(event_payload(Event::SecurityNotice(notice)).1, None);
         assert_eq!(

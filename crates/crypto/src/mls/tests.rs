@@ -683,6 +683,30 @@ fn the_server_reads_the_framing_of_a_first_commit_and_whom_its_welcome_is_for() 
         first_commit_sender(&update.commit, identity()),
         Err(MlsError::Malformed)
     ));
+    // Its header: the group and the epoch it commits from, for the first
+    // commit as for any other; nothing but a commit has one.
+    assert_eq!(
+        commit_header(&commit.commit).unwrap(),
+        CommitHeader {
+            group: identity(),
+            epoch: 0
+        }
+    );
+    assert_eq!(
+        commit_header(&update.commit).unwrap(),
+        CommitHeader {
+            group: identity(),
+            epoch: 1
+        }
+    );
+    assert!(matches!(commit_header(&welcome), Err(MlsError::Malformed)));
+    assert!(matches!(
+        commit_header(b"garbage"),
+        Err(MlsError::Malformed)
+    ));
+    let mut trailing = commit.commit.clone();
+    trailing.push(0);
+    assert!(matches!(commit_header(&trailing), Err(MlsError::Malformed)));
     // Neither a member's commit nor anything else is an external commit.
     assert!(!is_external_commit(&commit.commit));
     assert!(!is_external_commit(&update.commit));

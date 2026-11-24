@@ -43,6 +43,47 @@ use uuid::Uuid;
 
 pub const DATABASE_URL_VAR: &str = "TAVERN_TEST_DATABASE_URL";
 
+/// A database of its own, migrated, for a test that changes the whole
+/// instance (a restore revokes every session, deletes every one-time
+/// KeyPackage): the other tests share the test database. Named after the
+/// test database, so it ends in `_test` too; [`drop_database`] removes it.
+pub async fn fresh_database() -> String {
+    let base = database_url();
+    let (prefix, name) = base.rsplit_once('/').unwrap();
+    let name = name.split('?').next().unwrap();
+    let own = format!(
+        "{}_{}_test",
+        name.trim_end_matches("_test"),
+        &Uuid::new_v4().simple().to_string()[..12]
+    );
+    let admin = db::connect_with_acquire_timeout(&base, 1, ACQUIRE_TIMEOUT)
+        .await
+        .unwrap();
+    // A name made of letters, digits and underscores only.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {own}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+    format!("{prefix}/{own}")
+}
+
+/// Drops a database made by [`fresh_database`], with whatever still uses it.
+pub async fn drop_database(url: &str) {
+    let own = url.rsplit('/').next().unwrap();
+    assert!(own.ends_with("_test"));
+    let admin = db::connect_with_acquire_timeout(&database_url(), 1, ACQUIRE_TIMEOUT)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {own} WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    admin.close().await;
+}
+
 /// How long a request of a test server waits for a database connection.
 /// The tests share one PostgreSQL, which at times is slow to open their
 /// connections (right after a build, under load): five seconds, the
@@ -168,8 +209,14 @@ impl TestApp {
 
     /// Like [`TestApp::spawn`], with settings changed by `configure`.
     pub async fn spawn_configured(configure: impl FnOnce(&mut Settings)) -> Self {
-        let database_url = database_url();
-        let pool = db::connect_with_acquire_timeout(&database_url, 5, ACQUIRE_TIMEOUT)
+        Self::spawn_on(&database_url(), configure).await
+    }
+
+    /// Like [`TestApp::spawn_configured`], on the database at
+    /// `database_url`: one of [`fresh_database`], for tests that change the
+    /// whole instance.
+    pub async fn spawn_on(database_url: &str, configure: impl FnOnce(&mut Settings)) -> Self {
+        let pool = db::connect_with_acquire_timeout(database_url, 5, ACQUIRE_TIMEOUT)
             .await
             .expect("database must be reachable");
         db::migrate(&pool).await.expect("migrations must apply");
@@ -183,6 +230,30 @@ impl TestApp {
             configure(&mut settings);
             settings
         });
+        Self::serve(state).await
+    }
+
+    /// The same instance (its secrets and settings) started again on the
+    /// database at `database_url`: a server restarted on a restored backup.
+    pub async fn restarted_on(&self, database_url: &str) -> Self {
+        let pool = db::connect_with_acquire_timeout(database_url, 5, ACQUIRE_TIMEOUT)
+            .await
+            .expect("database must be reachable");
+        db::migrate(&pool).await.expect("migrations must apply");
+        let fresh = AppState::new(
+            pool,
+            test_secrets(),
+            Settings::new(None, false, Duration::from_secs(3600)),
+        );
+        Self::serve(AppState {
+            secrets: std::sync::Arc::clone(&self.state.secrets),
+            settings: std::sync::Arc::clone(&self.state.settings),
+            ..fresh
+        })
+        .await
+    }
+
+    async fn serve(state: AppState) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = app(state.clone());

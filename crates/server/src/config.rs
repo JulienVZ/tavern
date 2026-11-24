@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Environment variable names.
@@ -41,9 +42,12 @@ pub mod vars {
     pub const KEY_PACKAGE_PAIR_CLAIMS_PER_DAY: &str = "TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_DAY";
     /// Friend requests per hour and per requesting user.
     pub const FRIEND_REQUESTS_PER_HOUR: &str = "TAVERN_FRIEND_REQUESTS_PER_HOUR";
+    /// Directory of the server's own files, outside the database.
+    pub const DATA_DIR: &str = "TAVERN_DATA_DIR";
 }
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
+const DEFAULT_DATA_DIR: &str = "/var/lib/tavern";
 const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
@@ -93,6 +97,9 @@ pub struct Config {
     pub claim_limits: ClaimLimits,
     /// Friend requests a user may send per hour.
     pub friend_requests_per_hour: u32,
+    /// Directory of the server's own files, outside the database: the
+    /// marker that tells a restored database ([`crate::restore`]).
+    pub data_dir: PathBuf,
 }
 
 /// Default and largest `TAVERN_MESSAGE_RETENTION_DAYS` (ADR 0019, section 12).
@@ -142,6 +149,7 @@ impl fmt::Debug for Config {
             .field("device_inactive_days", &self.device_inactive_days)
             .field("claim_limits", &self.claim_limits)
             .field("friend_requests_per_hour", &self.friend_requests_per_hour)
+            .field("data_dir", &self.data_dir)
             .finish()
     }
 }
@@ -325,6 +333,9 @@ impl Config {
             device_inactive_days,
             claim_limits,
             friend_requests_per_hour,
+            data_dir: PathBuf::from(
+                get(vars::DATA_DIR).unwrap_or_else(|| DEFAULT_DATA_DIR.to_owned()),
+            ),
         })
     }
 }
@@ -368,6 +379,7 @@ mod tests {
         assert_eq!(config.message_retention_days, 30);
         assert_eq!(config.device_inactive_days, 30);
         assert_eq!(config.friend_requests_per_hour, 20);
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/tavern"));
         assert_eq!(
             config.claim_limits,
             ClaimLimits {

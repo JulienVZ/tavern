@@ -80,6 +80,10 @@ pub enum SecurityNoticeKind {
     DeviceRevoked,
     /// The recovery key was replaced.
     RecoveryKeyReplaced,
+    /// The instance was restored from a backup: what the user changed after
+    /// it ([`SecurityNotice::backup_taken_at_ms`]) is undone, and every
+    /// device was signed out.
+    InstanceRestored,
     /// A kind introduced by an instance newer than this client. Still shown:
     /// the user must know that something happened.
     Other,
@@ -95,6 +99,9 @@ pub struct SecurityNotice {
     pub kind: SecurityNoticeKind,
     /// When, in milliseconds since the Unix epoch.
     pub created_at_ms: u64,
+    /// [`SecurityNoticeKind::InstanceRestored`]: when the restored backup was
+    /// taken, in milliseconds since the Unix epoch, if the instance knows.
+    pub backup_taken_at_ms: Option<u64>,
 }
 
 impl SecurityNotice {
@@ -111,12 +118,16 @@ impl SecurityNotice {
             Ok(proto::SecurityNoticeKind::RecoveryKeyReplaced) => {
                 SecurityNoticeKind::RecoveryKeyReplaced
             }
+            Ok(proto::SecurityNoticeKind::InstanceRestored) => SecurityNoticeKind::InstanceRestored,
             Ok(proto::SecurityNoticeKind::Unspecified) | Err(_) => SecurityNoticeKind::Other,
         };
         Some(Self {
             notice_id: uuid(&notice.notice_id)?,
             kind,
             created_at_ms: notice.created_at_ms,
+            backup_taken_at_ms: (kind == SecurityNoticeKind::InstanceRestored
+                && notice.backup_taken_at_ms != 0)
+                .then_some(notice.backup_taken_at_ms),
         })
     }
 }
@@ -160,6 +171,10 @@ pub enum GatewayEvent {
         /// Every security notice this device has not acknowledged, including
         /// those already announced by [`GatewayEvent::SecurityNotice`].
         security_notices: Vec<SecurityNotice>,
+        /// The instance generation: when it differs from the one seen last,
+        /// the instance was restored from a backup, and the groups of the
+        /// conversations are to be recreated (0 before gateway minor 7).
+        instance_generation: u64,
     },
     /// A device was just enrolled on the account. The user must be notified
     /// and offered to revoke it.
@@ -420,6 +435,7 @@ async fn connection(
         .send(GatewayEvent::Connected {
             new_devices,
             security_notices,
+            instance_generation: ready.instance_generation,
         })
         .await
         .is_err()
@@ -569,6 +585,7 @@ mod tests {
             kind,
             notice_id: id.as_bytes().to_vec(),
             created_at_ms: 42,
+            backup_taken_at_ms: 0,
         };
         let kind = |value: i32| SecurityNotice::from_proto(&notice(value)).map(|n| n.kind);
 
@@ -577,6 +594,7 @@ mod tests {
         assert_eq!(kind(3), Some(SecurityNoticeKind::AccountRecovered));
         assert_eq!(kind(4), Some(SecurityNoticeKind::DeviceRevoked));
         assert_eq!(kind(5), Some(SecurityNoticeKind::RecoveryKeyReplaced));
+        assert_eq!(kind(6), Some(SecurityNoticeKind::InstanceRestored));
         assert_eq!(kind(0), Some(SecurityNoticeKind::Other));
         assert_eq!(kind(99), Some(SecurityNoticeKind::Other));
 
@@ -586,8 +604,28 @@ mod tests {
             kind: 1,
             notice_id: Vec::new(),
             created_at_ms: 0,
+            backup_taken_at_ms: 0,
         };
         assert_eq!(SecurityNotice::from_proto(&unidentified), None);
+
+        // The date of the backup, for a restore only; 0 is unknown.
+        let restored = |backup_taken_at_ms| proto::SecurityNotice {
+            kind: 6,
+            backup_taken_at_ms,
+            ..notice(6)
+        };
+        let backup = |notice: proto::SecurityNotice| {
+            SecurityNotice::from_proto(&notice).map(|n| n.backup_taken_at_ms)
+        };
+        assert_eq!(backup(restored(1_700)), Some(Some(1_700)));
+        assert_eq!(backup(restored(0)), Some(None));
+        assert_eq!(
+            backup(proto::SecurityNotice {
+                backup_taken_at_ms: 1_700,
+                ..notice(2)
+            }),
+            Some(None)
+        );
     }
 
     #[test]

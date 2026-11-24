@@ -23,6 +23,7 @@ pub mod pending;
 pub mod purge;
 pub mod rate_limit;
 pub mod removals;
+pub mod restore;
 pub mod routes;
 pub mod secrets;
 pub mod session;

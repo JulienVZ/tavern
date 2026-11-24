@@ -9,6 +9,13 @@
 # Restore the configuration files too when moving to a new machine: clients
 # and existing groups depend on the instance secrets stored in .env.
 #
+# After the database, the script raises the instance generation and records
+# when the backup was taken. At its next start the server revokes every
+# session, tells every account what the restore undid, and has every
+# conversation's group recreated (docs/self-hosting.md, "Backups"). The
+# server also tells a restored database by itself, from its marker, should
+# the database be restored another way.
+#
 # TODO(M5): restore the encrypted blob storage once attachments exist.
 
 set -eu
@@ -72,6 +79,37 @@ echo "Restoring PostgreSQL..."
 docker compose exec -T postgres sh -c \
     'pg_restore --clean --if-exists --no-owner --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
     <"$dir/db.dump"
+
+# When the backup was taken: the file backup.sh writes, else the time in the
+# archive's name. Checked strictly: it goes into SQL.
+taken_at=""
+if [ -f "$dir/taken_at" ]; then
+    taken_at=$(cat "$dir/taken_at")
+else
+    stamp=$(basename "$dir" | sed -n 's/^tavern-\([0-9]\{8\}T[0-9]\{6\}Z\)$/\1/p')
+    if [ -n "$stamp" ]; then
+        taken_at=$(echo "$stamp" | sed 's/^\(....\)\(..\)\(..\)T\(..\)\(..\)\(..\)Z$/\1-\2-\3T\4:\5:\6Z/')
+    fi
+fi
+if ! echo "$taken_at" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+    echo "restore.sh: the date of this backup is unknown; the restore notice gives an estimate." >&2
+    taken_at=""
+fi
+
+echo "Recording the restore..."
+# A dump older than the table (migration 0014) is told by the server's
+# marker instead.
+docker compose exec -T postgres sh -c \
+    'psql --quiet --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' <<SQL
+DO \$\$
+BEGIN
+    IF to_regclass('instance_state') IS NOT NULL THEN
+        UPDATE instance_state SET generation = generation + 1,
+            backup_taken_at = NULLIF('$taken_at', '')::timestamptz;
+    END IF;
+END
+\$\$;
+SQL
 
 docker compose up -d
 echo "Restore complete."

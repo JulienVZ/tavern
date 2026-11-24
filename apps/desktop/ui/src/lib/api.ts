@@ -113,6 +113,7 @@ export type SecurityNoticeKind =
   | "account_recovered"
   | "device_revoked"
   | "recovery_key_replaced"
+  | "instance_restored"
   | "other";
 
 /** Something security-relevant that happened to the account. */
@@ -120,6 +121,8 @@ export interface SecurityNotice {
   noticeId: string;
   kind: SecurityNoticeKind;
   createdAtMs: number;
+  /** `instance_restored` only, when the instance knows the backup's date. */
+  backupTakenAtMs?: number;
 }
 
 export type GatewayEvent =

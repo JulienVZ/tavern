@@ -81,6 +81,7 @@ describe("security notices", () => {
       "account_recovered",
       "device_revoked",
       "recovery_key_replaced",
+      "instance_restored",
       "other",
     ];
     render(Home);
@@ -90,6 +91,35 @@ describe("security notices", () => {
       securityNotices: kinds.map((kind, index) => ({ ...notice, kind, noticeId: `n${index}` })),
     });
     expect(session.securityNotices).toHaveLength(kinds.length);
+  });
+});
+
+describe("the notice of a restored backup", () => {
+  it("gives the date of the backup and what to do again", async () => {
+    render(Home);
+    handleGatewayEvent({
+      type: "connected",
+      newDevices: [],
+      securityNotices: [
+        { ...notice, kind: "instance_restored", backupTakenAtMs: Date.UTC(2026, 10, 2, 12) },
+      ],
+    });
+    const text = (await screen.findByText(/restored from a backup of/)).textContent ?? "";
+    expect(text).toContain("2026");
+    expect(text).toContain("change your password and create a new recovery key");
+    expect(text).toContain("revoke again");
+  });
+
+  it("says so when the date of the backup is unknown", async () => {
+    render(Home);
+    handleGatewayEvent({
+      type: "connected",
+      newDevices: [],
+      securityNotices: [{ ...notice, kind: "instance_restored" }],
+    });
+    expect(
+      await screen.findByText(/restored from a backup: everything done on it after the backup/),
+    ).toBeTruthy();
   });
 });
 

@@ -107,12 +107,14 @@ pub async fn remove_from(
     let mut tx = state.db.begin().await?;
     // The same lock as every request that adds to the sequence, taken
     // first, as they do.
-    let locked: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE")
+    let locked: Option<bool> =
+        sqlx::query_scalar("SELECT needs_recreation FROM conversations WHERE id = $1 FOR UPDATE")
             .bind(conversation)
             .fetch_optional(&mut *tx)
             .await?;
-    if locked.is_none() {
+    // A group to recreate after a restore is not changed any more: the new
+    // group takes active devices only (section 17).
+    if locked.is_none_or(|needs_recreation| needs_recreation) {
         return Ok(false);
     }
     let leaf: Option<Uuid> = sqlx::query_scalar(concat!(

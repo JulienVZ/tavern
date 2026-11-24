@@ -54,6 +54,9 @@ services:
       TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR: ${TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_HOUR:-}
       TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_DAY: ${TAVERN_KEY_PACKAGE_PAIR_CLAIMS_PER_DAY:-}
       TAVERN_FRIEND_REQUESTS_PER_HOUR: ${TAVERN_FRIEND_REQUESTS_PER_HOUR:-}
+      # The server's own files, outside the database: its marker tells a
+      # restored database (docs/self-hosting.md, "Backups").
+      TAVERN_DATA_DIR: /var/lib/tavern
       # The server is reachable only through Caddy (it publishes no port), and
       # Caddy appends the client address to X-Forwarded-For. The server uses
       # that last entry for rate limiting, never a value sent by the client.
@@ -70,6 +73,8 @@ services:
       retries: 6
       start_period: 10s
     read_only: true
+    volumes:
+      - server-data:/var/lib/tavern
     cap_drop:
       - ALL
     security_opt:
@@ -120,6 +125,9 @@ services:
 
 volumes:
   postgres-data:
+  # Never backed up nor restored with the database: it is what tells the
+  # server that the database went back in time.
+  server-data:
   caddy-data:
   caddy-config:
 

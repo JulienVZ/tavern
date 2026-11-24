@@ -95,6 +95,10 @@ message Ready {
   // oldest first. The client shows them until the user dismisses them, then
   // sends AckSecurityNotices. Since minor 1.
   repeated SecurityNotice security_notices = 9;
+  // The instance generation: raised each time the instance is restored from
+  // a backup. A client that sees it change recreates the groups of its
+  // conversations (ADR 0019, sections 15 and 17). Since minor 7.
+  uint64 instance_generation = 10;
 }
 
 message DeviceSummary {
@@ -210,6 +214,9 @@ message SecurityNotice {
   bytes notice_id = 2;
   // Since minor 1.
   uint64 created_at_ms = 3;
+  // INSTANCE_RESTORED only: when the restored backup was taken, 0 if the
+  // server does not know. Since minor 7.
+  uint64 backup_taken_at_ms = 4;
 }
 
 // A client shows a kind it does not know as a generic notice.
@@ -226,6 +233,10 @@ enum SecurityNoticeKind {
   SECURITY_NOTICE_KIND_DEVICE_REVOKED = 4;
   // The recovery key was replaced; the previous one stopped working.
   SECURITY_NOTICE_KIND_RECOVERY_KEY_REPLACED = 5;
+  // The instance was restored from a backup (backup_taken_at_ms): whatever
+  // the user changed after it is undone, and every device was signed out.
+  // Since minor 7.
+  SECURITY_NOTICE_KIND_INSTANCE_RESTORED = 6;
 }
 
 // The user dismissed these notices on this device. Unknown identifiers are
@@ -280,6 +291,10 @@ enum ErrorCode {
   ERROR_CODE_INVALID_KEY_PACKAGE = 44;
   ERROR_CODE_NOT_A_MEMBER = 45;  // not a device of the group, or not a participant
   ERROR_CODE_GROUP_INFO_REQUIRED = 46;
+  // The conversation's group must be recreated first (a restored backup), or
+  // the message is for a group that was recreated since (section 17). Since
+  // minor 7.
+  ERROR_CODE_GROUP_RECREATION_REQUIRED = 47;
 
   // Social (M2). Since minor 5.
   ERROR_CODE_BLOCKED = 60;  // the sender blocks the other user; never sent to the blocked one
@@ -305,7 +320,10 @@ message SendMessageAck {
 
 // An MLS commit (PublicMessage) for the group's current epoch; exactly one
 // commit is accepted per epoch. With epoch 0 and no group yet, the group's
-// first commit, from any active device of a participant.
+// first commit, from any active device of a participant. With epoch 0 and a
+// generation the conversation does not have yet, its recreation (since minor
+// 7): the next generation, or any later one when the conversation must be
+// recreated after a restore.
 message SubmitCommit {
   bytes conversation_id = 1;
   uint64 epoch = 2;

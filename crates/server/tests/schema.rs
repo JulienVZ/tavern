@@ -120,3 +120,45 @@ async fn every_database_column_is_classified() {
         problems.join("\n")
     );
 }
+
+/// Every write to the database advances the counter of changes, which the
+/// server's marker compares to tell a restored database (ADR 0019, section
+/// 15): every table has the trigger, but the instance's own state and the
+/// migrations' table. A table added later gets it in its migration.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn every_table_counts_its_changes() {
+    let database_url = common::database_url();
+    let pool = db::connect(&database_url, 1).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    let missing: Vec<String> = sqlx::query_scalar(
+        "SELECT t.tablename::text FROM pg_tables t \
+         WHERE t.schemaname = 'public' \
+           AND t.tablename NOT IN ('instance_state', '_sqlx_migrations') \
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger g \
+                           JOIN pg_class c ON c.oid = g.tgrelid \
+                           WHERE c.relname = t.tablename AND g.tgname = 'instance_changed') \
+         ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        missing.is_empty(),
+        "tables without the instance_changed trigger: {missing:?}"
+    );
+    let before: (i64, bool) = sqlx::query_as("SELECT last_value, is_called FROM instance_changes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE instance_invites SET uses = uses WHERE false")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT last_value FROM instance_changes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!before.1 || after > before.0);
+}

@@ -120,7 +120,9 @@ CREATE TABLE security_notices (
     id          uuid PRIMARY KEY DEFAULT uuidv7(),           -- META
     user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, -- META  the account concerned
     kind        smallint NOT NULL,                           -- META  enum: TOTP disabled by an admin, password changed, ...
-    created_at  timestamptz NOT NULL DEFAULT now()           -- META
+    created_at  timestamptz NOT NULL DEFAULT now(),          -- META
+    backup_taken_at timestamptz,                             -- META  kind 6 (instance restored) only: when the backup was taken, if known (migration 0014)
+    CHECK (backup_taken_at IS NULL OR kind = 6)
 );
 CREATE INDEX security_notices_user_idx ON security_notices (user_id, created_at);
 
@@ -229,6 +231,8 @@ CREATE TABLE conversations (
     last_seq      bigint NOT NULL DEFAULT 0,                 -- META  last assigned sequence number
     created_by    uuid REFERENCES users(id) ON DELETE SET NULL, -- META
     created_at    timestamptz NOT NULL DEFAULT now(),        -- META
+    needs_recreation boolean NOT NULL DEFAULT false,         -- META  set by a restore: only the recreation of its group is accepted (migration 0014)
+    recreated_at  timestamptz,                               -- META  last recreation of its group: a user may ask for one at most once an hour
     CHECK (last_seq >= 0)
 );
 
@@ -370,6 +374,34 @@ CREATE INDEX pending_removals_device_idx ON pending_removals (device_id);
 ```
 
 Commits and proposals are `PUB`: they are signed but not encrypted, and contain public keys and membership changes only. Their path secrets are HPKE-encrypted to members inside the commit.
+
+```sql
+-- Implemented (task 9b of M2, migration 0014). A restored backup (ADR 0019,
+-- sections 15 and 17). One row. restore.sh raises the generation and
+-- records the backup's date; the server raises it too when its marker
+-- (TAVERN_DATA_DIR/instance-marker, outside the database) shows the
+-- database behind. At start-up the server handles a generation once, in one
+-- transaction: every session revoked, the notice for every account, every
+-- one-time KeyPackage deleted, every conversation to recreate; the
+-- generation is marked handled at its end.
+CREATE TABLE instance_state (
+    id                 boolean PRIMARY KEY DEFAULT true,     -- META  a single row
+    instance_id        uuid NOT NULL DEFAULT gen_random_uuid(), -- META  names this database in the server's marker
+    generation         bigint NOT NULL DEFAULT 0,            -- META  raised by each restore, announced in Ready
+    handled_generation bigint NOT NULL DEFAULT 0,            -- META  the last generation handled at start-up
+    backup_taken_at    timestamptz,                          -- META  when the restored backup was taken, if known
+    alive_at           timestamptz,                          -- META  the server's last record of a change, at most a few seconds old
+    CHECK (id),
+    CHECK (handled_generation BETWEEN 0 AND generation)
+);
+
+-- Advanced by every statement that writes to any other table (trigger
+-- instance_changed, FOR EACH STATEMENT): the marker records its value, and
+-- a database restored from a backup has it behind. Not transactional, so no
+-- write waits for another. Every table added later gets the trigger in its
+-- migration (tests/schema.rs checks it).
+CREATE SEQUENCE instance_changes AS bigint;
+```
 
 ## 5. M3 — private groups
 

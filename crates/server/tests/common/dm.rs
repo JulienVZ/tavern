@@ -49,6 +49,9 @@ pub fn leaf(account: &Account, device: &Device) -> VerifiedLeaf {
 /// A DM between two friends, as its clients know it.
 pub struct Dm {
     pub conversation: Uuid,
+    /// The generation of the group its clients build: 0, until a test
+    /// recreates it (ADR 0019, section 17).
+    pub generation: u32,
     pub participants: [[u8; ID_LEN]; 2],
     pub keys: Keys,
     pub external_sender: [u8; 32],
@@ -65,7 +68,7 @@ impl Dm {
     pub fn identity(&self) -> GroupIdentity {
         GroupIdentity {
             conversation_id: *self.conversation.as_bytes(),
-            generation: 0,
+            generation: self.generation,
         }
     }
 }
@@ -85,6 +88,7 @@ pub async fn dm_between(app: &TestApp, (a, a1): (&Account, &Device), b: &Account
     participants.sort();
     Dm {
         conversation: conversation.conversation_id,
+        generation: 0,
         participants,
         keys: Keys(
             [

@@ -107,6 +107,10 @@ const en = {
     "A device was revoked from your account ({date}). If it was not you, change your password.",
   "notice.recovery_key_replaced":
     "The recovery key of your account was replaced ({date}); the previous one no longer works. If it was not you, change your password and create a new recovery key.",
+  "notice.instance_restored":
+    "This instance was restored from a backup of {backup}: everything done on it after that date is undone, and messages sent since may be missing. If you changed any of the following after {backup}, do it again now. First, change your password and create a new recovery key, if you had changed them. Then check your devices and revoke again those you had revoked, the people you block or removed from your friends, and your two-factor authentication.",
+  "notice.instance_restored_undated":
+    "This instance was restored from a backup: everything done on it after the backup is undone, and recent messages may be missing. If you changed any of the following recently, do it again now. First, change your password and create a new recovery key, if you had changed them. Then check your devices and revoke again those you had revoked, the people you block or removed from your friends, and your two-factor authentication.",
   "notice.other":
     "A security-related change was made to your account ({date}). Update Tavern to see the details.",
   "notice.ack": "OK, noted",
@@ -379,6 +383,10 @@ const fr: Catalogue = {
     "Un appareil a été révoqué de votre compte ({date}). Si ce n'était pas vous, changez votre mot de passe.",
   "notice.recovery_key_replaced":
     "La clé de récupération de votre compte a été remplacée ({date}) ; l'ancienne ne fonctionne plus. Si ce n'était pas vous, changez votre mot de passe et créez une nouvelle clé de récupération.",
+  "notice.instance_restored":
+    "Cette instance a été restaurée à partir d'une sauvegarde du {backup} : tout ce qui y a été fait après cette date est annulé, et des messages envoyés depuis peuvent manquer. Si vous avez modifié l'un des points suivants après le {backup}, refaites-le maintenant. D'abord, changez votre mot de passe et créez une nouvelle clé de récupération, si vous les aviez changés. Vérifiez ensuite vos appareils et révoquez de nouveau ceux que vous aviez révoqués, les personnes que vous bloquez ou que vous avez retirées de vos amis, et votre double authentification.",
+  "notice.instance_restored_undated":
+    "Cette instance a été restaurée à partir d'une sauvegarde : tout ce qui y a été fait après la sauvegarde est annulé, et des messages récents peuvent manquer. Si vous avez modifié récemment l'un des points suivants, refaites-le maintenant. D'abord, changez votre mot de passe et créez une nouvelle clé de récupération, si vous les aviez changés. Vérifiez ensuite vos appareils et révoquez de nouveau ceux que vous aviez révoqués, les personnes que vous bloquez ou que vous avez retirées de vos amis, et votre double authentification.",
   "notice.other":
     "Une modification liée à la sécurité a été faite sur votre compte ({date}). Mettez Tavern à jour pour en voir le détail.",
   "notice.ack": "J'en prends note",

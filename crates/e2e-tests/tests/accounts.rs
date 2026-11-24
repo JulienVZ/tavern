@@ -44,6 +44,13 @@ async fn login(computer: &InstanceClient, handle: &str) -> (Client, bool) {
     }
 }
 
+/// The instance generation the server announces in `Ready`.
+async fn generation(server: &Server) -> u64 {
+    tavern_server::restore::generation(&server.state.db)
+        .await
+        .unwrap()
+}
+
 fn totp_code(secret_base32: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -82,6 +89,7 @@ async fn a_user_registers_with_an_invitation_and_logs_in_from_two_devices() {
         GatewayEvent::Connected {
             new_devices: Vec::new(),
             security_notices: Vec::new(),
+            instance_generation: generation(&server).await,
         }
     );
 
@@ -175,6 +183,7 @@ async fn a_device_that_was_away_learns_about_new_devices_when_it_reconnects() {
         GatewayEvent::Connected {
             new_devices: Vec::new(),
             security_notices: Vec::new(),
+            instance_generation: generation(&server).await,
         }
     );
 }

@@ -370,11 +370,57 @@ jobs:
         run: |
           ./scripts/create-admin.sh | tee invite.txt
           grep -Eq '^ +[0-9A-Z]{4}(-[0-9A-Z]{2,4}){6}$' invite.txt
+          sql() {
+            docker compose exec -T postgres sh -c \
+              'psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"'
+          }
+          # An account with a live session, made directly in the database:
+          # the restore must revoke it (ADR 0019, section 15).
+          sql <<'SQL'
+          WITH u AS (
+              INSERT INTO users (handle, display_name, opaque_suite, opaque_record, identity_key,
+                                 identity_key_wrapped_pw, identity_key_wrapped_rk)
+              VALUES ('ci_restore', 'CI', 1, '\x00', '\x00', '\x00', '\x00') RETURNING id
+          ), d AS (
+              INSERT INTO devices (user_id, signature_key, certificate, platform)
+              SELECT id, '\x01', '\x00', 3 FROM u RETURNING id
+          )
+          INSERT INTO sessions (device_id, token_hash, expires_at)
+          SELECT id, '\x02', now() + interval '1 day' FROM d;
+          SQL
           ./scripts/backup.sh
-          ./scripts/restore.sh --yes "$(ls backups/*.tar.gz | tail -n 1)"
+          archive=$(ls backups/*.tar.gz | tail -n 1)
+          ./scripts/restore.sh --yes "$archive"
           sleep 5
           curl --silent --insecure --fail --retry 10 --retry-delay 3 --retry-all-errors \
             https://localhost/health | jq -e '.status == "ok"'
+          # Handled at start-up: generation 1, the session revoked, the
+          # notice recorded with the date of the backup.
+          echo "SELECT generation, handled_generation, backup_taken_at IS NOT NULL FROM instance_state" \
+            | sql | tee state.txt
+          grep -qx '1|1|t' state.txt
+          echo "SELECT count(*) FROM sessions WHERE revoked_at IS NULL" | sql | grep -qx 0
+          echo "SELECT count(*) FROM security_notices WHERE kind = 6 AND backup_taken_at IS NOT NULL" \
+            | sql | grep -qx "$(echo 'SELECT count(*) FROM users' | sql)"
+      - name: The server tells a database restored without restore.sh
+        working-directory: deploy
+        run: |
+          sql() {
+            docker compose exec -T postgres sh -c \
+              'psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"'
+          }
+          # The same backup again, by hand: generation 0 in it, below the
+          # server's marker.
+          mkdir -p restored
+          tar -xzf "$(ls backups/*.tar.gz | tail -n 1)" -C restored
+          docker compose stop server
+          docker compose exec -T postgres sh -c \
+            'pg_restore --clean --if-exists --no-owner --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+            < restored/*/db.dump
+          docker compose up -d --wait --wait-timeout 120
+          echo "SELECT generation, handled_generation FROM instance_state" | sql | tee state.txt
+          grep -qx '2|2' state.txt
+          echo "SELECT count(*) FROM sessions WHERE revoked_at IS NULL" | sql | grep -qx 0
       - name: Show logs on failure
         if: failure()
         working-directory: deploy

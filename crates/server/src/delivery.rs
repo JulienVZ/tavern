@@ -28,8 +28,9 @@ use std::sync::Arc;
 use sqlx::PgConnection;
 use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::{
-    ExpectedGroup, MlsError, PROPOSAL_QUEUE_KIND, PublicState, Refusal, ServerSigner, VerifiedLeaf,
-    application_header, first_commit_sender, is_external_commit, welcome_key_packages,
+    CommitHeader, ExpectedGroup, MlsError, PROPOSAL_QUEUE_KIND, PublicState, Refusal, ServerSigner,
+    VerifiedLeaf, application_header, commit_header, first_commit_sender, is_external_commit,
+    welcome_key_packages,
 };
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::{
@@ -55,6 +56,8 @@ pub struct Refused {
     /// With `STALE_EPOCH`, the group's current epoch when known; 0
     /// otherwise.
     pub current_epoch: u64,
+    /// With `RATE_LIMITED`, how long to wait; 0 otherwise.
+    pub retry_after_ms: u32,
 }
 
 impl Refused {
@@ -63,6 +66,7 @@ impl Refused {
             code,
             message,
             current_epoch: 0,
+            retry_after_ms: 0,
         }
     }
 
@@ -71,7 +75,7 @@ impl Refused {
         proto::Error {
             code: self.code.into(),
             message: self.message.to_owned(),
-            retry_after_ms: 0,
+            retry_after_ms: self.retry_after_ms,
             current_epoch: self.current_epoch,
         }
     }
@@ -109,6 +113,13 @@ impl Refused {
         Self::new(
             proto::ErrorCode::InvalidCommit,
             "the commit fails validation against the group",
+        )
+    }
+
+    fn recreation_required() -> Self {
+        Self::new(
+            proto::ErrorCode::GroupRecreationRequired,
+            "the conversation's group must be recreated, or was recreated since",
         )
     }
 
@@ -370,6 +381,60 @@ pub(crate) async fn group_of(
     Ok(row.and_then(|(generation, epoch)| {
         Some((u32::try_from(generation).ok()?, u64::try_from(epoch).ok()?))
     }))
+}
+
+/// Where a conversation stands with the recreation of its group (section
+/// 17), read under its lock.
+#[derive(Debug, Clone, Copy)]
+struct Recreation {
+    /// A restore requires it: nothing else is accepted until then.
+    required: bool,
+    /// How long until a user may ask for one again (at most once an hour),
+    /// if they may not yet.
+    wait_ms: Option<u32>,
+}
+
+async fn recreation(conn: &mut PgConnection, conversation: Uuid) -> Result<Recreation> {
+    let (required, wait_ms): (bool, Option<i64>) = sqlx::query_as(
+        "SELECT needs_recreation, \
+                CASE WHEN recreated_at > now() - interval '1 hour' \
+                     THEN ceil(extract(epoch FROM recreated_at + interval '1 hour' - now()) \
+                               * 1000)::bigint END \
+         FROM conversations WHERE id = $1",
+    )
+    .bind(conversation)
+    .fetch_one(conn)
+    .await?;
+    Ok(Recreation {
+        required,
+        wait_ms: wait_ms.map(|ms| u32::try_from(ms.max(1)).unwrap_or(u32::MAX)),
+    })
+}
+
+/// Deletes what the conversation's old group left (section 17), in the
+/// recreation's transaction: its ciphertext, Welcomes and pending removals,
+/// and its devices, which the new group's tree writes again. The old
+/// group's state goes when the new one is stored ([`mls::insert`]). The
+/// sequence goes on: its numbers are never reused.
+async fn clear_old_group(conn: &mut PgConnection, conversation: Uuid) -> Result<()> {
+    for table in [
+        "DELETE FROM messages WHERE conversation_id = $1",
+        "DELETE FROM welcomes WHERE conversation_id = $1",
+        "DELETE FROM pending_removals WHERE conversation_id = $1",
+        "DELETE FROM conversation_devices WHERE conversation_id = $1",
+    ] {
+        sqlx::query(table)
+            .bind(conversation)
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE conversations SET needs_recreation = false, recreated_at = now() WHERE id = $1",
+    )
+    .bind(conversation)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// The SQL condition, on a row of `conversation_devices` named by the
@@ -648,12 +713,73 @@ pub async fn submit_commit(
     };
     let retention = state.settings.message_retention_days;
 
+    // In clear in the commit's framing: which group it is for, and from
+    // which epoch. A commit without a readable header fails validation.
+    let header = commit_header(&request.mls_commit).ok();
+
     let mut tx = state.db.begin().await?;
     let dm = lock(&mut tx, conversation, me).await?;
+    let current = group_of(&mut tx, conversation).await?;
+    let recreation = recreation(&mut tx, conversation).await?;
+    // A group's first commit: its creation, or its recreation (section
+    // 17), for a generation it does not have yet.
+    let first = match (header, current) {
+        (Some(header), _) if header.group.conversation_id != *conversation.as_bytes() => {
+            return Err(Refused::invalid_commit());
+        }
+        (Some(CommitHeader { group, epoch: 0 }), None) if request.epoch == 0 => {
+            // After a restore, generation 0 may be taken already, by a group
+            // created after the backup: the recreation picks a later one.
+            match (recreation.required, group.generation) {
+                (false, 0) => Some(group),
+                (true, 0) => return Err(Refused::recreation_required()),
+                (true, _) => Some(group),
+                (false, _) => return Err(Refused::invalid_commit()),
+            }
+        }
+        (Some(CommitHeader { group, epoch: 0 }), Some((generation, _)))
+            if request.epoch == 0 && group.generation > generation =>
+        {
+            if !recreation.required {
+                // Asked by a user (section 11): the next generation, at
+                // most once an hour. After a restore, any later one: the
+                // devices may know generations the server lost.
+                if Some(group.generation) != generation.checked_add(1) {
+                    return Err(Refused::invalid_commit());
+                }
+                if let Some(wait_ms) = recreation.wait_ms {
+                    let in_group = members(&mut tx, conversation)
+                        .await?
+                        .contains(&session.device_id);
+                    // Recreated meanwhile by another device: it has a
+                    // Welcome to process, or the group to join.
+                    return Err(if in_group {
+                        Refused {
+                            retry_after_ms: wait_ms,
+                            ..Refused::new(
+                                proto::ErrorCode::RateLimited,
+                                "a conversation's group is recreated at most once an hour",
+                            )
+                        }
+                    } else {
+                        Refused::stale()
+                    });
+                }
+            }
+            Some(group)
+        }
+        (Some(header), Some((generation, _))) if header.group.generation < generation => {
+            return Err(Refused::recreation_required());
+        }
+        _ if recreation.required => return Err(Refused::recreation_required()),
+        _ => None,
+    };
+    let recreating = first.is_some() && current.is_some();
     // A device the server is removing commits nothing more, but may come
-    // back by external commit once active again (sections 6 and 15).
+    // back by external commit once active again (sections 6 and 15), or
+    // recreate the group, which takes active devices only.
     let cut = cut_off(&mut tx, conversation, session.device_id).await?;
-    if cut && !(request.external && is_external_commit(&request.mls_commit)) {
+    if cut && !recreating && !(request.external && is_external_commit(&request.mls_commit)) {
         return Err(Refused::not_a_member());
     }
     sender_active(&mut tx, session).await?;
@@ -661,21 +787,22 @@ pub async fn submit_commit(
     let roster = ServerRoster::load(&mut tx, &dm.users, state.settings.device_inactive_days)
         .await
         .map_err(state_refused)?;
-    let before = members(&mut tx, conversation).await?;
+    // The devices that hold the group and process the commit; none for a
+    // first commit: the old group's devices of a recreation get a Welcome
+    // if they are in the new group, `JoinConversation` otherwise.
+    let before = if first.is_some() {
+        Vec::new()
+    } else {
+        members(&mut tx, conversation).await?
+    };
 
     let (old_epoch, new_epoch, leaves, reissued, still_pending, welcomed, packages) =
-        match group_of(&mut tx, conversation).await? {
-            None => {
-                if request.epoch != 0 {
-                    return Err(Refused::invalid_commit());
-                }
+        match (first, current) {
+            (Some(identity), _) => {
                 // A new group adds leaves: between friends only.
                 writable(&mut tx, me, dm.peer(me)).await?;
                 let expected = ExpectedGroup {
-                    identity: GroupIdentity {
-                        conversation_id: *conversation.as_bytes(),
-                        generation: 0,
-                    },
+                    identity,
                     participants: &participants,
                 };
                 let (public, devices) = PublicState::create(
@@ -703,6 +830,9 @@ pub async fn submit_commit(
                 {
                     return Err(Refused::invalid_commit());
                 }
+                if recreating || recreation.required {
+                    clear_old_group(&mut tx, conversation).await?;
+                }
                 mls::insert(&mut tx, public).await.map_err(state_refused)?;
                 (
                     0,
@@ -714,7 +844,8 @@ pub async fn submit_commit(
                     Packages::First(added),
                 )
             }
-            Some((generation, epoch)) => {
+            (None, None) => return Err(Refused::invalid_commit()),
+            (None, Some((generation, epoch))) => {
                 if request.epoch < epoch {
                     return Err(Refused::stale_at(epoch));
                 }
@@ -935,6 +1066,18 @@ pub async fn send_message(
             server_time_ms: u64::try_from(at_ms).unwrap_or_default(),
         });
     }
+    if header.group.conversation_id != *conversation.as_bytes() {
+        return Err(Refused::invalid("the message is for another conversation"));
+    }
+    // After a restore nothing goes to the old group, and a message for a
+    // group recreated since is refused the same way: the device joins the
+    // new group first (section 17).
+    let current = group_of(&mut tx, conversation).await?;
+    if recreation(&mut tx, conversation).await?.required
+        || current.is_some_and(|(generation, _)| header.group.generation < generation)
+    {
+        return Err(Refused::recreation_required());
+    }
     // A device the server asked to remove sends nothing more.
     let leaf: bool = sqlx::query_scalar(concat!(
         "SELECT EXISTS (SELECT 1 FROM conversation_devices d \
@@ -951,12 +1094,7 @@ pub async fn send_message(
     }
     sender_active(&mut tx, session).await?;
     writable(&mut tx, me, dm.peer(me)).await?;
-    let (generation, epoch) = group_of(&mut tx, conversation)
-        .await?
-        .ok_or_else(Refused::not_a_member)?;
-    if header.group.conversation_id != *conversation.as_bytes() {
-        return Err(Refused::invalid("the message is for another conversation"));
-    }
+    let (generation, epoch) = current.ok_or_else(Refused::not_a_member)?;
     if (header.group.generation, header.epoch) < (generation, epoch) {
         return Err(Refused::stale_at(epoch));
     }
@@ -1156,7 +1294,7 @@ pub async fn ack_welcome(
 }
 
 /// A DM's users, and its group's epoch and GroupInfo if it has one.
-type GroupInfoRow = (Uuid, Uuid, Option<i64>, Option<Vec<u8>>);
+type GroupInfoRow = (Uuid, Uuid, bool, Option<i64>, Option<Vec<u8>>);
 
 /// `FetchGroupInfo`: the group's latest GroupInfo, to join it by external
 /// commit. Any device of a participant may read it, between friends only:
@@ -1171,7 +1309,8 @@ pub async fn fetch_group_info(
     let conversation = conversation_id(&request.conversation_id)?;
     let mut conn = state.db.acquire().await?;
     let row: Option<GroupInfoRow> = sqlx::query_as(
-        "SELECT d.user_low, d.user_high, g.epoch, g.group_info FROM dm_conversations d \
+        "SELECT d.user_low, d.user_high, c.needs_recreation, g.epoch, g.group_info \
+         FROM dm_conversations d JOIN conversations c ON c.id = d.conversation_id \
          LEFT JOIN mls_groups g ON g.conversation_id = d.conversation_id \
          WHERE d.conversation_id = $1",
     )
@@ -1179,11 +1318,16 @@ pub async fn fetch_group_info(
     .fetch_optional(&mut *conn)
     .await?;
     let me = session.user_id;
-    let Some((low, high, epoch, info)) = row.filter(|(low, high, ..)| me == *low || me == *high)
+    let Some((low, high, needs_recreation, epoch, info)) =
+        row.filter(|(low, high, ..)| me == *low || me == *high)
     else {
         return Err(Refused::not_a_member());
     };
     writable(&mut conn, me, if me == low { high } else { low }).await?;
+    // The restored group is behind its devices: nobody joins it.
+    if needs_recreation {
+        return Err(Refused::recreation_required());
+    }
     match (epoch, info) {
         (Some(epoch), Some(info)) => Ok(proto::GroupInfo {
             epoch: u64::try_from(epoch).unwrap_or_default(),

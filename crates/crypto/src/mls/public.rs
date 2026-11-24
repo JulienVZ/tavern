@@ -118,6 +118,38 @@ pub fn is_external_commit(bytes: &[u8]) -> bool {
         && matches!(message.sender(), Sender::NewMemberCommit)
 }
 
+/// What the server reads of a commit before it checks it: its group and its
+/// epoch, in clear in its framing. A commit at epoch 0 of a generation the
+/// conversation does not have yet is the first commit of a new group: the
+/// group's creation, or its recreation (section 17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitHeader {
+    /// The group: conversation and generation.
+    pub group: GroupIdentity,
+    /// The epoch it commits from.
+    pub epoch: u64,
+}
+
+/// Reads the header of a commit: an MLS `PublicMessage` carrying a commit,
+/// and nothing after it. Its content is not checked here.
+pub fn commit_header(bytes: &[u8]) -> Result<CommitHeader, MlsError> {
+    let (message, rest) =
+        MlsMessageIn::tls_deserialize_bytes(bytes).map_err(|_| MlsError::Malformed)?;
+    if !rest.is_empty() {
+        return Err(MlsError::Malformed);
+    }
+    let MlsMessageBodyIn::PublicMessage(message) = message.extract() else {
+        return Err(MlsError::Malformed);
+    };
+    if message.content_type() != ContentType::Commit {
+        return Err(MlsError::Malformed);
+    }
+    Ok(CommitHeader {
+        group: GroupIdentity::from_group_id(message.group_id())?,
+        epoch: message.epoch().as_u64(),
+    })
+}
+
 /// The KeyPackages a Welcome is for (their `KeyPackageRef`s, in clear in
 /// it), in order. Refused unless it is a Welcome of Tavern's ciphersuite,
 /// with nothing after it.

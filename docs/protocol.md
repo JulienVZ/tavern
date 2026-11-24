@@ -196,6 +196,9 @@ message Ready {
   // Security notices this device has not acknowledged, oldest first, at
   // most 32. Since minor 1.
   repeated SecurityNotice security_notices = 9;
+  // Raised each time the instance is restored from a backup (section 5.2,
+  // "Restored backups"). Since minor 7.
+  uint64 instance_generation = 10;
 }
 
 message DeviceSummary {
@@ -246,9 +249,10 @@ message SecurityNotice {
   SecurityNoticeKind kind = 1;
   bytes notice_id = 2;        // since minor 1
   uint64 created_at_ms = 3;   // since minor 1
+  uint64 backup_taken_at_ms = 4;  // INSTANCE_RESTORED only, 0 if unknown; since minor 7
 }
 // TOTP_DISABLED_BY_ADMIN | PASSWORD_CHANGED | ACCOUNT_RECOVERED
-// | DEVICE_REVOKED | RECOVERY_KEY_REPLACED
+// | DEVICE_REVOKED | RECOVERY_KEY_REPLACED | INSTANCE_RESTORED (since minor 7)
 
 // The user dismissed these notices on this device. At most 64 identifiers;
 // unknown ones are ignored. Answered with Ack. Since minor 1.
@@ -266,9 +270,11 @@ Minor version 1 of the gateway. Each event below is stored for the account and r
 | `ACCOUNT_RECOVERED` | The recovery key is used to set a new password | nobody | no: every device is signed out |
 | `DEVICE_REVOKED` | A device of the account is revoked | the device that revoked it | yes |
 | `RECOVERY_KEY_REPLACED` | The recovery key is replaced | the device that replaced it | yes |
+| `INSTANCE_RESTORED` (minor 7) | The server starts on a database restored from a backup, for every account, with `backup_taken_at_ms` | nobody | no: every device is signed out |
 
 - A device acknowledges for itself only: a notice dismissed on one device stays on the others.
-- A device is not told about what happened before it was enrolled. Exception: `TOTP_DISABLED_BY_ADMIN` and `ACCOUNT_RECOVERED` are also listed for devices enrolled later, until one device of the account acknowledges them.
+- A device is not told about what happened before it was enrolled. Exception: `TOTP_DISABLED_BY_ADMIN`, `ACCOUNT_RECOVERED` and `INSTANCE_RESTORED` are also listed for devices enrolled later, until one device of the account acknowledges them (after a restore, a device enrolled after the backup is unknown to the database, and is enrolled anew).
+- `INSTANCE_RESTORED` gives the date of the backup and says what it means: whatever the user did after it is undone (a password change, a new recovery key, a revocation, a block, an unfriending, TOTP disabled) and messages sent since may be missing. It asks the user to do again what they changed since that date: first change the password and create a new recovery key if they had changed them, then check their devices (revoking again those they had revoked), the people they block or unfriended, and their two-factor authentication. Without a date (0), it says so.
 - Enabling TOTP again deletes the `TOTP_DISABLED_BY_ADMIN` notices of the account.
 - A notice is listed for 90 days at most.
 - A client shows a kind it does not know as a generic notice; it never drops it.
@@ -311,7 +317,9 @@ message SendMessageAck {
 }
 
 // An MLS commit (PublicMessage). Accepted only if `epoch` is the group's
-// current epoch; exactly one commit is accepted per epoch.
+// current epoch; exactly one commit is accepted per epoch. With epoch 0 and
+// a generation the conversation does not have yet: the group's first commit
+// (its creation, or its recreation, since minor 7).
 message SubmitCommit {
   bytes conversation_id = 1;
   uint64 epoch = 2;
@@ -401,7 +409,7 @@ message KeyPackagesLow { uint32 remaining = 1; }
 message JoinConversation { bytes conversation_id = 1; }
 ```
 
-Delivery rules (implemented in tasks 8 and 9 of M2, gateway minors 5 and 6; restore and recreation come with task 9b):
+Delivery rules (implemented in tasks 8, 9 and 9b of M2, gateway minors 5, 6 and 7):
 
 - Each conversation has one sequence, shared by application messages, proposals and commits, numbered under the lock of the conversation's row: strictly increasing, without gaps. A device processes it in the order of its numbers, whatever the order its events arrive in, and fills a gap with `FetchMessages` (section 3, connection lifecycle). It reads it from the commit that added it to the group, to the commit that removed it if one did (`FetchMessages`, at most 200 a page).
 - The group's devices, who receives what, are computed by the server from the public tree it merged, in the same transaction, never from what a client says. A message goes to every device of the group but its sender's, the sender's other devices included; a commit to the devices that held the group before it; a Welcome to each device the commit added, sent again at each connection until `AckWelcome`.
@@ -419,6 +427,8 @@ Delivery rules (implemented in tasks 8 and 9 of M2, gateway minors 5 and 6; rest
 - **The device being removed is cut off** from its proposal on: it is sent the proposal itself, then no event of the conversation; `FetchMessages` gives it the sequence up to its proposal and no further, `AckMessages` stops there, and `SendMessage` and `SubmitCommit` answer `NOT_A_MEMBER`, except an external commit, by which it comes back if it is active again. If the server asks again after an external commit, the cut moves to the new proposal (only commits and proposals lie in between). Once a commit removes the leaf, the device reads up to that commit.
 - **A device back from an inactivity** (or a device of an account enabled again) fetches the GroupInfo and rejoins by external commit, as the same device: the commit removes its earlier leaf, which settles its removal, and the server does not ask for it again. The client shows the gap.
 - **Devices left out of a group** (decided 2026-11-17): after each commit it merges, in a DM open to writing, the server sends `JoinConversation` to the active devices of either user that are not in the group, or that it is removing. Nothing is stored: `GET /v1/conversations` says `joined: false` to such a device at any time.
+- **Recreating a group** (minor 7, [ADR 0019](adr/0019-mls-direct-messages.md), section 17). A group's first commit for a generation the conversation does not have yet, at epoch 0, recreates its group, with the current active devices of both users, checked as a first commit (above). Any active device of either user may submit it, between friends only. It is accepted at the next generation when a user asks (a broken conversation), at most once an hour per conversation (`RATE_LIMITED` with the wait to a device of the group; `STALE_EPOCH` to a device that is not, since the group was just recreated); and at any later generation when a restore requires it. In the same transaction the server deletes what the old group left: its stored messages, Welcomes, pending removals and devices, then its public state; the sequence goes on with the recreation's commit, numbers never reused. The first recreation wins; the others get `STALE_EPOCH` and join by its Welcome. A message, a commit or a `FetchGroupInfo` for the old group is refused with `GROUP_RECREATION_REQUIRED`: the device joins the new group (Welcome, or `JoinConversation` for an active device left out).
+- **Restored backups** (minor 7, [ADR 0019](adr/0019-mls-direct-messages.md), section 15). A restore raises the instance generation, announced in `Ready.instance_generation`. Before serving anything, the server handles a new generation once, in one transaction: every session revoked (every device signs in again with the password, and TOTP if enabled, before anything else), `INSTANCE_RESTORED` for every account, every one-time KeyPackage deleted (those served after the backup would be served a second time; devices upload new ones when they reconnect), and every conversation marked for recreation. Until it is recreated, a conversation takes nothing but its recreation (`GROUP_RECREATION_REQUIRED`), and the server asks for no removal in it. Since generation 0, or the next generation, may have been used after the backup, the recreation after a restore takes a generation above every one the device and the server know of the conversation, above 0 for a conversation without a group. A client that sees a new instance generation recreates the group of each of its conversations, unless another device did it first; a DM created after the backup no longer exists on the server and is created again for the same pair. Client side: tasks 10 and 11.
 
 ### 5.3 Gateway: friends (M2), presence and typing (M3)
 
@@ -516,6 +526,7 @@ enum ErrorCode {
   INVALID_KEY_PACKAGE = 44;
   NOT_A_MEMBER = 45;
   GROUP_INFO_REQUIRED = 46;
+  GROUP_RECREATION_REQUIRED = 47;  // the group must be recreated (a restore), or was recreated since; since minor 7
 
   // Social (M2)
   BLOCKED = 60;
