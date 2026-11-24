@@ -39,7 +39,7 @@ Requirements set by the maintainer:
 |---|---|---|---|
 | **Sign out** | Session revoked. The device stays enrolled and stays a member of its conversations. | Session token and store key removed. Device key seed and wrapped store key kept. | Kept, encrypted. |
 | **Session ended by the instance** (password changed elsewhere, expiry, account disabled) | — | Same as signing out, as soon as the device learns it. | Kept, encrypted. |
-| **Sign out and erase this device** (confirmation dialog) | Device revoked; its part of the store key is erased; from task 9 the server also removes it from its MLS groups. | Record deleted, account removed from the index. | Deleted. |
+| **Sign out and erase this device** (confirmation dialog) | Device revoked; its part of the store key is erased; the server removes it from its MLS groups ([ADR 0019](0019-mls-direct-messages.md), section 6). | Record deleted, account removed from the index. | Deleted. |
 | **Revoked from another device** | Same as above. | Record deleted when the device learns it. | Deleted when the device learns it. |
 
 Erasure revokes first: if the instance cannot be reached, nothing is deleted, the user stays signed in and sees the error, and can retry.

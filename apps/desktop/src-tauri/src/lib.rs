@@ -226,7 +226,8 @@ impl GatewayView {
             },
             GatewayEvent::FriendshipChanged { .. }
             | GatewayEvent::UserDevicesChanged { .. }
-            | GatewayEvent::ConversationCreated { .. } => return None,
+            | GatewayEvent::ConversationCreated { .. }
+            | GatewayEvent::JoinConversation { .. } => return None,
         })
     }
 }

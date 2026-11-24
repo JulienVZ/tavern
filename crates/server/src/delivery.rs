@@ -15,6 +15,13 @@
 //! updates of one's own leaf go through. The blocked user is answered what
 //! an unfriended one is (`NOT_FRIENDS`), by the same work; only the blocker
 //! gets `BLOCKED` (ADR 0020).
+//!
+//! A device the server asked to remove (`pending_removals`, sections 6 and
+//! 15) is cut off from its proposal on: it is told nothing more of the
+//! conversation, reads the sequence up to that proposal and no further, and
+//! sends nothing. It may still fetch the GroupInfo and come back by external
+//! commit if it is active again (a device back after an inactivity), and
+//! that commit, which removes its earlier leaf, settles the removal.
 
 use std::sync::Arc;
 
@@ -32,6 +39,7 @@ use tavern_protocol::{
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::activity;
 use crate::gateway::Event;
 use crate::mls::{self, ServerRoster, StateError};
 use crate::routes::friends;
@@ -310,7 +318,10 @@ async fn writable(conn: &mut PgConnection, me: Uuid, peer: Uuid) -> Result<()> {
 }
 
 /// The conversation's group: generation and epoch.
-async fn group_of(conn: &mut PgConnection, conversation: Uuid) -> Result<Option<(u32, u64)>> {
+pub(crate) async fn group_of(
+    conn: &mut PgConnection,
+    conversation: Uuid,
+) -> std::result::Result<Option<(u32, u64)>, sqlx::Error> {
     let row: Option<(i64, i64)> =
         sqlx::query_as("SELECT generation, epoch FROM mls_groups WHERE conversation_id = $1")
             .bind(conversation)
@@ -321,15 +332,106 @@ async fn group_of(conn: &mut PgConnection, conversation: Uuid) -> Result<Option<
     }))
 }
 
-/// The devices of the conversation's group.
-async fn members(conn: &mut PgConnection, conversation: Uuid) -> Result<Vec<Uuid>> {
-    Ok(sqlx::query_scalar(
-        "SELECT device_id FROM conversation_devices \
-         WHERE conversation_id = $1 AND left_seq IS NULL",
-    )
+/// The SQL condition, on a row of `conversation_devices` named by the
+/// alias, that a device of the group meets when it is not cut off by a
+/// pending removal: who receives what, and who may send. A string literal,
+/// for `concat!`: queries stay static.
+macro_rules! not_cut_off {
+    ($alias:literal) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM pending_removals p WHERE p.conversation_id = ",
+            $alias,
+            ".conversation_id AND p.device_id = ",
+            $alias,
+            ".device_id)"
+        )
+    };
+}
+pub(crate) use not_cut_off;
+
+/// The devices of the conversation's group that receive what is appended
+/// to its sequence: not those the server asked to remove.
+pub(crate) async fn members(
+    conn: &mut PgConnection,
+    conversation: Uuid,
+) -> std::result::Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(concat!(
+        "SELECT device_id FROM conversation_devices d \
+         WHERE conversation_id = $1 AND left_seq IS NULL AND ",
+        not_cut_off!("d")
+    ))
     .bind(conversation)
     .fetch_all(conn)
+    .await
+}
+
+/// Whether the two users of a DM are friends: only then is it open to
+/// writing, and only then are devices left out told to join (section 4).
+async fn friends_now(conn: &mut PgConnection, dm: Dm) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM friendships \
+                        WHERE user_low = $1 AND user_high = $2 AND status = 'accepted')",
+    )
+    .bind(dm.users[0])
+    .bind(dm.users[1])
+    .fetch_one(conn)
     .await?)
+}
+
+/// The active devices of the DM's users that are not in its group, or that
+/// the server asked to remove: they have the conversation to join by
+/// external commit (section 4). Computed, never stored.
+async fn left_out(
+    conn: &mut PgConnection,
+    dm: Dm,
+    inactive_days: u32,
+) -> std::result::Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(concat!(
+        "SELECT d.id FROM devices d JOIN users u ON u.id = d.user_id \
+         WHERE d.user_id = ANY($1) AND ",
+        activity::active_device!("$3"),
+        " AND NOT EXISTS (SELECT 1 FROM conversation_devices c \
+                          WHERE c.conversation_id = $2 AND c.device_id = d.id \
+                            AND c.left_seq IS NULL AND ",
+        not_cut_off!("c"),
+        ") ORDER BY d.id"
+    ))
+    .bind(&dm.users[..])
+    .bind(dm.conversation)
+    .bind(activity::window(inactive_days))
+    .fetch_all(conn)
+    .await
+}
+
+/// Keeps `pending_removals` as the merged state has it: a row goes when its
+/// leaf is no longer to remove (a commit removed it), and a removal asked
+/// again after an external commit moves to its new proposal.
+async fn settle_removals(
+    conn: &mut PgConnection,
+    conversation: Uuid,
+    still_pending: &[i32],
+    reissued: &[(i32, i64)],
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM pending_removals \
+         WHERE conversation_id = $1 AND NOT (leaf_index = ANY($2))",
+    )
+    .bind(conversation)
+    .bind(still_pending)
+    .execute(&mut *conn)
+    .await?;
+    for (leaf, seq) in reissued {
+        sqlx::query(
+            "UPDATE pending_removals SET proposal_seq = $3 \
+             WHERE conversation_id = $1 AND leaf_index = $2",
+        )
+        .bind(conversation)
+        .bind(leaf)
+        .bind(seq)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Writes the group's devices as the merged tree has them, `seq` being the
@@ -448,7 +550,7 @@ fn too_large() -> Refused {
     Refused::new(proto::ErrorCode::PayloadTooLarge, "too large")
 }
 
-fn stored(
+pub(crate) fn stored(
     conversation: Uuid,
     entry: Appended,
     epoch: u64,
@@ -514,7 +616,7 @@ pub async fn submit_commit(
         .map_err(state_refused)?;
     let before = members(&mut tx, conversation).await?;
 
-    let (old_epoch, new_epoch, leaves, reissued, welcomed, packages) =
+    let (old_epoch, new_epoch, leaves, reissued, still_pending, welcomed, packages) =
         match group_of(&mut tx, conversation).await? {
             None => {
                 if request.epoch != 0 {
@@ -555,7 +657,15 @@ pub async fn submit_commit(
                     return Err(Refused::invalid_commit());
                 }
                 mls::insert(&mut tx, public).await.map_err(state_refused)?;
-                (0, 1, leaves, Vec::new(), devices, Packages::First(added))
+                (
+                    0,
+                    1,
+                    leaves,
+                    Vec::new(),
+                    Vec::new(),
+                    devices,
+                    Packages::First(added),
+                )
             }
             Some((generation, epoch)) => {
                 if request.epoch < epoch {
@@ -601,12 +711,20 @@ pub async fn submit_commit(
                     )
                     .map_err(|error| commit_refused(error, epoch))?;
                 let leaves = loaded.state.leaves();
+                let still_pending = loaded
+                    .state
+                    .pending_removals()
+                    .map_err(|error| commit_refused(error, epoch))?
+                    .into_iter()
+                    .map(|leaf| i32::try_from(leaf.u32()).unwrap_or(i32::MAX))
+                    .collect();
                 mls::save(&mut tx, loaded).await.map_err(state_refused)?;
                 (
                     epoch,
                     merged.epoch,
                     leaves,
                     merged.reissued,
+                    still_pending,
                     merged.changes.added,
                     Packages::Member(added),
                 )
@@ -635,7 +753,8 @@ pub async fn submit_commit(
     )
     .await?;
     let mut proposals = Vec::with_capacity(reissued.len());
-    for proposal in reissued {
+    let mut moved = Vec::with_capacity(reissued.len());
+    for tavern_crypto::mls::Reissued { leaf, proposal } in reissued {
         let entry = append(
             &mut tx,
             conversation,
@@ -646,6 +765,7 @@ pub async fn submit_commit(
             retention,
         )
         .await?;
+        moved.push((i32::try_from(leaf).unwrap_or(i32::MAX), entry.seq));
         proposals.push(stored(
             conversation,
             entry,
@@ -655,6 +775,7 @@ pub async fn submit_commit(
             proposal,
         ));
     }
+    settle_removals(&mut tx, conversation, &still_pending, &moved).await?;
     sync_leaves(&mut tx, conversation, &leaves, commit.seq).await?;
     let welcomes: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "INSERT INTO welcomes (conversation_id, recipient_device_id, payload, expires_at) \
@@ -668,6 +789,11 @@ pub async fn submit_commit(
     .fetch_all(&mut *tx)
     .await?;
     let after = members(&mut tx, conversation).await?;
+    let to_join = if friends_now(&mut tx, dm).await? {
+        left_out(&mut tx, dm, state.settings.device_inactive_days).await?
+    } else {
+        Vec::new()
+    };
     tx.commit().await?;
 
     // The devices that held the group before the commit process it; all of
@@ -699,6 +825,14 @@ pub async fn submit_commit(
             mls_welcome: request.mls_welcome.clone(),
         });
         state.gateway.notify_device(device, Event::Welcome(welcome));
+    }
+    for device in to_join {
+        state.gateway.notify_device(
+            device,
+            Event::JoinConversation {
+                conversation_id: conversation,
+            },
+        );
     }
     Ok(proto::CommitAck {
         seq: u64::try_from(commit.seq).unwrap_or_default(),
@@ -745,10 +879,13 @@ pub async fn send_message(
             server_time_ms: u64::try_from(at_ms).unwrap_or_default(),
         });
     }
-    let leaf: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM conversation_devices \
-                        WHERE conversation_id = $1 AND device_id = $2 AND left_seq IS NULL)",
-    )
+    // A device the server asked to remove sends nothing more.
+    let leaf: bool = sqlx::query_scalar(concat!(
+        "SELECT EXISTS (SELECT 1 FROM conversation_devices d \
+                        WHERE conversation_id = $1 AND device_id = $2 AND left_seq IS NULL AND ",
+        not_cut_off!("d"),
+        ")"
+    ))
     .bind(conversation)
     .bind(session.device_id)
     .fetch_one(&mut *tx)
@@ -846,7 +983,9 @@ fn used_elsewhere() -> Refused {
 type MessageRow = (i64, i64, i16, Option<Uuid>, i64, Vec<u8>);
 
 /// `FetchMessages`: the sequence after `after_seq`, from when this device
-/// joined the group to the commit that removed it, if one did.
+/// joined the group to the commit that removed it, if one did, or to the
+/// server's proposal to remove it while that is pending: what follows is
+/// not for it.
 pub async fn fetch_messages(
     state: &AppState,
     session: &Session,
@@ -857,9 +996,12 @@ pub async fn fetch_messages(
         0 => MAX_FETCH_MESSAGES,
         limit => limit.min(MAX_FETCH_MESSAGES),
     };
+    // LEAST ignores a NULL: the earlier of the two ends there is.
     let span: Option<(i64, Option<i64>)> = sqlx::query_as(
-        "SELECT joined_seq, left_seq FROM conversation_devices \
-         WHERE conversation_id = $1 AND device_id = $2",
+        "SELECT d.joined_seq, LEAST(d.left_seq, p.proposal_seq) FROM conversation_devices d \
+         LEFT JOIN pending_removals p \
+           ON p.conversation_id = d.conversation_id AND p.device_id = d.device_id \
+         WHERE d.conversation_id = $1 AND d.device_id = $2",
     )
     .bind(conversation)
     .bind(session.device_id)
@@ -903,7 +1045,8 @@ pub async fn fetch_messages(
 
 /// `AckMessages`: this device has durably processed the sequence up to
 /// `up_to_seq`. Its cursor only moves forward, and never past what it may
-/// read. What every device acknowledged is deleted by the purge (task 9).
+/// read. What every device acknowledged is deleted by the purge
+/// ([`crate::purge`]).
 pub async fn ack_messages(
     state: &AppState,
     session: &Session,
@@ -913,7 +1056,11 @@ pub async fn ack_messages(
     let up_to = i64::try_from(request.up_to_seq).unwrap_or(i64::MAX);
     let updated = sqlx::query(
         "UPDATE conversation_devices d \
-         SET acked_seq = GREATEST(d.acked_seq, LEAST($3, COALESCE(d.left_seq, c.last_seq))) \
+         SET acked_seq = GREATEST(d.acked_seq, LEAST($3, COALESCE( \
+                 LEAST(d.left_seq, (SELECT p.proposal_seq FROM pending_removals p \
+                                    WHERE p.conversation_id = d.conversation_id \
+                                      AND p.device_id = d.device_id)), \
+                 c.last_seq))) \
          FROM conversations c \
          WHERE d.conversation_id = $1 AND d.device_id = $2 AND c.id = d.conversation_id",
     )
@@ -929,7 +1076,7 @@ pub async fn ack_messages(
 }
 
 /// `AckWelcome`: this device has joined, or refused, the group of a
-/// Welcome; it is not sent again. Deleted by the purge (task 9).
+/// Welcome; it is not sent again. Deleted by the purge ([`crate::purge`]).
 pub async fn ack_welcome(
     state: &AppState,
     session: &Session,

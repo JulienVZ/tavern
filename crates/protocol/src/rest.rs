@@ -851,6 +851,11 @@ dto! {
         /// A DM whose users are not friends any more: kept, with its
         /// history, but nothing new can be sent in it.
         pub read_only: bool,
+        /// Whether the requesting device is in its MLS group, and not being
+        /// removed from it. `false` for a device left out of the group (one
+        /// enrolled after it was created, one back after an inactivity): it
+        /// joins by external commit, in a DM that is not read-only.
+        pub joined: bool,
     }
 }
 

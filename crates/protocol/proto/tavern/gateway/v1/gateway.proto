@@ -64,6 +64,7 @@ message ServerFrame {
     FriendshipChanged friendship_changed = 45;  // Since minor 3.
     KeyPackagesLow key_packages_low = 48;  // Since minor 2.
     UserDevicesChanged user_devices_changed = 49;  // Since minor 3.
+    JoinConversation join_conversation = 50;  // Since minor 6.
   }
 }
 
@@ -155,6 +156,15 @@ message ConversationCreated {
   bytes conversation_id = 1;
   ConversationKind kind = 2;
   repeated bytes member_user_ids = 3;
+}
+
+// An active device of a member is not in the conversation's group, or the
+// server asked to remove it (ADR 0019, sections 4 and 15): it joins by
+// external commit, from the GroupInfo. Sent after each commit the server
+// merges, to such devices if they are connected, in a DM open to writing
+// only; the others read `joined` in GET /v1/conversations. Since minor 6.
+message JoinConversation {
+  bytes conversation_id = 1;
 }
 
 enum ConversationKind {

@@ -280,7 +280,8 @@ CREATE TABLE mls_group_entries (
 -- of the conversation's row (conversations.last_seq), strictly increasing
 -- and without gaps; who receives them; the welcomes of the devices a commit
 -- adds; and the idempotency records of sent messages, which outlive them.
--- Acknowledged and expired rows are deleted by the purge (M2, task 9).
+-- Acknowledged and expired rows are deleted by the hourly purge (task 9 of
+-- M2, crates/server/src/purge.rs).
 
 -- The devices of each conversation's group, computed by the server from the
 -- merged public tree in the transaction that merges a commit, never from
@@ -343,16 +344,26 @@ CREATE TABLE welcomes (
 );
 CREATE INDEX welcomes_recipient_idx ON welcomes (recipient_device_id) WHERE acked_at IS NULL;
 
--- Planned (task 9 of M2). External Remove proposals issued by the server and
--- not yet committed, with the sequence of their message. The proposals
--- themselves are stored with the group's public state (mls_group_entries).
+-- Implemented (task 9 of M2, migration 0012). The server's removals not
+-- committed yet (ADR 0019, sections 6 and 15), one per device of a
+-- conversation's group. The proposals themselves are stored with the
+-- group's public state (mls_group_entries). From its proposal on, the
+-- device is cut off: no event of the conversation, the sequence read up to
+-- the proposal and no further, nothing sent. A row goes when a merged
+-- commit removes the leaf; proposal_seq moves when the server asks again
+-- after an external commit.
 CREATE TABLE pending_removals (
-    conversation_id uuid NOT NULL REFERENCES conversations(id), -- META
+    conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, -- META
+    device_id       uuid NOT NULL REFERENCES devices(id) ON DELETE CASCADE, -- META
     leaf_index      integer NOT NULL,                        -- META
     proposal_seq    bigint NOT NULL,                         -- META  sequence number of the proposal message
     created_at      timestamptz NOT NULL DEFAULT now(),      -- META
-    PRIMARY KEY (conversation_id, leaf_index)
+    PRIMARY KEY (conversation_id, device_id),
+    CHECK (leaf_index >= 0),
+    CHECK (proposal_seq >= 1)
 );
+CREATE UNIQUE INDEX pending_removals_leaf_idx ON pending_removals (conversation_id, leaf_index);
+CREATE INDEX pending_removals_device_idx ON pending_removals (device_id);
 ```
 
 Commits and proposals are `PUB`: they are signed but not encrypted, and contain public keys and membership changes only. Their path secrets are HPKE-encrypted to members inside the commit.

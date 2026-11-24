@@ -16,631 +16,27 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use common::dm::*;
 
-use common::ws::{
-    Received, Socket, connect, expect_close, expect_frame, hello, open, receive, send,
-};
+use common::ws::{Received, connect, expect_close, expect_frame, hello, open, receive, send};
 use common::{Account, Device, TestApp};
 use openmls_memory_storage::MemoryStorage;
 use reqwest::Method;
-use tavern_crypto::identity::{ID_LEN, IdentityPublicKey};
 use tavern_crypto::mls::credential::for_device;
-use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::{
-    ClaimedKeyPackage, Commit, DeviceSigner, ExpectedGroup, Group, Incoming, Provider, Roster,
-    ServerSigner, VerifiedLeaf, key_package, padding,
+    ClaimedKeyPackage, Commit, DeviceSigner, Group, Incoming, Provider, VerifiedLeaf, padding,
 };
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
-use tavern_protocol::rest::{
-    Conversation, CreateDmRequest, KeyPackageClaim, KeyPackageCount, UploadKeyPackagesRequest,
-};
 use tavern_protocol::{
     GATEWAY_HELLOS_PER_MINUTE, GATEWAY_REQUEST_BURST, GATEWAY_SUBPROTOCOL,
     MAX_APPLICATION_MESSAGE_BYTES, close_code,
 };
 use tavern_server::delivery::{self, Kind};
 use tavern_server::gateway::EVENT_QUEUE_LEN;
-use tavern_server::mls;
-use tavern_server::session::Session;
+use tavern_server::removals;
 use uuid::Uuid;
-
-/// The identity keys the clients of these tests trust.
-#[derive(Clone)]
-struct Keys(HashMap<[u8; ID_LEN], IdentityPublicKey>);
-
-impl Roster for Keys {
-    fn identity_key(&self, user_id: &[u8; ID_LEN]) -> Option<IdentityPublicKey> {
-        self.0.get(user_id).copied()
-    }
-}
-
-fn leaf(account: &Account, device: &Device) -> VerifiedLeaf {
-    VerifiedLeaf {
-        user_id: *account.user_id.as_bytes(),
-        device_id: *device.device_id.as_bytes(),
-    }
-}
-
-/// A DM between two friends, as its clients know it.
-struct Dm {
-    conversation: Uuid,
-    participants: [[u8; ID_LEN]; 2],
-    keys: Keys,
-    external_sender: [u8; 32],
-}
-
-impl Dm {
-    fn expected(&self) -> ExpectedGroup<'_> {
-        ExpectedGroup {
-            identity: self.identity(),
-            participants: &self.participants,
-        }
-    }
-
-    fn identity(&self) -> GroupIdentity {
-        GroupIdentity {
-            conversation_id: *self.conversation.as_bytes(),
-            generation: 0,
-        }
-    }
-}
-
-/// Makes `a` and `b` friends, and `a`'s device creates their DM (no group).
-async fn dm_between(app: &TestApp, (a, a1): (&Account, &Device), b: &Account) -> Dm {
-    let b_device = app.enrol(b).await;
-    app.befriend((a, a1), (b, &b_device)).await;
-    let conversation: Conversation = app
-        .post(
-            "/v1/conversations",
-            Some(&a1.session_token),
-            &CreateDmRequest { user_id: b.user_id },
-        )
-        .await;
-    let mut participants = [*a.user_id.as_bytes(), *b.user_id.as_bytes()];
-    participants.sort();
-    Dm {
-        conversation: conversation.conversation_id,
-        participants,
-        keys: Keys(
-            [
-                (*a.user_id.as_bytes(), a.identity.public()),
-                (*b.user_id.as_bytes(), b.identity.public()),
-            ]
-            .into_iter()
-            .collect(),
-        ),
-        external_sender: app.state.secrets.external_sender.public_bytes(),
-    }
-}
-
-async fn upload(app: &TestApp, device: &Device, count: usize) {
-    let _: KeyPackageCount = app
-        .post(
-            "/v1/devices/me/key-packages",
-            Some(&device.session_token),
-            &UploadKeyPackagesRequest {
-                key_packages: device.key_packages(count),
-                last_resort: None,
-            },
-        )
-        .await;
-}
-
-/// The packages `by` claims for `user`'s devices, checked as a client does.
-async fn claim(app: &TestApp, by: &Device, user: &Account, keys: &Keys) -> Vec<ClaimedKeyPackage> {
-    let (status, bytes) = app
-        .send::<()>(
-            Method::POST,
-            &format!("/v1/users/{}/key-packages/claim", user.user_id),
-            Some(&by.session_token),
-            None,
-        )
-        .await;
-    assert!(status.is_success(), "{status}");
-    let claim: KeyPackageClaim = serde_json::from_slice(&bytes).unwrap();
-    claim
-        .key_packages
-        .iter()
-        .map(|served| {
-            let device = VerifiedLeaf {
-                user_id: *user.user_id.as_bytes(),
-                device_id: *served.device_id.as_bytes(),
-            };
-            key_package::validate_claimed(served.key_package.as_slice(), device, keys).unwrap()
-        })
-        .collect()
-}
-
-fn code(payload: &ServerPayload) -> proto::ErrorCode {
-    match payload {
-        ServerPayload::Error(error) => error.code(),
-        other => panic!("expected an error, got {other:?}"),
-    }
-}
-
-fn current_epoch(payload: &ServerPayload) -> u64 {
-    match payload {
-        ServerPayload::Error(error) => error.current_epoch,
-        other => panic!("expected an error, got {other:?}"),
-    }
-}
-
-fn error_text(payload: &ServerPayload) -> (proto::ErrorCode, String) {
-    match payload {
-        ServerPayload::Error(error) => (error.code(), error.message.clone()),
-        other => panic!("expected an error, got {other:?}"),
-    }
-}
-
-/// A device connected to the gateway, with its group.
-struct Member {
-    device: Device,
-    socket: Socket,
-    next_request: u64,
-    events: VecDeque<ServerPayload>,
-    group: Option<Group>,
-    /// The Welcomes it acknowledged. A Welcome may arrive twice, pushed
-    /// and sent again at connection (`protocol.md`, section 3): like a
-    /// client, the device goes by its id.
-    acked_welcomes: HashSet<Vec<u8>>,
-}
-
-impl Member {
-    /// Whether `event` is a Welcome this device already acknowledged.
-    fn seen(&self, event: &ServerPayload) -> bool {
-        matches!(event, ServerPayload::WelcomeEvent(welcome)
-            if self.acked_welcomes.contains(&welcome.welcome_id))
-    }
-}
-
-impl Member {
-    async fn connect(app: &TestApp, device: Device) -> Self {
-        let (socket, _) = connect(app, &device).await;
-        Self {
-            device,
-            socket,
-            next_request: 1,
-            events: VecDeque::new(),
-            group: None,
-            acked_welcomes: HashSet::new(),
-        }
-    }
-
-    async fn send_request(&mut self, payload: ClientPayload) -> u64 {
-        self.next_request += 1;
-        send(&mut self.socket, self.next_request, payload).await;
-        self.next_request
-    }
-
-    /// The answer to request `id`; events that arrive meanwhile are kept.
-    async fn answer(&mut self, id: u64) -> ServerPayload {
-        loop {
-            let frame = expect_frame(&mut self.socket).await;
-            if frame.request_id == id {
-                return frame.payload.unwrap();
-            }
-            assert_eq!(frame.request_id, 0, "the answer to another request");
-            self.events.push_back(frame.payload.unwrap());
-        }
-    }
-
-    async fn request(&mut self, payload: ClientPayload) -> ServerPayload {
-        let id = self.send_request(payload).await;
-        self.answer(id).await
-    }
-
-    /// The next event of a sequence or a Welcome; events about friends,
-    /// devices and KeyPackages are skipped.
-    async fn event(&mut self) -> ServerPayload {
-        loop {
-            let event = match self.events.pop_front() {
-                Some(event) => event,
-                None => {
-                    let frame = expect_frame(&mut self.socket).await;
-                    assert_eq!(frame.request_id, 0);
-                    frame.payload.unwrap()
-                }
-            };
-            match event {
-                ServerPayload::FriendshipChanged(_)
-                | ServerPayload::ConversationCreated(_)
-                | ServerPayload::UserDevicesChanged(_)
-                | ServerPayload::DeviceListChanged(_)
-                | ServerPayload::KeyPackagesLow(_) => {}
-                event if self.seen(&event) => {}
-                event => return event,
-            }
-        }
-    }
-
-    /// Asserts that no event of a sequence or Welcome is waiting: a
-    /// heartbeat's answer comes first.
-    async fn nothing_waiting(&mut self) {
-        let answer = self
-            .request(ClientPayload::Heartbeat(proto::Heartbeat {}))
-            .await;
-        assert!(matches!(answer, ServerPayload::HeartbeatAck(_)));
-        while let Some(event) = self.events.pop_front() {
-            assert!(
-                self.seen(&event)
-                    || matches!(
-                        event,
-                        ServerPayload::FriendshipChanged(_)
-                            | ServerPayload::UserDevicesChanged(_)
-                            | ServerPayload::DeviceListChanged(_)
-                            | ServerPayload::KeyPackagesLow(_)
-                    ),
-                "unexpected {event:?}"
-            );
-        }
-    }
-
-    fn create(&mut self, dm: &Dm, claimed: &[ClaimedKeyPackage]) -> Commit {
-        let (group, commit) = Group::create(
-            &self.device.provider,
-            &DeviceSigner::new(&self.device.key),
-            for_device(&self.device.certificate, &self.device.key.public()),
-            &dm.expected(),
-            &dm.external_sender,
-            claimed,
-            &dm.keys,
-        )
-        .unwrap();
-        self.group = Some(group);
-        commit
-    }
-
-    fn self_update(&mut self, dm: &Dm) -> Commit {
-        let Self { group, device, .. } = self;
-        group
-            .as_mut()
-            .unwrap()
-            .self_update(&device.provider, &DeviceSigner::new(&device.key), &dm.keys)
-            .unwrap()
-    }
-
-    fn encrypt(&mut self, content: &[u8]) -> Vec<u8> {
-        let Self { group, device, .. } = self;
-        group
-            .as_mut()
-            .unwrap()
-            .encrypt(&device.provider, &DeviceSigner::new(&device.key), content)
-            .unwrap()
-    }
-
-    fn process(&mut self, dm: &Dm, message: &[u8]) -> Incoming {
-        let Self { group, device, .. } = self;
-        group
-            .as_mut()
-            .unwrap()
-            .process(&device.provider, message, &dm.keys)
-            .unwrap()
-    }
-
-    fn merge(&mut self) {
-        let Self { group, device, .. } = self;
-        group
-            .as_mut()
-            .unwrap()
-            .merge_pending_commit(&device.provider)
-            .unwrap();
-    }
-
-    /// Drops this device's own group, the one it created and lost the race
-    /// with (ADR 0019, section 4), before it joins the winner's.
-    fn drop_group(&mut self) {
-        let group = self.group.take().unwrap();
-        group.delete(&self.device.provider).unwrap();
-    }
-
-    fn discard(&mut self) {
-        let Self { group, device, .. } = self;
-        group
-            .as_mut()
-            .unwrap()
-            .discard_pending_commit(&device.provider)
-            .unwrap();
-    }
-
-    async fn submit(&mut self, dm: &Dm, epoch: u64, commit: Commit, external: bool) -> u64 {
-        self.send_request(ClientPayload::SubmitCommit(proto::SubmitCommit {
-            conversation_id: dm.conversation.as_bytes().to_vec(),
-            epoch,
-            mls_commit: commit.commit,
-            mls_welcome: commit.welcome.unwrap_or_default(),
-            mls_group_info: commit.group_info,
-            external,
-        }))
-        .await
-    }
-
-    async fn send_message(&mut self, dm: &Dm, client_message_id: Uuid, message: Vec<u8>) -> u64 {
-        self.send_request(ClientPayload::SendMessage(proto::SendMessage {
-            conversation_id: dm.conversation.as_bytes().to_vec(),
-            client_message_id: client_message_id.as_bytes().to_vec(),
-            mls_message: message,
-        }))
-        .await
-    }
-
-    /// Joins by the next Welcome, and acknowledges it.
-    async fn join(&mut self, dm: &Dm) {
-        let ServerPayload::WelcomeEvent(welcome) = self.event().await else {
-            panic!("expected a Welcome");
-        };
-        assert_eq!(welcome.conversation_id, dm.conversation.as_bytes());
-        let joined = Group::join(
-            &self.device.provider,
-            &welcome.mls_welcome,
-            &dm.expected(),
-            &dm.keys,
-            &dm.external_sender,
-        )
-        .unwrap();
-        self.group = Some(joined.group);
-        let ack = self
-            .request(ClientPayload::AckWelcome(proto::AckWelcome {
-                welcome_id: welcome.welcome_id.clone(),
-            }))
-            .await;
-        assert!(matches!(ack, ServerPayload::Ack(_)), "{ack:?}");
-        self.acked_welcomes.insert(welcome.welcome_id);
-    }
-
-    /// The next application message, decrypted: its sequence number and
-    /// content.
-    async fn receive_text(&mut self, dm: &Dm) -> (u64, Vec<u8>) {
-        let ServerPayload::MessageEvent(event) = self.event().await else {
-            panic!("expected a message");
-        };
-        let message = event.message.unwrap();
-        match self.process(dm, &message.mls_message) {
-            Incoming::Application { content, .. } => (message.seq, content.expose().to_vec()),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    async fn fetch(&mut self, dm: &Dm, after_seq: u64, limit: u32) -> proto::MessageBatch {
-        let answer = self
-            .request(ClientPayload::FetchMessages(proto::FetchMessages {
-                conversation_id: dm.conversation.as_bytes().to_vec(),
-                after_seq,
-                limit,
-            }))
-            .await;
-        let ServerPayload::MessageBatch(batch) = answer else {
-            panic!("{answer:?}");
-        };
-        batch
-    }
-}
-
-fn commit_ack(payload: &ServerPayload) -> &proto::CommitAck {
-    match payload {
-        ServerPayload::CommitAck(ack) => ack,
-        other => panic!("expected a commit acknowledgement, got {other:?}"),
-    }
-}
-
-fn message_ack(payload: &ServerPayload) -> proto::SendMessageAck {
-    match payload {
-        ServerPayload::SendMessageAck(ack) => *ack,
-        other => panic!("expected a message acknowledgement, got {other:?}"),
-    }
-}
-
-/// The devices of the conversation's group, as the server routes to them.
-async fn routed(app: &TestApp, conversation: Uuid) -> Vec<Uuid> {
-    let mut devices: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT device_id FROM conversation_devices \
-         WHERE conversation_id = $1 AND left_seq IS NULL",
-    )
-    .bind(conversation)
-    .fetch_all(&app.state.db)
-    .await
-    .unwrap();
-    devices.sort();
-    devices
-}
-
-/// The devices the server's public state of the group holds.
-async fn in_tree(app: &TestApp, dm: &Dm) -> Vec<Uuid> {
-    let mut conn = app.state.db.acquire().await.unwrap();
-    let loaded = mls::load(&mut conn, dm.identity()).await.unwrap().unwrap();
-    let mut devices: Vec<Uuid> = loaded
-        .state
-        .leaves()
-        .into_iter()
-        .map(|(_, leaf)| Uuid::from_bytes(leaf.device_id))
-        .collect();
-    devices.sort();
-    devices
-}
-
-async fn sequence(app: &TestApp, conversation: Uuid) -> Vec<(i64, i16)> {
-    sqlx::query_as("SELECT seq, kind FROM messages WHERE conversation_id = $1 ORDER BY seq")
-        .bind(conversation)
-        .fetch_all(&app.state.db)
-        .await
-        .unwrap()
-}
-
-/// Holds `conversation`'s row, as a request adding to its sequence does,
-/// until the returned transaction ends; with its backend.
-async fn hold(
-    app: &TestApp,
-    conversation: Uuid,
-) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
-    let mut tx = app.state.db.begin().await.unwrap();
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
-    sqlx::query("SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE")
-        .bind(conversation)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    (tx, pid)
-}
-
-/// Returns once `count` backends wait behind `holder`: for a row lock, the
-/// first waiter waits for the holder and the next ones for the waiter ahead
-/// of them, hence the chain. PostgreSQL announces no such event, so it is
-/// polled; the timeout only keeps a broken test from hanging.
-async fn waiting_for(app: &TestApp, holder: i32, count: i64) {
-    let wait = async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "WITH RECURSIVE chain(pid) AS ( \
-                     SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) \
-                     UNION \
-                     SELECT a.pid FROM pg_stat_activity a \
-                     JOIN chain c ON c.pid = ANY(pg_blocking_pids(a.pid))) \
-                 SELECT count(*) FROM chain",
-            )
-            .bind(holder)
-            .fetch_one(&app.state.db)
-            .await
-            .unwrap();
-            if waiting == count {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(60), wait)
-        .await
-        .expect("the requests never waited for the conversation");
-}
-
-/// Holds `device`'s read position in `conversation` (its row of
-/// `conversation_devices`) until the returned transaction ends, with its
-/// backend: the device's `AckMessages` waits meanwhile, and its connection
-/// with it.
-async fn hold_cursor(
-    app: &TestApp,
-    conversation: Uuid,
-    device: Uuid,
-) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
-    let mut tx = app.state.db.begin().await.unwrap();
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
-    sqlx::query(
-        "SELECT 1 FROM conversation_devices \
-         WHERE conversation_id = $1 AND device_id = $2 FOR UPDATE",
-    )
-    .bind(conversation)
-    .bind(device)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    (tx, pid)
-}
-
-/// A trigger that runs `body` (PL/pgSQL) after each row inserted into
-/// `table` for `conversation`, and for no other: the tests share one
-/// database. It makes a request fail, or wait, at a precise point.
-struct Trigger {
-    name: String,
-    table: &'static str,
-}
-
-impl Trigger {
-    async fn install(app: &TestApp, table: &'static str, conversation: Uuid, body: &str) -> Self {
-        let name = format!("test_{}", Uuid::new_v4().simple());
-        // Built from a random name, a table and a body of this file, and a
-        // UUID: nothing from outside.
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS \
-             $$ BEGIN {body} RETURN NULL; END $$; \
-             CREATE TRIGGER {name} AFTER INSERT ON {table} FOR EACH ROW \
-             WHEN (NEW.conversation_id = '{conversation}') EXECUTE FUNCTION {name}();"
-        )))
-        .execute(&app.state.db)
-        .await
-        .unwrap();
-        Self { name, table }
-    }
-
-    async fn remove(self, app: &TestApp) {
-        let Self { name, table } = self;
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP TRIGGER {name} ON {table}; DROP FUNCTION {name}();"
-        )))
-        .execute(&app.state.db)
-        .await
-        .unwrap();
-    }
-}
-
-/// The session of `device`, to call the server's handlers directly: two
-/// requests of one device at once, which one connection never sends.
-fn session(account: &Account, device: &Device) -> Session {
-    Session {
-        user_id: account.user_id,
-        device_id: device.device_id,
-        is_admin: false,
-    }
-}
-
-async fn last_seq(app: &TestApp, conversation: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT last_seq FROM conversations WHERE id = $1")
-        .bind(conversation)
-        .fetch_one(&app.state.db)
-        .await
-        .unwrap()
-}
-
-async fn group_epoch(app: &TestApp, conversation: Uuid) -> Option<i64> {
-    sqlx::query_scalar("SELECT epoch FROM mls_groups WHERE conversation_id = $1")
-        .bind(conversation)
-        .fetch_optional(&app.state.db)
-        .await
-        .unwrap()
-}
-
-async fn welcomes_of(app: &TestApp, conversation: Uuid) -> Vec<(Uuid, Uuid)> {
-    sqlx::query_as(
-        "SELECT id, recipient_device_id FROM welcomes WHERE conversation_id = $1 ORDER BY id",
-    )
-    .bind(conversation)
-    .fetch_all(&app.state.db)
-    .await
-    .unwrap()
-}
-
-fn group_info_request(dm: &Dm) -> ClientPayload {
-    ClientPayload::FetchGroupInfo(proto::FetchGroupInfo {
-        conversation_id: dm.conversation.as_bytes().to_vec(),
-    })
-}
-
-/// Alice and Bob's DM, its group created by Alice's first device with Bob's
-/// first device: both connected, in the group.
-async fn group_of_two(app: &TestApp) -> (Account, Member, Account, Member, Dm) {
-    let (alice, alice1) = app.account_with_device("sq", false).await;
-    let bob = app.register("sq", false).await;
-    let dm = dm_between(app, (&alice, &alice1), &bob).await;
-    let bob1 = app.enrol(&bob).await;
-    // Only Bob's newest device has packages, and is active in the group.
-    upload(app, &bob1, 3).await;
-    let claimed = claim(app, &alice1, &bob, &dm.keys).await;
-    let mut alice1 = Member::connect(app, alice1).await;
-    let mut bob1 = Member::connect(app, bob1).await;
-    let commit = alice1.create(&dm, &claimed);
-    let id = alice1.submit(&dm, 0, commit, false).await;
-    commit_ack(&alice1.answer(id).await);
-    alice1.merge();
-    bob1.join(&dm).await;
-    (alice, alice1, bob, bob1, dm)
-}
 
 /// Sections 4 and 18: the first device creates the group with its own
 /// other device and the peer's devices; those join by Welcome, a device
@@ -958,18 +354,17 @@ async fn messages_sent_at_once_take_consecutive_numbers() {
 }
 
 /// The server asks to remove `device` from the group, as at a revocation
-/// (task 9): its proposal is stored with the group's state.
+/// (`removals`): its proposal is stored with the group's state, and
+/// appended to the sequence.
 async fn server_removes(app: &TestApp, dm: &Dm, device: VerifiedLeaf) {
-    let mut tx = app.state.db.begin().await.unwrap();
-    let mut loaded = mls::load(&mut tx, dm.identity()).await.unwrap().unwrap();
-    let leaf = loaded.state.leaf_of(device).unwrap();
-    loaded
-        .state
-        .remove(leaf, &ServerSigner::new(&app.state.secrets.external_sender))
-        .unwrap()
-        .unwrap();
-    mls::save(&mut tx, loaded).await.unwrap();
-    tx.commit().await.unwrap();
+    let issued = removals::remove_from(
+        &app.state,
+        dm.conversation,
+        Uuid::from_bytes(device.device_id),
+    )
+    .await
+    .unwrap();
+    assert!(issued);
 }
 
 /// Section 6: while the server's removals are pending, no application
@@ -979,20 +374,31 @@ async fn server_removes(app: &TestApp, dm: &Dm, device: VerifiedLeaf) {
 async fn pending_removals_hold_messages_and_commits_that_leave_them_out() {
     let app = TestApp::spawn_unlimited().await;
     let (_, mut alice1, bob, mut bob1, dm) = group_of_two(&app).await;
+    // Built before Alice's device knows of the removal: an older or faulty
+    // client's.
+    let message = alice1.encrypt(b"held");
+    let commit = alice1.self_update(&dm);
     server_removes(&app, &dm, leaf(&bob, &bob1.device)).await;
 
-    let message = alice1.encrypt(b"held");
     let id = alice1.send_message(&dm, Uuid::new_v4(), message).await;
     assert_eq!(
         code(&alice1.answer(id).await),
         proto::ErrorCode::RemovalPending
     );
-    let commit = alice1.self_update(&dm);
     let id = alice1.submit(&dm, 1, commit, false).await;
     assert_eq!(
         code(&alice1.answer(id).await),
         proto::ErrorCode::RemovalPending
     );
+    // Both devices are told, the one to remove included, which then hears
+    // nothing more.
+    for member in [&mut alice1, &mut bob1] {
+        let ServerPayload::ProposalEvent(event) = member.event().await else {
+            panic!("expected the server's removal");
+        };
+        let proposal = event.message.unwrap();
+        assert_eq!((proposal.seq, proposal.epoch), (2, 1));
+    }
     bob1.nothing_waiting().await;
 }
 
@@ -1005,6 +411,13 @@ async fn an_external_commit_brings_the_pending_removals_again() {
     let app = TestApp::spawn_unlimited().await;
     let (alice, mut alice1, bob, bob1, dm) = group_of_two(&app).await;
     server_removes(&app, &dm, leaf(&bob, &bob1.device)).await;
+    let ServerPayload::ProposalEvent(event) = alice1.event().await else {
+        panic!("expected the server's removal");
+    };
+    assert!(matches!(
+        alice1.process(&dm, &event.message.unwrap().mls_message),
+        Incoming::Proposal
+    ));
     let alice2 = app.enrol(&alice).await;
     let mut alice2 = Member::connect(&app, alice2).await;
 
@@ -1030,14 +443,14 @@ async fn an_external_commit_brings_the_pending_removals_again() {
     alice2.group = Some(group);
     let id = alice2.submit(&dm, 1, commit, true).await;
     let ack = alice2.answer(id).await;
-    assert_eq!((commit_ack(&ack).seq, commit_ack(&ack).new_epoch), (2, 2));
+    assert_eq!((commit_ack(&ack).seq, commit_ack(&ack).new_epoch), (3, 2));
     alice2.merge();
 
     let ServerPayload::ProposalEvent(event) = alice2.event().await else {
         panic!("expected the removal asked again");
     };
     let proposal = event.message.unwrap();
-    assert_eq!((proposal.seq, proposal.epoch), (3, 2));
+    assert_eq!((proposal.seq, proposal.epoch), (4, 2));
     assert!(proposal.sender_device_id.is_empty(), "the server's");
     assert!(matches!(
         alice2.process(&dm, &proposal.mls_message),
@@ -1059,13 +472,18 @@ async fn an_external_commit_brings_the_pending_removals_again() {
     ));
     assert_eq!(
         sequence(&app, dm.conversation).await,
-        [(1, 2), (2, 2), (3, 3)]
+        [(1, 2), (2, 3), (3, 2), (4, 3)]
     );
     assert_eq!(
         routed(&app, dm.conversation).await,
         in_tree(&app, &dm).await
     );
     assert_eq!(routed(&app, dm.conversation).await.len(), 3);
+    // The removal moved to its proposal of the new epoch.
+    assert_eq!(
+        pending_removals(&app, dm.conversation).await,
+        [(bob1.device.device_id, 4)]
+    );
 }
 
 /// Section 16 and ADR 0020: a read-only DM takes no message and no new

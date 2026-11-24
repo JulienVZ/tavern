@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use tavern_server::config::Config;
 use tavern_server::secrets::InstanceSecrets;
-use tavern_server::{AppState, Settings, app, db, panics, routes, telemetry};
+use tavern_server::{AppState, Settings, app, db, panics, purge, routes, telemetry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -104,6 +104,8 @@ async fn run() -> anyhow::Result<()> {
             )
         },
     );
+    // At start-up, then every hour (ADR 0019, sections 12 and 15).
+    let purge = purge::spawn(state.clone());
     let listener = TcpListener::bind(config.listen_addr)
         .await
         .with_context(|| format!("cannot listen on {}", config.listen_addr))?;
@@ -117,6 +119,7 @@ async fn run() -> anyhow::Result<()> {
     .await
     .context("HTTP server failed")?;
 
+    purge.abort();
     pool.close().await;
     tracing::info!("shut down cleanly");
     Ok(())

@@ -14,6 +14,7 @@
     reason = "test helpers panic on failure, and not every test file uses every helper"
 )]
 
+pub mod dm;
 pub mod ws;
 
 use std::collections::HashMap;

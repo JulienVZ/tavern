@@ -12,12 +12,12 @@ use tavern_protocol::rest::{
 };
 use uuid::Uuid;
 
-use crate::AppState;
 use crate::error::{ApiError, ApiJson, ApiResult, is_unique_violation};
 use crate::gateway::{Event, RevocationReason};
 use crate::notices::{self, NoticeKind};
 use crate::routes::friends;
 use crate::session::{self, EnrolmentAuth, Session};
+use crate::{AppState, removals};
 
 /// Active devices allowed per account.
 pub const MAX_DEVICES: i64 = 10;
@@ -282,5 +282,11 @@ pub(crate) async fn revoke(
         },
     );
     friends::tell_friends_about_device(&state, session.user_id, device_id, false).await;
+    // The device leaves its groups (ADR 0019, section 6), after the
+    // revocation, which does not depend on it: what fails here is asked for
+    // again by the hourly sweep.
+    if let Err(error) = removals::remove_device(&state, device_id).await {
+        tracing::error!(%error, "cannot ask for a revoked device's removals yet");
+    }
     Ok(StatusCode::NO_CONTENT)
 }

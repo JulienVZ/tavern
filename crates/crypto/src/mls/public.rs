@@ -614,7 +614,18 @@ pub struct MergedCommit {
     /// The server's removals that the commit did not carry (an external
     /// commit cannot), signed again for the new epoch: to append to the
     /// conversation's sequence right after the commit (sections 5 and 6).
-    pub reissued: Vec<Vec<u8>>,
+    /// In the order of their leaves.
+    pub reissued: Vec<Reissued>,
+}
+
+/// A removal the server asked again for, in a new epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reissued {
+    /// The leaf to remove: a leaf index does not move in MLS, so it is the
+    /// one first asked for.
+    pub leaf: u32,
+    /// The signed `Remove` proposal (`PublicMessage`).
+    pub proposal: Vec<u8>,
 }
 
 /// The public state of one group, on the server, with the latest GroupInfo
@@ -1009,7 +1020,10 @@ impl PublicState {
             if !validated.removed.contains(&leaf)
                 && let Some(proposal) = self.remove(leaf, signer)?
             {
-                reissued.push(proposal);
+                reissued.push(Reissued {
+                    leaf: leaf.u32(),
+                    proposal,
+                });
             }
         }
         self.group_info = validated.group_info;

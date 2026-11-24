@@ -19,7 +19,7 @@ use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::gateway::RevocationReason;
 use crate::notices::{self, NoticeKind};
 use crate::session::{self, Session};
-use crate::{AppState, totp};
+use crate::{AppState, removals, totp};
 
 /// Codes stored in `admin_audit_log.action`. Never renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +307,12 @@ pub(crate) async fn disable_user(
         Some(user_id),
     )
     .await?;
+    // Its devices leave their groups, as at a revocation (ADR 0019, section
+    // 6); they come back by external commit once the account is enabled
+    // again. What fails here is asked for again by the hourly sweep.
+    if let Err(error) = removals::remove_user_devices(&state, user_id).await {
+        tracing::error!(%error, "cannot ask for a disabled account's removals yet");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

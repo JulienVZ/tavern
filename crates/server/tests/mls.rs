@@ -32,7 +32,7 @@ use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::key_package;
 use tavern_crypto::mls::{
     ClaimedKeyPackage, Commit, DeviceSigner, ExpectedGroup, Group, LeafError, MlsError, Provider,
-    PublicState, Refusal, Roster, ServerSigner, VerifiedLeaf,
+    PublicState, Refusal, Reissued, Roster, ServerSigner, VerifiedLeaf,
 };
 use tavern_server::db;
 use tavern_server::mls::{self, LoadedState, ServerRoster, StateError};
@@ -359,7 +359,7 @@ impl Dm {
         submitter: VerifiedLeaf,
         commit: &Commit,
         keep: bool,
-    ) -> Result<(u64, Vec<Vec<u8>>), MlsError> {
+    ) -> Result<(u64, Vec<Reissued>), MlsError> {
         let mut tx = pool.begin().await.unwrap();
         let loaded = mls::load(&mut tx, self.identity).await.unwrap().unwrap();
         self.finish(tx, loaded, submitter, commit, keep).await
@@ -373,7 +373,7 @@ impl Dm {
         submitter: VerifiedLeaf,
         commit: &Commit,
         keep: bool,
-    ) -> Result<(u64, Vec<Vec<u8>>), MlsError> {
+    ) -> Result<(u64, Vec<Reissued>), MlsError> {
         let roster = self.roster(&mut tx).await;
         let validated = loaded.state.validate_commit(
             &commit.commit,
@@ -614,6 +614,7 @@ async fn the_server_s_removals_go_through_save_and_load() {
         .await
         .unwrap();
     assert_eq!((epoch, reissued.len()), (2, 1));
+    assert_eq!(reissued[0].leaf, leaf.u32());
     let stored = dm.stored(&pool).await;
     assert_eq!(stored.epoch(), 2);
     assert_eq!(stored.pending_removals().unwrap(), [leaf]);

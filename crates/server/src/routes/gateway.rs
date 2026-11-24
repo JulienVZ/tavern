@@ -667,6 +667,12 @@ pub fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
             (payload, None)
         }
         Event::Welcome(welcome) => (ServerPayload::WelcomeEvent(welcome.as_ref().clone()), None),
+        Event::JoinConversation { conversation_id } => (
+            ServerPayload::JoinConversation(proto::JoinConversation {
+                conversation_id: conversation_id.as_bytes().to_vec(),
+            }),
+            None,
+        ),
         Event::ConversationCreated {
             conversation_id,
             members,
@@ -747,6 +753,16 @@ mod tests {
         assert_eq!(
             event_payload(Event::SessionRevoked(RevocationReason::Replaced)).1,
             Some(close_code::REPLACED)
+        );
+        let conversation_id = Uuid::from_u128(11);
+        assert_eq!(
+            event_payload(Event::JoinConversation { conversation_id }),
+            (
+                ServerPayload::JoinConversation(proto::JoinConversation {
+                    conversation_id: conversation_id.as_bytes().to_vec(),
+                }),
+                None
+            )
         );
     }
 

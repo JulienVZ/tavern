@@ -183,6 +183,13 @@ pub enum GatewayEvent {
         /// Its members.
         members: Vec<Uuid>,
     },
+    /// This device is not in the MLS group of a conversation of its user,
+    /// or the server is removing it: it joins by external commit (ADR 0019,
+    /// sections 4 and 15; the sync engine of tasks 10 and 11).
+    JoinConversation {
+        /// The conversation.
+        conversation_id: Uuid,
+    },
     /// A friend enrolled (`added`) or revoked a device.
     UserDevicesChanged {
         /// The friend.
@@ -494,6 +501,8 @@ async fn connection(
                             },
                         )
                     }
+                    Some(ServerPayload::JoinConversation(join)) => uuid(&join.conversation_id)
+                        .map(|conversation_id| GatewayEvent::JoinConversation { conversation_id }),
                     Some(ServerPayload::UserDevicesChanged(change)) => uuid(&change.user_id)
                         .zip(uuid(&change.device_id))
                         .map(|(user_id, device_id)| GatewayEvent::UserDevicesChanged {

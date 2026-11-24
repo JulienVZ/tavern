@@ -41,8 +41,10 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 /// - 4: `ConversationCreated` (M2);
 /// - 5: a conversation's sequence: commits, messages, welcomes; the limits
 ///   on requests and on `Hello`s per device; the close code 4009 when a
-///   device does not keep up with its events (M2, ADR 0019).
-pub const GATEWAY_MINOR_VERSION: u32 = 5;
+///   device does not keep up with its events (M2, ADR 0019);
+/// - 6: the server's removals and the cut-off of a device it removes;
+///   `JoinConversation` to the devices left out of a group (M2, ADR 0019).
+pub const GATEWAY_MINOR_VERSION: u32 = 6;
 
 /// Largest number of notices one `AckSecurityNotices` frame may name.
 pub const MAX_SECURITY_NOTICE_ACKS: usize = 64;

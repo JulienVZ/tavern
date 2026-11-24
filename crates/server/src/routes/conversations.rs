@@ -30,29 +30,40 @@ fn not_friends() -> ApiError {
     )
 }
 
-/// A DM, its group if any, and whether its users are friends.
-type Row = (Uuid, i64, Uuid, Uuid, Option<i64>, Option<i64>, bool);
+/// A DM, its group if any, whether its users are friends, and whether the
+/// requesting device is in its group.
+type Row = (Uuid, i64, Uuid, Uuid, Option<i64>, Option<i64>, bool, bool);
 
-/// The DMs of `user`, or the one with id `only`, oldest first.
-async fn dms<'c>(db: impl PgExecutor<'c>, user: Uuid, only: Option<Uuid>) -> ApiResult<Vec<Row>> {
-    Ok(sqlx::query_as(
+/// The DMs of the session's user, or the one with id `only`, oldest first.
+async fn dms<'c>(
+    db: impl PgExecutor<'c>,
+    session: &Session,
+    only: Option<Uuid>,
+) -> ApiResult<Vec<Row>> {
+    Ok(sqlx::query_as(concat!(
         "SELECT c.id, c.last_seq, d.user_low, d.user_high, g.generation, g.epoch, \
                 EXISTS (SELECT 1 FROM friendships f \
                         WHERE f.user_low = d.user_low AND f.user_high = d.user_high \
-                          AND f.status = 'accepted') \
+                          AND f.status = 'accepted'), \
+                EXISTS (SELECT 1 FROM conversation_devices m \
+                        WHERE m.conversation_id = c.id AND m.device_id = $3 \
+                          AND m.left_seq IS NULL AND ",
+        crate::delivery::not_cut_off!("m"),
+        ") \
          FROM dm_conversations d \
          JOIN conversations c ON c.id = d.conversation_id \
          LEFT JOIN mls_groups g ON g.conversation_id = c.id \
          WHERE (d.user_low = $1 OR d.user_high = $1) AND ($2::uuid IS NULL OR c.id = $2) \
-         ORDER BY c.created_at, c.id",
-    )
-    .bind(user)
+         ORDER BY c.created_at, c.id"
+    ))
+    .bind(session.user_id)
     .bind(only)
+    .bind(session.device_id)
     .fetch_all(db)
     .await?)
 }
 
-fn view((id, last_seq, low, high, generation, epoch, friends): Row) -> Conversation {
+fn view((id, last_seq, low, high, generation, epoch, friends, joined): Row) -> Conversation {
     Conversation {
         conversation_id: id,
         kind: ConversationKind::Dm,
@@ -61,6 +72,7 @@ fn view((id, last_seq, low, high, generation, epoch, friends): Row) -> Conversat
         epoch: epoch.and_then(|epoch| u64::try_from(epoch).ok()),
         last_seq: u64::try_from(last_seq).unwrap_or_default(),
         read_only: !friends,
+        joined,
     }
 }
 
@@ -128,7 +140,7 @@ pub(crate) async fn create(
             (id, StatusCode::CREATED)
         }
     };
-    let row = dms(&mut *tx, me, Some(id))
+    let row = dms(&mut *tx, &session, Some(id))
         .await?
         .into_iter()
         .next()
@@ -147,8 +159,9 @@ pub(crate) async fn create(
 }
 
 /// The user's conversations, oldest first, each with its group's generation
-/// and epoch (`null` while it has no group), and `read_only` for a DM whose
-/// users are not friends any more.
+/// and epoch (`null` while it has no group), `read_only` for a DM whose
+/// users are not friends any more, and `joined` for whether the requesting
+/// device is in its group (ADR 0019, section 4).
 #[utoipa::path(
     get,
     path = "/v1/conversations",
@@ -160,7 +173,7 @@ pub(crate) async fn list(
     State(state): State<AppState>,
     session: Session,
 ) -> ApiResult<Json<ConversationList>> {
-    let rows = dms(&state.db, session.user_id, None).await?;
+    let rows = dms(&state.db, &session, None).await?;
     Ok(Json(ConversationList {
         conversations: rows.into_iter().map(view).collect(),
     }))

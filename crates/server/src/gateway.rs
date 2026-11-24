@@ -89,6 +89,12 @@ pub enum Event {
     Sequenced(Arc<proto::StoredMessage>),
     /// A Welcome for the receiving device.
     Welcome(Arc<proto::WelcomeEvent>),
+    /// The receiving device is not in the group of a conversation of its
+    /// user, or is being removed from it: it joins by external commit.
+    JoinConversation {
+        /// The conversation.
+        conversation_id: Uuid,
+    },
     /// A friend of the receiving user enrolled (`added`) or revoked a device.
     UserDevicesChanged {
         /// The friend.

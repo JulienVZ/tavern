@@ -2910,6 +2910,7 @@ fn the_server_asks_again_for_the_removals_an_external_commit_leaves_out() {
     let merged = accept(&dm, &mut state, &alice3, &commit);
     assert_eq!(merged.changes.added, [alice3.leaf()]);
     assert_eq!(merged.reissued.len(), 1);
+    assert_eq!(merged.reissued[0].leaf, bob2.u32());
     assert_eq!(state.pending_removals().unwrap(), [bob2]);
     dm.deliver_all(&commit.commit, &[]);
     dm.devices.push(alice3);
@@ -2921,7 +2922,7 @@ fn the_server_asks_again_for_the_removals_an_external_commit_leaves_out() {
 
     // The removal again, for epoch 2: every member stores it, the newcomer
     // too, and the first to commit carries it.
-    for incoming in dm.deliver_all(&merged.reissued[0], &[]) {
+    for incoming in dm.deliver_all(&merged.reissued[0].proposal, &[]) {
         assert_eq!(incoming, Incoming::Proposal);
     }
     let device = &dm.devices[joined];

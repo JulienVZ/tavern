@@ -39,7 +39,7 @@ pub use group::{Commit, ExpectedGroup, Group, Incoming, Joined, MembershipChange
 pub use key_package::ClaimedKeyPackage;
 pub use policy::{Alarm, PolicyError};
 pub use public::{
-    ApplicationHeader, MergedCommit, PROPOSAL_QUEUE_KIND, PublicEntries, PublicState,
+    ApplicationHeader, MergedCommit, PROPOSAL_QUEUE_KIND, PublicEntries, PublicState, Reissued,
     ValidatedCommit, application_header, first_commit_sender, welcome_key_packages,
 };
 pub use signer::{DeviceSigner, ServerSigner};

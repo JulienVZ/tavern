@@ -91,6 +91,7 @@ message ServerFrame {
     TypingEvent typing_event = 47;
     KeyPackagesLow key_packages_low = 48;
     UserDevicesChanged user_devices_changed = 49;
+    JoinConversation join_conversation = 50;
   }
 }
 ```
@@ -109,7 +110,7 @@ Rules:
 3. The server answers `Ready`, or `Error` followed by a close.
 4. The client sends `Heartbeat` every 30 seconds. The server closes a connection that has been silent for 75 seconds.
 5. On every `Heartbeat` the server checks that the session is still valid, and closes with 4003 when it is not. `Ready` lists the devices enrolled while this device was away; the client shows them, then sends `AckDeviceList`. `Ready` also lists the security notices this device has not acknowledged; the client shows them until the user dismisses them, then sends `AckSecurityNotices`.
-6. From M2: after `Ready`, the client catches up: for each conversation, `FetchMessages` from its last acknowledged sequence number. Pending welcomes are re-sent by the server as `WelcomeEvent` until acknowledged. A Welcome may therefore arrive twice: the connection subscribes to events before `Ready`, so that none is lost, and a Welcome stored in between is both pushed and re-sent. The client goes by `welcome_id`, and a Welcome it already acknowledged is ignored.
+6. From M2: after `Ready`, the client catches up: for each conversation, `FetchMessages` from its last acknowledged sequence number. Pending welcomes are re-sent by the server as `WelcomeEvent` until acknowledged. A Welcome may therefore arrive twice: the connection subscribes to events before `Ready`, so that none is lost, and a Welcome stored in between is both pushed and re-sent. The client goes by `welcome_id`: a Welcome it already acknowledged is ignored, and so is a Welcome for a group it has already joined, even one it has not acknowledged yet (the join was written, the acknowledgement lost); it acknowledges that one again.
 7. On disconnect the client reconnects with exponential backoff and jitter (1 s up to 60 s). It does not reconnect after 4002 or 4003: the session is gone and the user must log in again. After 4009 (it did not keep up with its events) it reconnects and catches up as in step 6.
 
 Pushed events are notifications, not a reliable source. An event may be missed (the connection dropped, or its queue was full: the server then closes with 4009 rather than drop an event in silence) and events may arrive out of order (each request notifies after its own transaction). The source is the stored sequence, and from M2 the client follows one rule: it processes each conversation's sequence in the order of its numbers, from the last one it processed. Given an event with number N+2 when it has processed N, it puts N+2 aside, fetches the gap with `FetchMessages` (after N), and processes N+1, then N+2. Welcomes, security notices and the device list come back at each connection.
@@ -290,7 +291,7 @@ Minor version 1 of the gateway. Each event below is stored for the account and r
 | `DELETE /v1/friends/{user_id}` | Remove a friend. Implemented |
 | `PUT /v1/blocks/{user_id}`, `DELETE /v1/blocks/{user_id}` | Block (ends a friendship or a request between the two; not disclosed to the blocked user), unblock (deletes what the blocked user sent meanwhile). Implemented |
 | `POST /v1/conversations` | Create the DM with a friend (`{"user_id": ...}`); idempotent: one DM per pair of users, `201` when created, `200` with the existing one (with its epoch) if any, also when two creations cross and when two users become friends again. `NOT_FRIENDS` for anyone else, an unknown user and a blocked or blocking one alike; `INVALID_ARGUMENT` for oneself. Implemented (task 7 of M2) |
-| `GET /v1/conversations` | Conversations of the user, oldest first: members, generation and current epoch of the MLS group (`null` while it has none), last sequence number, and `read_only` for a DM whose users are not friends any more. Implemented |
+| `GET /v1/conversations` | Conversations of the user, oldest first: members, generation and current epoch of the MLS group (`null` while it has none), last sequence number, `read_only` for a DM whose users are not friends any more, and `joined`: whether the requesting device is in its group and not being removed from it (`false` for a device left out of the group, which joins by external commit, and for a device the server is removing). `joined` since task 9 of M2 (a field, not a route: the REST minor is unchanged). Implemented |
 
 Creating a DM reserves a conversation id on the server, and announces it (`ConversationCreated`). The creating device then builds the MLS group locally (group id = conversation id followed by a 32-bit group generation, 0 at first, incremented when the group is recreated; `external_senders` = the server's key), adds its own other devices and the peer's devices, and submits the first commit with its Welcome. If it stops before, the conversation stays without a group (epoch `null`): any active device of either user may create it, the first commit for epoch 0 wins and the others get `STALE_EPOCH`. Details, including unfriending, blocking and recreation: [ADR 0019](adr/0019-mls-direct-messages.md).
 
@@ -392,9 +393,15 @@ message UserDevicesChanged {
 // A claim left this device fewer than 10 one-time KeyPackages: it uploads
 // more. A device that is not connected uploads at its next connection.
 message KeyPackagesLow { uint32 remaining = 1; }
+
+// This active device of a member is not in the conversation's group, or the
+// server is removing it: it joins by external commit. Sent after each commit
+// the server merges, in a DM open to writing only, to such devices that are
+// connected; the others read `joined` in GET /v1/conversations. Since minor 6.
+message JoinConversation { bytes conversation_id = 1; }
 ```
 
-Delivery rules (implemented in task 8 of M2, gateway minor 5; removals, purge and recreation come with task 9):
+Delivery rules (implemented in tasks 8 and 9 of M2, gateway minors 5 and 6; restore and recreation come with task 9b):
 
 - Each conversation has one sequence, shared by application messages, proposals and commits, numbered under the lock of the conversation's row: strictly increasing, without gaps. A device processes it in the order of its numbers, whatever the order its events arrive in, and fills a gap with `FetchMessages` (section 3, connection lifecycle). It reads it from the commit that added it to the group, to the commit that removed it if one did (`FetchMessages`, at most 200 a page).
 - The group's devices, who receives what, are computed by the server from the public tree it merged, in the same transaction, never from what a client says. A message goes to every device of the group but its sender's, the sender's other devices included; a commit to the devices that held the group before it; a Welcome to each device the commit added, sent again at each connection until `AckWelcome`.
@@ -406,8 +413,11 @@ Delivery rules (implemented in task 8 of M2, gateway minor 5; removals, purge an
 - A commit is validated against the public group state: it is the submitting device's own, its signature is valid, the clients' policy holds (proposals allowed for the sender, no group context change, new leaves active devices of participants with valid device certificates and the very key and certificate each device enrolled with), and the GroupInfo submitted with it is the new epoch's (same group context and confirmation tag, with the ratchet tree and `ExternalPub`), signed by the committer. A member's commit that leaves out a pending removal is refused with `REMOVAL_PENDING`; after an external commit, which cannot carry them, the server appends its removals again for the new epoch. The epoch update is atomic ([ADR 0019](adr/0019-mls-direct-messages.md), sections 5, 6 and 14).
 - External proposals issued by the server are always `Remove`. Clients reject any other type from an external sender.
 - `SendMessage` is idempotent on (`device`, `client_message_id`): a retry returns the original acknowledgement, and a message already accepted is never stored or delivered twice, even re-encrypted. The idempotency record outlives the message, for twice the retention period; a client never resends a message older than the retention period.
-- The server deletes a stored message once every recipient device has acknowledged it, or after the retention limit (`TAVERN_MESSAGE_RETENTION_DAYS`, default and maximum 30 days), whichever comes first. A welcome is deleted when acknowledged.
-- A device that has not connected for `TAVERN_DEVICE_INACTIVE_DAYS` (default: the retention; never more) is removed from its groups by the server's `Remove` proposals, without being revoked. It rejoins by external commit when it comes back.
+- The server deletes a stored message once every device it was for has acknowledged it (every device of the group that reads the sequence at its number, the sender excepted), or after the retention limit (`TAVERN_MESSAGE_RETENTION_DAYS`, default and maximum 30 days), whichever comes first. A welcome is deleted when acknowledged or expired; an idempotency record and a KeyPackage when expired. This purge runs at start-up, then every hour.
+- **Removals.** A revoked device, the devices of a disabled account, and a device that has not connected for `TAVERN_DEVICE_INACTIVE_DAYS` (default: the retention; never more), without being revoked, leave each of their groups by one `Remove` proposal of the server, signed with the external sender key and appended to the sequence (`ProposalEvent`, `sender_device_id` empty). A revocation and the disabling of an account ask for them right after their own transaction; the hourly pass asks for any that is missing. Asking again changes nothing: one proposal per device and group. Until a member commits it, the group takes no application message (`REMOVAL_PENDING`).
+- **The device being removed is cut off** from its proposal on: it is sent the proposal itself, then no event of the conversation; `FetchMessages` gives it the sequence up to its proposal and no further, `AckMessages` stops there, and `SendMessage` answers `NOT_A_MEMBER`. If the server asks again after an external commit, the cut moves to the new proposal (only commits and proposals lie in between). Once a commit removes the leaf, the device reads up to that commit.
+- **A device back from an inactivity** (or a device of an account enabled again) fetches the GroupInfo and rejoins by external commit, as the same device: the commit removes its earlier leaf, which settles its removal, and the server does not ask for it again. The client shows the gap.
+- **Devices left out of a group** (decided 2026-11-17): after each commit it merges, in a DM open to writing, the server sends `JoinConversation` to the active devices of either user that are not in the group, or that it is removing. Nothing is stored: `GET /v1/conversations` says `joined: false` to such a device at any time.
 
 ### 5.3 Gateway: friends (M2), presence and typing (M3)
 
