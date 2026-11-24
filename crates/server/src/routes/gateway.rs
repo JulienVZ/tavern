@@ -426,19 +426,19 @@ async fn run(
     let limit = RequestLimit::new(&state.rate_limits.gateway, session.device_id);
     loop {
         tokio::select! {
-            // First: once the session ended, no other request is handled,
-            // and the connection closes without waiting for its queue.
+            // In this order: a request first, then the end of the session,
+            // then the queue. A request received once the session ended is
+            // not handled: the connection closes instead, whatever arrived
+            // first. An idle connection closes as soon as its session ends,
+            // without waiting for its queue.
             biased;
-            reason = subscription.ended.wait() => {
-                let (payload, close) = translate(Event::SessionRevoked(reason));
-                // The peer may be gone already: it closes all the same.
-                let _ = socket.send(frame(0, payload)).await;
-                return close;
-            }
             incoming = tokio::time::timeout(silence, socket.recv()) => {
                 let Ok(message) = incoming else {
                     return Some(close_code::HEARTBEAT_TIMEOUT);
                 };
+                if let Some(reason) = subscription.ended.now() {
+                    return session_ended(socket, translate, reason).await;
+                }
                 // Untrusted input: a panic while handling it closes this
                 // connection only.
                 let next = match panics::guard(on_message(state, session, &limit, message)).await {
@@ -454,6 +454,9 @@ async fn run(
                 if socket.send(frame(request_id, reply)).await.is_err() {
                     return None;
                 }
+            }
+            reason = subscription.ended.wait() => {
+                return session_ended(socket, translate, reason).await;
             }
             event = subscription.events.recv() => {
                 let Some(event) = event else {
@@ -481,6 +484,18 @@ async fn run(
             }
         }
     }
+}
+
+/// Tells the client its session ended; returns the close code.
+async fn session_ended(
+    socket: &mut WebSocket,
+    translate: Translate,
+    reason: RevocationReason,
+) -> Option<u16> {
+    let (payload, close) = translate(Event::SessionRevoked(reason));
+    // The peer may be gone already: it closes all the same.
+    let _ = socket.send(frame(0, payload)).await;
+    close
 }
 
 /// What to do after a message from the client.

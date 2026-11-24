@@ -162,6 +162,11 @@ pub struct Subscription {
 pub struct SessionEnd(watch::Receiver<Option<RevocationReason>>);
 
 impl SessionEnd {
+    /// The reason, if the device's session ended already.
+    pub fn now(&self) -> Option<RevocationReason> {
+        *self.0.borrow()
+    }
+
     /// Resolves once the device's session ended ([`Registry::end_session`]),
     /// with the reason; never otherwise. The connection then closes at once,
     /// whatever its queue still holds and whatever the client sends.

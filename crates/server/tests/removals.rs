@@ -33,6 +33,7 @@ use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_server::delivery::{self, Refused};
+use tavern_server::gateway::Event;
 use tavern_server::{mls, removals};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -501,12 +502,24 @@ async fn a_device_connected_for_days_stays_active() {
     bob1.nothing_waiting().await;
 }
 
-/// Section 6: a revocation closes the device's connection at once: the
-/// requests it sends after the revocation are not handled, whatever its
-/// queue still holds.
+/// Raw frame of a request, sent without waiting for anything.
+async fn send_raw(member: &mut Member, request_id: u64, payload: ClientPayload) {
+    let frame = proto::ClientFrame {
+        request_id,
+        payload: Some(payload),
+    };
+    member
+        .socket
+        .send(Message::Binary(frame.encode_to_vec().into()))
+        .await
+        .unwrap();
+}
+
+/// Section 6: a revocation closes an idle connection at once, with
+/// `SessionRevoked`, without waiting for anything from the device.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
-async fn a_revocation_closes_the_device_s_connection_at_once() {
+async fn a_revocation_closes_an_idle_connection_at_once() {
     let app = TestApp::spawn_unlimited().await;
     let (_, _alice1, bob, mut bob1, _) = group_of_two(&app).await;
     let bob2 = app.enrol(&bob).await;
@@ -519,31 +532,85 @@ async fn a_revocation_closes_the_device_s_connection_at_once() {
         )
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    // Requests sent after the revocation: none is handled, whether the
-    // connection is between two of them or not. Sending fails once the
-    // server closed it.
-    for request_id in 100..120 {
-        let frame = proto::ClientFrame {
-            request_id,
-            payload: Some(ClientPayload::Heartbeat(proto::Heartbeat {})),
-        };
-        if bob1
-            .socket
-            .send(Message::Binary(frame.encode_to_vec().into()))
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-    // What was sent before the revocation may come first; no answer comes.
+    // Events queued before the revocation may come first.
     loop {
         let frame = expect_frame(&mut bob1.socket).await;
-        assert_eq!(frame.request_id, 0, "no answer to the request: {frame:?}");
+        assert_eq!(frame.request_id, 0);
         if matches!(frame.payload, Some(ServerPayload::SessionRevoked(_))) {
             break;
         }
     }
+    assert_eq!(
+        expect_close(&mut bob1.socket).await,
+        Some(close_code::SESSION_REVOKED)
+    );
+}
+
+/// Section 6: once its session ended, a connection handles no request it
+/// receives, even one that was waiting to be read when the session ended:
+/// it closes instead. The order is forced: the device's first request
+/// waits for the conversation (held by the test), its second one is sent
+/// behind it, then the device is revoked, and only then is the
+/// conversation released. The first request, received before the
+/// revocation, is answered by its own checks; the second never is.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_request_received_after_a_revocation_is_not_handled() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, _alice1, bob, mut bob1, dm) = group_of_two(&app).await;
+    let bob2 = app.enrol(&bob).await;
+    let message = bob1.encrypt(b"sent before my revocation");
+
+    let (held, holder) = hold(&app, dm.conversation).await;
+    send_raw(
+        &mut bob1,
+        1,
+        ClientPayload::SendMessage(message_request(&dm, message)),
+    )
+    .await;
+    waiting_for(&app, holder, 1).await;
+    send_raw(&mut bob1, 2, ClientPayload::Heartbeat(proto::Heartbeat {})).await;
+    // Events queued meanwhile: the end of the session does not wait for
+    // them, nor does it let the second request through while they drain.
+    for _ in 0..30 {
+        app.state.gateway.notify_device(
+            bob1.device.device_id,
+            Event::KeyPackagesLow { remaining: 9 },
+        );
+    }
+
+    // The revocation ends the session, then asks for the removal, which
+    // waits for the conversation behind the first request.
+    let path = format!("/v1/devices/{}", bob1.device.device_id);
+    let revoke = app.status::<()>(Method::DELETE, &path, Some(&bob2.session_token), None);
+    let release = async {
+        waiting_for(&app, holder, 2).await;
+        held.rollback().await.unwrap();
+    };
+    let (status, ()) = tokio::join!(revoke, release);
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Events queued before may come first; then the first request's
+    // answer, and the end of the session. The second request gets nothing.
+    let mut answered = false;
+    loop {
+        let frame = expect_frame(&mut bob1.socket).await;
+        match (frame.request_id, frame.payload) {
+            (0, Some(ServerPayload::SessionRevoked(_))) => break,
+            (0, Some(ServerPayload::KeyPackagesLow(_))) => {
+                panic!("the connection waited for its queue")
+            }
+            (0, _) => {}
+            (1, Some(ServerPayload::Error(error))) => {
+                assert_eq!(error.code, i32::from(proto::ErrorCode::Unauthenticated));
+                answered = true;
+            }
+            (request_id, payload) => {
+                panic!("request {request_id} was handled after the revocation: {payload:?}")
+            }
+        }
+    }
+    assert!(answered, "the first request was not answered");
     assert_eq!(
         expect_close(&mut bob1.socket).await,
         Some(close_code::SESSION_REVOKED)
