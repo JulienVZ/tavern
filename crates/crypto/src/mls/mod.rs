@@ -40,7 +40,8 @@ pub use key_package::ClaimedKeyPackage;
 pub use policy::{Alarm, PolicyError};
 pub use public::{
     ApplicationHeader, MergedCommit, PROPOSAL_QUEUE_KIND, PublicEntries, PublicState, Reissued,
-    ValidatedCommit, application_header, first_commit_sender, welcome_key_packages,
+    ValidatedCommit, application_header, first_commit_sender, is_external_commit,
+    welcome_key_packages,
 };
 pub use signer::{DeviceSigner, ServerSigner};
 

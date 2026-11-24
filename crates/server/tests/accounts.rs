@@ -610,9 +610,10 @@ async fn a_revoked_device_loses_its_session_and_cannot_come_back() {
         StatusCode::NO_CONTENT
     );
 
+    // Ended at once: the connection closes without its queue.
     assert_eq!(
-        second_connection.events.try_recv().unwrap(),
-        Event::SessionRevoked(RevocationReason::Revoked)
+        second_connection.ended.wait().await,
+        RevocationReason::Revoked
     );
     assert_eq!(
         first_connection.events.try_recv().unwrap(),
@@ -1010,9 +1011,10 @@ async fn a_disabled_account_is_logged_out_and_cannot_log_in() {
         StatusCode::NO_CONTENT
     );
 
+    // Ended at once: the connection closes without its queue.
     assert_eq!(
-        connection.events.try_recv().unwrap(),
-        Event::SessionRevoked(RevocationReason::AccountDisabled)
+        connection.ended.wait().await,
+        RevocationReason::AccountDisabled
     );
     assert_eq!(
         app.status(

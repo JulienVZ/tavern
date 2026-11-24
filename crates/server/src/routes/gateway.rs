@@ -426,6 +426,15 @@ async fn run(
     let limit = RequestLimit::new(&state.rate_limits.gateway, session.device_id);
     loop {
         tokio::select! {
+            // First: once the session ended, no other request is handled,
+            // and the connection closes without waiting for its queue.
+            biased;
+            reason = subscription.ended.wait() => {
+                let (payload, close) = translate(Event::SessionRevoked(reason));
+                // The peer may be gone already: it closes all the same.
+                let _ = socket.send(frame(0, payload)).await;
+                return close;
+            }
             incoming = tokio::time::timeout(silence, socket.recv()) => {
                 let Ok(message) = incoming else {
                     return Some(close_code::HEARTBEAT_TIMEOUT);
@@ -605,20 +614,35 @@ async fn acknowledge_notices(
     }
 }
 
-/// Whether the session behind a connection still exists and is usable.
+/// Whether the session behind a connection still exists and is usable. A
+/// live connection is the device's activity, as a REST request is: recorded
+/// at most once an hour ([`session::touch`]), so that a device connected for
+/// longer than `TAVERN_DEVICE_INACTIVE_DAYS` is never removed as inactive.
 async fn session_is_live(state: &AppState, session: &Session) -> bool {
-    let live: Result<bool, sqlx::Error> = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM sessions s \
+    let live: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT s.last_used_at < now() - interval '1 hour' FROM sessions s \
              JOIN devices d ON d.id = s.device_id \
              JOIN users u ON u.id = d.user_id \
          WHERE s.device_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now() \
-           AND d.revoked_at IS NULL AND u.disabled_at IS NULL)",
+           AND d.revoked_at IS NULL AND u.disabled_at IS NULL",
     )
     .bind(session.device_id)
-    .fetch_one(&state.db)
+    .fetch_optional(&state.db)
     .await;
-    // A database hiccup must not log everyone out.
-    live.unwrap_or(true)
+    match live {
+        Ok(Some(stale)) => {
+            if stale
+                && let Err(error) =
+                    session::touch(&state.db, session.device_id, state.settings.session_ttl).await
+            {
+                tracing::error!(%error, "cannot record a connected device's activity");
+            }
+            true
+        }
+        Ok(None) => false,
+        // A database hiccup must not log everyone out.
+        Err(_) => true,
+    }
 }
 
 /// Translates a registry event into a frame, and the close code that follows

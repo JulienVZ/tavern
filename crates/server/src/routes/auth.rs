@@ -411,10 +411,9 @@ pub(crate) async fn logout(
         .bind(session.device_id)
         .execute(&state.db)
         .await?;
-    state.gateway.notify_device(
-        session.device_id,
-        crate::gateway::Event::SessionRevoked(RevocationReason::Revoked),
-    );
+    state
+        .gateway
+        .end_session(session.device_id, RevocationReason::Revoked);
     Ok(StatusCode::NO_CONTENT)
 }
 

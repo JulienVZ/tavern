@@ -269,7 +269,7 @@ pub(crate) async fn revoke(
     tracing::info!(user_id = %session.user_id, %device_id, "device revoked");
     state
         .gateway
-        .notify_device(device_id, Event::SessionRevoked(RevocationReason::Revoked));
+        .end_session(device_id, RevocationReason::Revoked);
     // After the revocation: the connection of the revoked device is closing,
     // so the notice reaches the remaining devices only.
     notices::publish(&state, session.user_id, notice, acting);

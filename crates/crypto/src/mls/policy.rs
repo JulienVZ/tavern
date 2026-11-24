@@ -24,8 +24,8 @@
 use std::collections::{HashMap, HashSet};
 
 use openmls::prelude::{
-    LeafNodeIndex, Member, MlsGroup, Proposal, ProposalOrRefType, QueuedProposal, Sender,
-    StagedCommit,
+    Credential, LeafNodeIndex, Member, MlsGroup, Proposal, ProposalOrRefType, QueuedProposal,
+    Sender, StagedCommit,
 };
 
 use super::MembershipChanges;
@@ -113,6 +113,8 @@ pub(crate) trait GroupView {
     fn leaves(&self) -> Vec<(LeafNodeIndex, VerifiedLeaf)>;
     /// The signature key of the leaf at `index`.
     fn signature_key(&self, index: LeafNodeIndex) -> Option<Vec<u8>>;
+    /// The credential of the leaf at `index`.
+    fn credential(&self, index: LeafNodeIndex) -> Option<Credential>;
     /// The leaves the server has asked to remove, from the stored proposals.
     fn requested_removals(&self) -> HashSet<LeafNodeIndex>;
 }
@@ -128,6 +130,10 @@ impl GroupView for MlsGroup {
 
     fn signature_key(&self, index: LeafNodeIndex) -> Option<Vec<u8>> {
         self.member_at(index).map(|member| member.signature_key)
+    }
+
+    fn credential(&self, index: LeafNodeIndex) -> Option<Credential> {
+        self.member_at(index).map(|member| member.credential)
     }
 
     fn requested_removals(&self) -> HashSet<LeafNodeIndex> {
@@ -303,6 +309,15 @@ pub(crate) fn check_commit(
     let committer = match committer {
         Sender::Member(index) => {
             let before = group.device_at(*index).ok_or(LeafError::Malformed)?;
+            // The committer's leaf as the group holds it, whether or not the
+            // commit carries a path: on the server, a device that is no
+            // longer active (revoked, its account disabled) or that is not
+            // the enrolled device commits nothing (section 2).
+            let credential = group.credential(*index).ok_or(LeafError::Malformed)?;
+            let key = group.signature_key(*index).ok_or(LeafError::Malformed)?;
+            if verify_leaf(&credential, &key, roster)? != before {
+                return Err(LeafError::Malformed.into());
+            }
             if let Some(after) = path_leaf
                 && after != before
             {

@@ -167,11 +167,14 @@ CREATE TABLE key_packages (
     last_resort  boolean NOT NULL DEFAULT false,             -- META
     expires_at   timestamptz NOT NULL,                       -- META  end of the KeyPackage's lifetime
     created_at   timestamptz NOT NULL DEFAULT now(),         -- META
-    served_at    timestamptz,                                -- META  when a claim served it (one-time packages; migration 0009)
+    served_at    timestamptz,                                -- META  when a claim first served it (migration 0009; last resorts too, migration 0013)
     leaf_key     bytea NOT NULL,                             -- PUB   encryption key of the package's leaf, kept once served (migration 0011)
     CHECK (octet_length(key_package) <= 4096),
+    -- A served one-time package keeps no bytes; a last resort keeps them
+    -- while it is the last resort, and once replaced, if it was served, is
+    -- kept as served without them until it expires (migration 0013).
     CONSTRAINT key_packages_served CHECK (
-        served_at IS NULL OR (NOT last_resort AND octet_length(key_package) = 0)
+        served_at IS NULL OR last_resort OR octet_length(key_package) = 0
     ),
     CONSTRAINT key_packages_leaf_key CHECK (octet_length(leaf_key) <= 256)
 );

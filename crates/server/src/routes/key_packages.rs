@@ -32,8 +32,8 @@ use crate::panics;
 use crate::routes::friends;
 use crate::session::Session;
 
-/// The packages a claim may serve: not served already, not expired, nor
-/// about to be (the device that claims one must still be able to add it to
+/// The one-time packages a claim may serve: not served already, not
+/// expired, nor about to be (the device that claims one must still be able to add it to
 /// a group). A string literal, for `concat!`: queries stay static.
 macro_rules! servable {
     () => {
@@ -188,10 +188,27 @@ pub(crate) async fn upload(
         insert(&mut *tx, device, package, false).await?;
     }
     if let Some(package) = &last_resort {
-        sqlx::query("DELETE FROM key_packages WHERE device_id = $1 AND last_resort")
-            .bind(device)
-            .execute(&mut *tx)
-            .await?;
+        // The last resort it replaces: kept as served, without its bytes,
+        // until it expires if a claim served it (a first commit may still
+        // add it, ADR 0019, section 4), deleted otherwise. The same package
+        // sent again (a retried upload) stays as it is.
+        let reference = &package.1.reference;
+        sqlx::query(
+            "UPDATE key_packages SET last_resort = false, key_package = '\\x' \
+             WHERE device_id = $1 AND last_resort AND served_at IS NOT NULL AND reference <> $2",
+        )
+        .bind(device)
+        .bind(reference)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM key_packages \
+             WHERE device_id = $1 AND last_resort AND served_at IS NULL AND reference <> $2",
+        )
+        .bind(device)
+        .bind(reference)
+        .execute(&mut *tx)
+        .await?;
         insert(&mut *tx, device, package, true).await?;
     }
     let stored: i64 = sqlx::query_scalar(
@@ -297,14 +314,17 @@ pub(crate) async fn claim(
         .bind(device)
         .fetch_optional(&mut *tx)
         .await?;
+        // The last resort is served again and again, and keeps its bytes;
+        // its first serving is recorded, so that it is kept once replaced.
         let package = match one_time {
             Some(package) => Some(package),
             None => {
-                sqlx::query_scalar(concat!(
-                    "SELECT key_package FROM key_packages \
-                     WHERE device_id = $1 AND last_resort AND ",
-                    servable!()
-                ))
+                sqlx::query_scalar(
+                    "UPDATE key_packages SET served_at = COALESCE(served_at, now()) \
+                     WHERE device_id = $1 AND last_resort \
+                       AND expires_at > now() + interval '1 hour' \
+                     RETURNING key_package",
+                )
                 .bind(device)
                 .fetch_optional(&mut *tx)
                 .await?

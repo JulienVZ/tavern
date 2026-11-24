@@ -18,7 +18,7 @@ use tavern_protocol::rest::{B64, SessionResponse};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
-use crate::gateway::{Event, RevocationReason};
+use crate::gateway::RevocationReason;
 use crate::{AppState, CLIENT_TOKEN_LEN, Enrolment};
 
 /// Reads `Authorization: Bearer <base64url>` and returns the token bytes.
@@ -70,26 +70,35 @@ pub async fn lookup(db: &PgPool, token: &[u8], ttl: Duration) -> ApiResult<Optio
         return Ok(None);
     };
     if stale {
-        // Sliding expiry, refreshed at most once an hour. The device's
-        // activity is recorded with day precision only.
-        sqlx::query(
-            "UPDATE sessions SET last_used_at = now(), expires_at = now() + make_interval(secs => $2) \
-             WHERE device_id = $1",
-        )
-        .bind(device_id)
-        .bind(ttl.as_secs_f64())
-        .execute(db)
-        .await?;
-        sqlx::query("UPDATE devices SET last_seen_at = date_trunc('day', now()) WHERE id = $1")
-            .bind(device_id)
-            .execute(db)
-            .await?;
+        touch(db, device_id, ttl).await?;
     }
     Ok(Some(Session {
         user_id,
         device_id,
         is_admin,
     }))
+}
+
+/// Records that `device` is in use: its session's sliding expiry, and its
+/// activity (`devices.last_seen_at`, day precision), which says whether it
+/// is active (ADR 0019, section 15). Called at most once an hour per
+/// device: by [`lookup`], at each REST request and `Hello`, and by the
+/// gateway at each `Heartbeat` of a connection, so that a device connected
+/// for days on end stays active.
+pub async fn touch(db: &PgPool, device: Uuid, ttl: Duration) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sessions SET last_used_at = now(), expires_at = now() + make_interval(secs => $2) \
+         WHERE device_id = $1",
+    )
+    .bind(device)
+    .bind(ttl.as_secs_f64())
+    .execute(db)
+    .await?;
+    sqlx::query("UPDATE devices SET last_seen_at = date_trunc('day', now()) WHERE id = $1")
+        .bind(device)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 impl FromRequestParts<AppState> for Session {
@@ -186,9 +195,7 @@ pub async fn revoke_all(
     .await?;
 
     for device_id in devices {
-        state
-            .gateway
-            .notify_device(device_id, Event::SessionRevoked(reason));
+        state.gateway.end_session(device_id, reason);
     }
     Ok(())
 }

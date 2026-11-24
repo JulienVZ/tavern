@@ -29,7 +29,7 @@ use sqlx::PgConnection;
 use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::{
     ExpectedGroup, MlsError, PROPOSAL_QUEUE_KIND, PublicState, Refusal, ServerSigner, VerifiedLeaf,
-    application_header, first_commit_sender, welcome_key_packages,
+    application_header, first_commit_sender, is_external_commit, welcome_key_packages,
 };
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::{
@@ -286,6 +286,46 @@ pub async fn lock(conn: &mut PgConnection, conversation: Uuid, me: Uuid) -> Resu
     }
 }
 
+/// Checks that the device behind `session` may still act, read under the
+/// conversation's lock: a live session, the device not revoked, its account
+/// not disabled. A revoked device whose connection has not closed yet, or
+/// whose removals the server has not asked for yet, gets nothing through
+/// (`UNAUTHENTICATED`): a revocation is in force once its transaction
+/// committed, whatever comes after it.
+async fn sender_active(conn: &mut PgConnection, session: &Session) -> Result<()> {
+    let live: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sessions s \
+             JOIN devices d ON d.id = s.device_id \
+             JOIN users u ON u.id = d.user_id \
+         WHERE s.device_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now() \
+           AND d.revoked_at IS NULL AND u.disabled_at IS NULL)",
+    )
+    .bind(session.device_id)
+    .fetch_one(conn)
+    .await?;
+    if live {
+        Ok(())
+    } else {
+        Err(Refused::new(
+            proto::ErrorCode::Unauthenticated,
+            "the session of this device has ended",
+        ))
+    }
+}
+
+/// Whether the server is removing `device` from the conversation's group:
+/// it is cut off, and may only come back by external commit.
+async fn cut_off(conn: &mut PgConnection, conversation: Uuid, device: Uuid) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pending_removals \
+                        WHERE conversation_id = $1 AND device_id = $2)",
+    )
+    .bind(conversation)
+    .bind(device)
+    .fetch_one(conn)
+    .await?)
+}
+
 /// Whether `me` may add to the DM with `peer`: only between friends
 /// (section 16). Whoever blocks whom, the same query runs and the blocked
 /// user gets what an unfriended one gets.
@@ -524,7 +564,7 @@ async fn first_welcome_covers(
     let references = welcome_key_packages(welcome).map_err(|_| Refused::wrong_welcome())?;
     let mut covered: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
         "SELECT device_id, leaf_key FROM key_packages \
-         WHERE reference = ANY($1) AND (served_at IS NOT NULL OR last_resort)",
+         WHERE reference = ANY($1) AND served_at IS NOT NULL",
     )
     .bind(&references)
     .fetch_all(conn)
@@ -610,6 +650,13 @@ pub async fn submit_commit(
 
     let mut tx = state.db.begin().await?;
     let dm = lock(&mut tx, conversation, me).await?;
+    // A device the server is removing commits nothing more, but may come
+    // back by external commit once active again (sections 6 and 15).
+    let cut = cut_off(&mut tx, conversation, session.device_id).await?;
+    if cut && !(request.external && is_external_commit(&request.mls_commit)) {
+        return Err(Refused::not_a_member());
+    }
+    sender_active(&mut tx, session).await?;
     let participants = dm.participants();
     let roster = ServerRoster::load(&mut tx, &dm.users, state.settings.device_inactive_days)
         .await
@@ -696,7 +743,16 @@ pub async fn submit_commit(
                         &expected,
                         &roster,
                     )
-                    .map_err(|error| commit_refused(error, epoch))?;
+                    .map_err(|error| match commit_refused(error, epoch) {
+                        // Its own removal pending: it cannot commit it.
+                        refused if cut && refused.code == proto::ErrorCode::RemovalPending => {
+                            Refused::not_a_member()
+                        }
+                        refused => refused,
+                    })?;
+                if cut && !validated.is_external() {
+                    return Err(Refused::not_a_member());
+                }
                 // An added leaf, by Add or by external commit, needs friends;
                 // removals and updates go through in a read-only DM.
                 if !validated.changes().added.is_empty() {
@@ -893,6 +949,7 @@ pub async fn send_message(
     if !leaf {
         return Err(Refused::not_a_member());
     }
+    sender_active(&mut tx, session).await?;
     writable(&mut tx, me, dm.peer(me)).await?;
     let (generation, epoch) = group_of(&mut tx, conversation)
         .await?

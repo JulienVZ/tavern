@@ -683,6 +683,22 @@ fn the_server_reads_the_framing_of_a_first_commit_and_whom_its_welcome_is_for() 
         first_commit_sender(&update.commit, identity()),
         Err(MlsError::Malformed)
     ));
+    // Neither a member's commit nor anything else is an external commit.
+    assert!(!is_external_commit(&commit.commit));
+    assert!(!is_external_commit(&update.commit));
+    assert!(!is_external_commit(&welcome));
+    assert!(!is_external_commit(b"garbage"));
+}
+
+/// What a device being removed may still submit: an external commit, told
+/// by its framing before it is checked.
+#[test]
+fn an_external_commit_is_told_by_its_framing() {
+    let mut dm = Dm::new();
+    let bob3 = dm.bob.device(0xb3);
+    let (_, commit) = join_externally(&mut dm, &bob3).unwrap();
+    assert!(is_external_commit(&commit.commit));
+    assert!(!is_external_commit(&commit.group_info));
 }
 
 /// The server learns which KeyPackages a member's commit adds, which its

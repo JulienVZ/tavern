@@ -1566,3 +1566,51 @@ async fn acknowledgements_stay_within_what_the_device_may_read() {
     let mut bob2 = Member::connect(&app, bob2).await;
     bob2.join(&dm).await;
 }
+
+/// Section 4: a first commit may add a last-resort KeyPackage the server
+/// served, even once its device replaced it: the server keeps its row, as
+/// served and without its bytes, until it expires, and matches the Welcome
+/// to it. A last resort never served is deleted when replaced.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_first_commit_may_add_a_last_resort_replaced_since() {
+    let app = TestApp::spawn_unlimited().await;
+    let (alice, alice1) = app.account_with_device("sq", false).await;
+    let bob = app.register("sq", false).await;
+    let dm = dm_between(&app, (&alice, &alice1), &bob).await;
+    let bob1 = app.enrol(&bob).await;
+    let first = bob1.key_package(true);
+    upload_last_resort(&app, &bob1, first).await;
+    let claimed = claim(&app, &alice1, &bob, &dm.keys).await;
+    assert_eq!(claimed.len(), 1, "Bob's last resort, the only package");
+
+    // Bob's device replaces it, then a never served one.
+    upload_last_resort(&app, &bob1, bob1.key_package(true)).await;
+    let rows = || async {
+        let rows: Vec<(bool, bool, i32)> = sqlx::query_as(
+            "SELECT last_resort, served_at IS NOT NULL, octet_length(key_package) \
+             FROM key_packages WHERE device_id = $1 ORDER BY created_at, id",
+        )
+        .bind(bob1.device_id)
+        .fetch_all(&app.state.db)
+        .await
+        .unwrap();
+        rows
+    };
+    let kept = rows().await;
+    assert_eq!(kept.len(), 2);
+    assert_eq!((kept[0].0, kept[0].1, kept[0].2), (false, true, 0));
+    assert!(kept[1].0 && !kept[1].1);
+    upload_last_resort(&app, &bob1, bob1.key_package(true)).await;
+    let kept = rows().await;
+    assert_eq!(kept.len(), 2, "the replaced one never served is gone");
+    assert_eq!((kept[0].0, kept[0].1), (false, true));
+
+    let mut alice1 = Member::connect(&app, alice1).await;
+    let mut bob1 = Member::connect(&app, bob1).await;
+    let commit = alice1.create(&dm, &claimed);
+    let id = alice1.submit(&dm, 0, commit, false).await;
+    commit_ack(&alice1.answer(id).await);
+    alice1.merge();
+    bob1.join(&dm).await;
+}

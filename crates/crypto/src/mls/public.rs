@@ -103,6 +103,21 @@ pub fn first_commit_sender(bytes: &[u8], identity: GroupIdentity) -> Result<u32,
     }
 }
 
+/// Whether a commit's framing says it is an external commit (sender
+/// `NewMemberCommit`), read before it is checked: what a device the server
+/// is removing may still submit (sections 6 and 15). `false` for anything
+/// that is not a `PublicMessage` carrying a commit.
+pub fn is_external_commit(bytes: &[u8]) -> bool {
+    let Ok((message, _)) = MlsMessageIn::tls_deserialize_bytes(bytes) else {
+        return false;
+    };
+    let MlsMessageBodyIn::PublicMessage(message) = message.extract() else {
+        return false;
+    };
+    message.content_type() == ContentType::Commit
+        && matches!(message.sender(), Sender::NewMemberCommit)
+}
+
 /// The KeyPackages a Welcome is for (their `KeyPackageRef`s, in clear in
 /// it), in order. Refused unless it is a Welcome of Tavern's ciphersuite,
 /// with nothing after it.
@@ -570,6 +585,10 @@ impl GroupView for PublicView<'_> {
             .map(|leaf| leaf.signature_key().as_slice().to_vec())
     }
 
+    fn credential(&self, index: LeafNodeIndex) -> Option<openmls::prelude::Credential> {
+        self.group.leaf(index).map(|leaf| leaf.credential().clone())
+    }
+
     fn requested_removals(&self) -> HashSet<LeafNodeIndex> {
         self.requested.clone()
     }
@@ -580,6 +599,7 @@ impl GroupView for PublicView<'_> {
 #[derive(Debug)]
 pub struct ValidatedCommit {
     staged: StagedCommit,
+    external: bool,
     changes: MembershipChanges,
     removed: HashSet<LeafNodeIndex>,
     group_info: Vec<u8>,
@@ -595,6 +615,11 @@ impl ValidatedCommit {
     /// The epoch the commit starts.
     pub fn epoch(&self) -> u64 {
         self.staged.epoch().as_u64()
+    }
+
+    /// Whether it is an external commit: a device joining, or coming back.
+    pub fn is_external(&self) -> bool {
+        self.external
     }
 
     /// The `KeyPackageRef`s of the KeyPackages the commit adds: the ones
@@ -993,6 +1018,7 @@ impl PublicState {
             .collect::<Result<_, _>>()?;
         Ok(ValidatedCommit {
             staged: *staged,
+            external,
             changes,
             removed,
             group_info: group_info.to_vec(),

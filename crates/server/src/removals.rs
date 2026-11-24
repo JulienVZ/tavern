@@ -95,9 +95,10 @@ pub async fn sweep(state: &AppState) -> Result<usize, StateError> {
 }
 
 /// Asks for the removal of `device` from `conversation`'s group, in one
-/// transaction under the conversation's lock: `true` if a proposal was
-/// issued, `false` if there is nothing to do (the device is not a leaf any
-/// more, or its removal is already asked for).
+/// transaction under the conversation's lock: `true` if the removal is now
+/// recorded (a proposal issued, or one the state already held given its
+/// row), `false` if there is nothing to do (the device is not a leaf any
+/// more, or its removal is already recorded).
 pub async fn remove_from(
     state: &AppState,
     conversation: Uuid,
@@ -146,12 +147,24 @@ pub async fn remove_from(
     };
     let epoch = loaded.state.epoch();
     let signer = ServerSigner::new(&state.secrets.external_sender);
+    let leaf_index = i32::try_from(leaf.u32()).unwrap_or(i32::MAX);
     let Some(proposal) = loaded.state.remove(leaf, &signer)? else {
-        // Asked for in the state, but without its row: only a removal made
-        // before the row existed. The commit that removes the leaf settles
-        // it as well.
-        tracing::warn!(%conversation, "a removal is stored without its row");
-        return Ok(false);
+        // Asked for in the state, but without its row (a removal stored
+        // before the row existed): the row is written, and the device is
+        // cut off from now on, the end of the sequence standing for its
+        // proposal. Nothing is appended: the members hold the proposal.
+        tracing::warn!(%conversation, "a removal was stored without its row");
+        sqlx::query(
+            "INSERT INTO pending_removals (conversation_id, device_id, leaf_index, proposal_seq) \
+             SELECT $1, $2, $3, last_seq FROM conversations WHERE id = $1",
+        )
+        .bind(conversation)
+        .bind(device)
+        .bind(leaf_index)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(true);
     };
     mls::save(&mut tx, loaded).await?;
     let entry = delivery::append(
@@ -170,7 +183,7 @@ pub async fn remove_from(
     )
     .bind(conversation)
     .bind(device)
-    .bind(i32::try_from(leaf.u32()).unwrap_or(i32::MAX))
+    .bind(leaf_index)
     .bind(entry.seq)
     .execute(&mut *tx)
     .await?;

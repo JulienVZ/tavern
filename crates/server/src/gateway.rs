@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tavern_protocol::gateway::v1 as proto;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::notices::Notice;
@@ -118,6 +118,8 @@ struct Connection {
     sender: mpsc::Sender<Event>,
     /// Set when an event found the queue full.
     overflowed: Arc<AtomicBool>,
+    /// Set when the device's session ended: the connection closes at once.
+    ended: watch::Sender<Option<RevocationReason>>,
 }
 
 impl Connection {
@@ -151,6 +153,30 @@ pub struct Subscription {
     /// Identifies this connection in [`Registry::disconnect`].
     pub generation: u64,
     overflowed: Arc<AtomicBool>,
+    /// Resolves once the device's session ended.
+    pub ended: SessionEnd,
+}
+
+/// The end of a connection's session, set by [`Registry::end_session`].
+#[derive(Debug)]
+pub struct SessionEnd(watch::Receiver<Option<RevocationReason>>);
+
+impl SessionEnd {
+    /// Resolves once the device's session ended ([`Registry::end_session`]),
+    /// with the reason; never otherwise. The connection then closes at once,
+    /// whatever its queue still holds and whatever the client sends.
+    pub async fn wait(&mut self) -> RevocationReason {
+        loop {
+            if let Some(reason) = *self.0.borrow_and_update() {
+                return reason;
+            }
+            if self.0.changed().await.is_err() {
+                // The registry let the connection go otherwise: its events
+                // say how.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
 }
 
 impl Subscription {
@@ -175,6 +201,7 @@ impl Registry {
         };
         let (sender, events) = mpsc::channel(EVENT_QUEUE_LEN);
         let overflowed = Arc::new(AtomicBool::new(false));
+        let (ended_sender, ended) = watch::channel(None);
         let previous = self
             .connections
             .lock()
@@ -186,6 +213,7 @@ impl Registry {
                     generation,
                     sender,
                     overflowed: Arc::clone(&overflowed),
+                    ended: ended_sender,
                 },
             );
         if let Some(previous) = previous {
@@ -199,6 +227,23 @@ impl Registry {
             events,
             generation,
             overflowed,
+            ended: SessionEnd(ended),
+        }
+    }
+
+    /// The session of `device_id` ended (revoked, the account disabled, its
+    /// credentials changed): its connection, if any, leaves the registry and
+    /// closes at once with `reason`, without handling another request or
+    /// waiting for its queue to drain.
+    pub fn end_session(&self, device_id: Uuid, reason: RevocationReason) {
+        let connection = self
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&device_id);
+        if let Some(connection) = connection {
+            // Set before the connection's queue closes with it.
+            connection.ended.send_replace(Some(reason));
         }
     }
 
@@ -280,6 +325,19 @@ mod tests {
         assert_eq!(sub_a1.events.try_recv().unwrap(), ADDED);
         assert!(sub_a2.events.try_recv().is_err());
         assert!(sub_b1.events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_ended_session_closes_its_connection_at_once() {
+        let registry = Registry::default();
+        let (user, device) = (Uuid::from_u128(1), Uuid::from_u128(11));
+        let mut subscription = registry.connect(user, device);
+        registry.notify_device(device, ADDED);
+        registry.end_session(device, RevocationReason::Revoked);
+        assert_eq!(subscription.ended.wait().await, RevocationReason::Revoked);
+        assert_eq!(registry.connected(), 0);
+        // Nothing reaches it any more; its other devices are not concerned.
+        registry.end_session(Uuid::from_u128(12), RevocationReason::Revoked);
     }
 
     #[test]

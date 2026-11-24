@@ -19,7 +19,7 @@ use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_protocol::rest::{
-    Conversation, ConversationList, CreateDmRequest, KeyPackageClaim, KeyPackageCount,
+    B64, Conversation, ConversationList, CreateDmRequest, KeyPackageClaim, KeyPackageCount,
     UploadKeyPackagesRequest,
 };
 use tavern_server::mls;
@@ -106,6 +106,21 @@ pub async fn upload(app: &TestApp, device: &Device, count: usize) {
             &UploadKeyPackagesRequest {
                 key_packages: device.key_packages(count),
                 last_resort: None,
+            },
+        )
+        .await;
+}
+
+/// Uploads `package` as the last-resort KeyPackage of `device`, which
+/// replaces the one it had.
+pub async fn upload_last_resort(app: &TestApp, device: &Device, package: B64) {
+    let _: KeyPackageCount = app
+        .post(
+            "/v1/devices/me/key-packages",
+            Some(&device.session_token),
+            &UploadKeyPackagesRequest {
+                key_packages: Vec::new(),
+                last_resort: Some(package),
             },
         )
         .await;
@@ -406,6 +421,21 @@ impl Member {
             Incoming::Application { content, .. } => (message.seq, content.expose().to_vec()),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Adds the devices of `packages`, in a commit that stays pending.
+    pub fn add_devices(&mut self, dm: &Dm, packages: &[ClaimedKeyPackage]) -> Commit {
+        let Self { group, device, .. } = self;
+        group
+            .as_mut()
+            .unwrap()
+            .add(
+                &device.provider,
+                &DeviceSigner::new(&device.key),
+                packages,
+                &dm.keys,
+            )
+            .unwrap()
     }
 
     /// Commits the server's pending removals, as the first member online
