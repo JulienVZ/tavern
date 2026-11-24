@@ -101,12 +101,13 @@ async fn claimed_devices(app: &TestApp, device: &Device, user: Uuid) -> Vec<Uuid
         .collect()
 }
 
-/// The packages stored for `device` and not served: one-time, then last
-/// resort.
+/// The one-time packages of `device` still to serve, and its last resort,
+/// which stays stored once served (its first serving is recorded).
 async fn stored(app: &TestApp, device: &Device) -> (i64, i64) {
     sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE NOT last_resort), count(*) FILTER (WHERE last_resort) \
-         FROM key_packages WHERE device_id = $1 AND served_at IS NULL",
+        "SELECT count(*) FILTER (WHERE NOT last_resort AND served_at IS NULL), \
+                count(*) FILTER (WHERE last_resort) \
+         FROM key_packages WHERE device_id = $1",
     )
     .bind(device.device_id)
     .fetch_one(&app.state.db)

@@ -22,8 +22,10 @@
 mod common;
 
 use common::dm::*;
-use common::ws::{expect_close, expect_frame, send};
+use common::ws::{expect_close, expect_frame};
 use common::{Account, Device, TestApp};
+use futures_util::SinkExt;
+use prost::Message as _;
 use reqwest::{Method, StatusCode};
 use tavern_crypto::mls::{Incoming, LeafError, MlsError, ServerSigner, VerifiedLeaf};
 use tavern_protocol::close_code;
@@ -32,6 +34,7 @@ use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
 use tavern_server::delivery::{self, Refused};
 use tavern_server::{mls, removals};
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 /// What the server answers a request handled directly, outside a
@@ -517,14 +520,21 @@ async fn a_revocation_closes_the_device_s_connection_at_once() {
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     // Requests sent after the revocation: none is handled, whether the
-    // connection is between two of them or not.
+    // connection is between two of them or not. Sending fails once the
+    // server closed it.
     for request_id in 100..120 {
-        send(
-            &mut bob1.socket,
+        let frame = proto::ClientFrame {
             request_id,
-            ClientPayload::Heartbeat(proto::Heartbeat {}),
-        )
-        .await;
+            payload: Some(ClientPayload::Heartbeat(proto::Heartbeat {})),
+        };
+        if bob1
+            .socket
+            .send(Message::Binary(frame.encode_to_vec().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
     }
     // What was sent before the revocation may come first; no answer comes.
     loop {
