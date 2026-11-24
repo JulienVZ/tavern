@@ -35,15 +35,15 @@ anyhow = "1.0"
 
 # Cryptography. These follow the RustCrypto generation that opaque-ke 4 is
 # built on (digest 0.10); see docs/adr/0011-account-identity-and-primitives.md.
-argon2 = { version = "0.5", features = ["zeroize"] }
-chacha20poly1305 = "0.10"
+argon2 = { version = "0.6", features = ["zeroize"] }
+chacha20poly1305 = "0.11"
 data-encoding = "2.11"
-ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
-hkdf = "0.12"
+ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize"] }
+hkdf = "0.13"
 opaque-ke = { version = "4.0.1", default-features = false, features = ["ristretto255", "argon2", "std"] }
 proptest = "1.12"
-rand = "0.8"
-sha2 = "0.10"
+rand = "0.10"
+sha2 = "0.11"
 subtle = "2.6"
 unicode-normalization = "0.1.26"
 zeroize = { version = "1.9", features = ["derive"] }
@@ -58,7 +58,7 @@ openmls_memory_storage = "=0.6.0"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "json", "matched-path", "tokio", "ws"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 prost = "0.14.6"
-qrcode = { version = "0.14.1", default-features = false }
+qrcode = { version = "0.15.0", default-features = false }
 prost-build = "0.14.6"
 protox = "0.10.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
