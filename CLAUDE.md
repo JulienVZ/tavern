@@ -336,10 +336,8 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 ```
 
 ### CI (GitHub Actions)
-- Sur chaque push et chaque PR : fmt, clippy, tests, `cargo deny`, `pnpm check`, Miri, image Docker, build Tauri **sur Linux uniquement**.
-- Build Tauri sur Windows, macOS et Linux : **une fois par jour** (seulement si `main` a changé depuis le dernier build des trois OS) et **à la demande** (`gh workflow run ci.yml --ref main`). Décision du 2026-11-15, pour économiser les minutes Actions tant que le dépôt est privé.
+- Sur chaque push et chaque PR : fmt, clippy, tests, `cargo deny`, `pnpm check`, Miri, image Docker, build Tauri **sur Windows, macOS et Linux** (dépôt public depuis le 2026-11-24 : plus de build quotidien ni de job `gate`). Relance manuelle : `gh workflow run ci.yml --ref main`.
 - Un changement qui ne touche que la documentation (`docs/**`, `*.md`, sauf `docs/database-schema.md` lu par un test) ne lance pas la CI.
-- **Quand le dépôt deviendra public : revenir au build des trois OS sur chaque PR.**
 - Sur tag `v*` : builds signés des installeurs (MSI/NSIS, DMG, AppImage + .deb), images Docker sur GHCR, release GitHub avec changelog.
 - Mises à jour automatiques du client via le updater Tauri (signature obligatoire).
 
@@ -394,7 +392,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 2. **Un jalon à la fois.** Ne commence pas le suivant sans validation.
 3. **Écris un ADR** (`docs/adr/NNNN-titre.md` : contexte, décision, alternatives, conséquences) pour toute décision structurante.
 4. **Mets à jour la doc dans le même commit** que le code (README, `docs/`, `.env.example`, ce fichier si une décision change).
-5. **Vérifie avant de déclarer terminé** : fmt, clippy, tests, build. Dis clairement ce qui n'a pas pu être testé (ex. capture d'écran sur un OS non disponible). Avant de remettre un serveur ou un client à tester à la main, relance-le depuis le build courant et vérifie que les routes ajoutées répondent : un processus démarré avant les derniers changements fait échouer le test pour une mauvaise raison. Pour la pile Docker : `./scripts/build.sh` puis `docker compose up -d`, et `GET /version` doit renvoyer dans `commit` le commit courant (sans suffixe `-dirty`) ; donne ce commit au mainteneur. Avant de déclarer un groupe de tâches ou un jalon terminé, lance le build des trois OS à la demande (`gh workflow run ci.yml --ref main`) et attends qu'il soit vert.
+5. **Vérifie avant de déclarer terminé** : fmt, clippy, tests, build. Dis clairement ce qui n'a pas pu être testé (ex. capture d'écran sur un OS non disponible). Avant de remettre un serveur ou un client à tester à la main, relance-le depuis le build courant et vérifie que les routes ajoutées répondent : un processus démarré avant les derniers changements fait échouer le test pour une mauvaise raison. Pour la pile Docker : `./scripts/build.sh` puis `docker compose up -d`, et `GET /version` doit renvoyer dans `commit` le commit courant (sans suffixe `-dirty`) ; donne ce commit au mainteneur. Avant de déclarer un groupe de tâches ou un jalon terminé, attends que la CI du dernier commit poussé soit verte sur les trois OS.
 8. **Version REST** : toute route ajoutée ou retirée incrémente `tavern_protocol::REST_MINOR_VERSION` (un test fige la liste des routes) ; c'est ce qui permet au client d'annoncer qu'une instance est plus ancienne que lui.
 9. **Espace disque** : la machine du mainteneur est presque pleine. Préviens dès que `target/` dépasse **10 Go** (seuil relevé pour M2, 8 Go auparavant), dès que l'espace libre passe sous **8 Go**, et avant toute opération qui consomme beaucoup d'espace.
 6. **Signale les risques** : si une demande affaiblit la sécurité ou le budget RAM, dis-le avant de l'implémenter.
