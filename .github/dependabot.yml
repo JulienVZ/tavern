@@ -11,6 +11,28 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # The next generation of RustCrypto (digest 0.11, rand 0.10) does not
+      # build with opaque-ke 4, whose primitives ours are aligned on (ADR
+      # 0011). Remove these entries once a stable opaque-ke 5 is out, and
+      # migrate them all at once, with an ADR.
+      #
+      # These are the semver-major updates in Cargo's sense. Dependabot
+      # calls 0.5 -> 0.6 a minor update, so `update-types:
+      # version-update:semver-major` would let five of the six through:
+      # each one is ignored from its next incompatible version on.
+      - dependency-name: argon2
+        versions: [">= 0.6"]
+      - dependency-name: chacha20poly1305
+        versions: [">= 0.11"]
+      - dependency-name: ed25519-dalek
+        versions: [">= 3"]
+      - dependency-name: hkdf
+        versions: [">= 0.13"]
+      - dependency-name: rand
+        versions: [">= 0.9"]
+      - dependency-name: sha2
+        versions: [">= 0.11"]
 
   - package-ecosystem: npm
     directory: /apps/desktop
