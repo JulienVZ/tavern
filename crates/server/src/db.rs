@@ -92,14 +92,27 @@ fn classify_error(error: &sqlx::Error) -> Failure {
 /// Opens a connection pool and checks that the database answers.
 ///
 /// Retries for a short while when PostgreSQL is still starting. Fails at once,
-/// with an explanation, when the credentials are refused.
+/// with an explanation, when the credentials are refused. A request waits at
+/// most five seconds for a connection.
 pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool, ConnectError> {
-    let deadline = tokio::time::Instant::now() + CONNECT_DEADLINE;
+    connect_with_acquire_timeout(database_url, max_connections, ACQUIRE_TIMEOUT).await
+}
+
+/// [`connect`], a request waiting at most `acquire_timeout` for a
+/// connection. Tests wait longer: many test servers share one PostgreSQL,
+/// which may be slow to open their connections at times, and a request that
+/// gives up fails its test for no fault of the code under test.
+pub async fn connect_with_acquire_timeout(
+    database_url: &str,
+    max_connections: u32,
+    acquire_timeout: Duration,
+) -> Result<PgPool, ConnectError> {
+    let deadline = tokio::time::Instant::now() + CONNECT_DEADLINE.max(acquire_timeout);
 
     loop {
         let attempt = PgPoolOptions::new()
             .max_connections(max_connections)
-            .acquire_timeout(ACQUIRE_TIMEOUT)
+            .acquire_timeout(acquire_timeout)
             .connect(database_url)
             .await;
 

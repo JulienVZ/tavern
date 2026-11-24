@@ -31,6 +31,12 @@ use tokio::sync::mpsc::Receiver;
 
 /// Environment variable holding the test database URL.
 pub const DATABASE_URL_VAR: &str = "TAVERN_TEST_DATABASE_URL";
+
+/// How long a request of a test server waits for a database connection.
+/// The tests share one PostgreSQL, which at times is slow to open their
+/// connections (right after a build, under load): five seconds, the
+/// server's own limit, made registrations fail for that reason alone.
+pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The URL of the test database, from `TAVERN_TEST_DATABASE_URL`.
 ///
 /// Tests create accounts by the hundred and rewrite rows at will, so they
@@ -71,7 +77,7 @@ impl Server {
     /// Starts a server with fresh instance secrets.
     pub async fn spawn() -> Self {
         let database_url = database_url();
-        let pool = db::connect(&database_url, 5)
+        let pool = db::connect_with_acquire_timeout(&database_url, 5, ACQUIRE_TIMEOUT)
             .await
             .expect("database must be reachable");
         db::migrate(&pool).await.expect("migrations must apply");
