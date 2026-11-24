@@ -27,7 +27,7 @@ jobs:
       matrix:
         target: [client_frame, server_frame, device_certificate, key_package_upload, application_message, commit]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the nightly toolchain and cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
@@ -39,7 +39,7 @@ jobs:
         run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="$SECONDS_PER_TARGET" -max_len=65536
       - name: Keep the crashing inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: crates/protocol/fuzz/artifacts

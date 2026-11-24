@@ -338,6 +338,7 @@ cd deploy && ./scripts/backup.sh && ./scripts/restore.sh backups/<archive>.tar.g
 ### CI (GitHub Actions)
 - Sur chaque push et chaque PR : fmt, clippy, tests, `cargo deny`, `pnpm check`, Miri, image Docker, build Tauri **sur Windows, macOS et Linux** (dépôt public depuis le 2026-11-24 : plus de build quotidien ni de job `gate`). Relance manuelle : `gh workflow run ci.yml --ref main`.
 - Un changement qui ne touche que la documentation (`docs/**`, `*.md`, sauf `docs/database-schema.md` lu par un test) ne lance pas la CI.
+- Toutes les actions de tous les workflows sont épinglées par SHA complet, version en commentaire (`uses: owner/name@<sha> # vX.Y.Z`), jamais par étiquette ni branche ; Dependabot les met à jour. GitHub n'autorise que les actions de GitHub et la liste d'actions tierces choisie, et exige l'épinglage par SHA : toute nouvelle action tierce doit être signalée au mainteneur pour être ajoutée à la liste.
 - Sur tag `v*` : builds signés des installeurs (MSI/NSIS, DMG, AppImage + .deb), images Docker sur GHCR, release GitHub avec changelog.
 - Mises à jour automatiques du client via le updater Tauri (signature obligatoire).
 

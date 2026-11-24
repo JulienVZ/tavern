@@ -121,4 +121,5 @@ pnpm client alice-2    # a third one, and so on
 - Small, coherent commits. One topic per pull request.
 - Never commit secrets, `.env` files or real data.
 - CI must pass: formatting, clippy, tests, `cargo deny`, UI checks, Miri, the server image, and the desktop build on Linux, Windows and macOS, all run on every push and pull request. A change that touches documentation only (`docs/**` and `*.md`, except `docs/database-schema.md`, which a test reads) does not run the CI. To run it again by hand: `gh workflow run ci.yml --ref <branch>`.
+- Workflows reference every action by its full commit SHA, with the version in a comment (`uses: owner/name@<sha> # vX.Y.Z`), never by a tag or a branch; Dependabot keeps both up to date.
 - Say in the pull request what you could not test (for example a platform you do not have).

@@ -25,6 +25,8 @@ updates:
       - dependency-name: typescript
         update-types: ["version-update:semver-major"]
 
+  # Every action is pinned to a full commit SHA, with its version in a
+  # comment (`uses: owner/name@<sha> # vX.Y.Z`): Dependabot updates both.
   - package-ecosystem: github-actions
     directory: /
     schedule:

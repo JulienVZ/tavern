@@ -80,7 +80,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Three client-side OPAQUE registrations at the production parameters,
       # with the memory charged to the process before, after and while idle.
       - name: Measure
