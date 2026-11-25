@@ -20,6 +20,15 @@ use uuid::Uuid;
 /// Trusts no identity key: these claims serve no package to check.
 struct Nobody;
 
+/// Trusts one user's identity key.
+struct Only(Uuid, IdentityPublicKey);
+
+impl Roster for Only {
+    fn identity_key(&self, user_id: &[u8; ID_LEN]) -> Option<IdentityPublicKey> {
+        (user_id == self.0.as_bytes()).then_some(self.1)
+    }
+}
+
 impl Roster for Nobody {
     fn identity_key(&self, _: &[u8; ID_LEN]) -> Option<IdentityPublicKey> {
         None
@@ -113,14 +122,22 @@ async fn two_users_become_friends_and_a_block_ends_it() {
         alice.friends().await.unwrap().friends[0].user_id,
         bob.user_id()
     );
-    // Friends: allowed (Bob's device has no package yet).
-    assert!(
-        alice
-            .claim_key_packages(bob.user_id(), &Nobody)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    // Friends: allowed. Bob's connected device uploaded its packages by
+    // itself; Alice is served one, which checks out under Bob's key.
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while bob.key_package_count().await.unwrap() < 20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Bob's device never uploaded its KeyPackages");
+    let bob_key =
+        IdentityPublicKey::from_bytes(bob.me().await.unwrap().identity_key.as_slice()).unwrap();
+    let served = alice
+        .claim_key_packages(bob.user_id(), &Only(bob.user_id(), bob_key))
+        .await
+        .unwrap();
+    assert_eq!(served.len(), 1);
 
     bob.block(alice.user_id()).await.unwrap();
     expect_relation(&mut bob_events, alice.user_id(), Relation::Blocked).await;
