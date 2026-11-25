@@ -287,14 +287,25 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
         generation: subscription.generation,
     };
     let pending = async {
+        // Checked again once the connection is registered: a session that
+        // ended between the Hello and the registration had nothing to close
+        // yet (`Registry::end_session`).
+        if !session_is_live(&state, &session).await {
+            return Ok(None);
+        }
         let notices = notices::pending(&state, &session).await?;
         let key_packages = key_packages::remaining(&state.db, session.device_id).await?;
         let generation = restore::generation(&state.db).await?;
-        Ok::<_, crate::error::ApiError>((notices, key_packages, generation))
+        Ok::<_, crate::error::ApiError>(Some((notices, key_packages, generation)))
     };
     let (security_notices, key_packages_remaining, instance_generation) =
         match failed(panics::guard(pending).await) {
-            Ok(pending) => pending,
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                drop(registered);
+                close(socket, close_code::SESSION_REVOKED).await;
+                return;
+            }
             Err(code) => {
                 drop(registered);
                 close(socket, code).await;
@@ -430,35 +441,12 @@ async fn run(
     let limit = RequestLimit::new(&state.rate_limits.gateway, session.device_id);
     loop {
         tokio::select! {
-            // In this order: a request first, then the end of the session,
-            // then the queue. A request received once the session ended is
-            // not handled: the connection closes instead, whatever arrived
-            // first. An idle connection closes as soon as its session ends,
-            // without waiting for its queue.
+            // In this order: the end of the session, then the queue, then
+            // requests, so that a burst of requests never starves the queue.
+            // An ended session closes the connection at once, without
+            // waiting for its queue; a request received once it ended is not
+            // handled, whatever arrived first.
             biased;
-            incoming = tokio::time::timeout(silence, socket.recv()) => {
-                let Ok(message) = incoming else {
-                    return Some(close_code::HEARTBEAT_TIMEOUT);
-                };
-                if let Some(reason) = subscription.ended.now() {
-                    return session_ended(socket, translate, reason).await;
-                }
-                // Untrusted input: a panic while handling it closes this
-                // connection only.
-                let next = match panics::guard(on_message(state, session, &limit, message)).await {
-                    Ok(next) => next,
-                    Err(Panicked) => return Some(close_code::INTERNAL_ERROR),
-                };
-                let (request_id, reply) = match next {
-                    Next::Reply(request_id, reply) => (request_id, reply),
-                    Next::Continue => continue,
-                    Next::Close(code) => return Some(code),
-                    Next::Gone => return None,
-                };
-                if socket.send(frame(request_id, reply)).await.is_err() {
-                    return None;
-                }
-            }
             reason = subscription.ended.wait() => {
                 return session_ended(socket, translate, reason).await;
             }
@@ -484,6 +472,29 @@ async fn run(
                     Ok(Err(_)) => return None,
                     Ok(Ok(Some(code))) => return Some(code),
                     Ok(Ok(None)) => {}
+                }
+            }
+            incoming = tokio::time::timeout(silence, socket.recv()) => {
+                let Ok(message) = incoming else {
+                    return Some(close_code::HEARTBEAT_TIMEOUT);
+                };
+                if let Some(reason) = subscription.ended.now() {
+                    return session_ended(socket, translate, reason).await;
+                }
+                // Untrusted input: a panic while handling it closes this
+                // connection only.
+                let next = match panics::guard(on_message(state, session, &limit, message)).await {
+                    Ok(next) => next,
+                    Err(Panicked) => return Some(close_code::INTERNAL_ERROR),
+                };
+                let (request_id, reply) = match next {
+                    Next::Reply(request_id, reply) => (request_id, reply),
+                    Next::Continue => continue,
+                    Next::Close(code) => return Some(code),
+                    Next::Gone => return None,
+                };
+                if socket.send(frame(request_id, reply)).await.is_err() {
+                    return None;
                 }
             }
         }
@@ -530,6 +541,11 @@ async fn on_message(
     if let Some(next) = limit.refuse(request.request_id) {
         return next;
     }
+    // Every request, reads included: a session that ended without its
+    // connection being told (it was not registered yet) is caught here.
+    if !session_is_live(state, session).await {
+        return Next::Close(close_code::SESSION_REVOKED);
+    }
     let reply = match request.payload {
         Some(ClientPayload::SubmitCommit(request)) => answer(
             delivery::submit_commit(state, session, request).await,
@@ -556,15 +572,9 @@ async fn on_message(
             delivery::fetch_group_info(state, session, request).await,
             ServerPayload::GroupInfo,
         ),
-        Some(ClientPayload::Heartbeat(_)) => {
-            // The cheapest place to notice an expired session.
-            if !session_is_live(state, session).await {
-                return Next::Close(close_code::SESSION_REVOKED);
-            }
-            ServerPayload::HeartbeatAck(proto::HeartbeatAck {
-                server_time_ms: now_ms(),
-            })
-        }
+        Some(ClientPayload::Heartbeat(_)) => ServerPayload::HeartbeatAck(proto::HeartbeatAck {
+            server_time_ms: now_ms(),
+        }),
         Some(ClientPayload::AckDeviceList(_)) => {
             let updated = sqlx::query("UPDATE devices SET devices_seen_at = now() WHERE id = $1")
                 .bind(session.device_id)

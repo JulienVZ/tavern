@@ -23,10 +23,10 @@
 
   /** A notice's text; a restore's gives the date of the backup, if known. */
   function noticeText(notice: SecurityNotice): string {
-    if (notice.kind === "instance_restored") {
+    if (notice.kind === "instance_restored" || notice.kind === "instance_restored_admin") {
       return notice.backupTakenAtMs === undefined
-        ? t("notice.instance_restored_undated")
-        : t("notice.instance_restored", { backup: formatDate(notice.backupTakenAtMs) });
+        ? t(`notice.${notice.kind}_undated`)
+        : t(`notice.${notice.kind}`, { backup: formatDate(notice.backupTakenAtMs) });
     }
     return t(`notice.${notice.kind}`, { date: formatDate(notice.createdAtMs) });
   }

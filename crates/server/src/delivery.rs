@@ -33,6 +33,7 @@ use tavern_crypto::mls::{
     welcome_key_packages,
 };
 use tavern_protocol::gateway::v1 as proto;
+use tavern_protocol::group_generation;
 use tavern_protocol::{
     MAX_APPLICATION_MESSAGE_BYTES, MAX_COMMIT_BYTES, MAX_FETCH_MESSAGES, MAX_GROUP_INFO_BYTES,
     MAX_WELCOME_BYTES,
@@ -394,6 +395,14 @@ struct Recreation {
     wait_ms: Option<u32>,
 }
 
+/// The instance generation: raised by each restore (section 15).
+async fn instance_generation(conn: &mut PgConnection) -> Result<u64> {
+    let generation: i64 = sqlx::query_scalar("SELECT generation FROM instance_state")
+        .fetch_one(conn)
+        .await?;
+    Ok(u64::try_from(generation).unwrap_or_default())
+}
+
 async fn recreation(conn: &mut PgConnection, conversation: Uuid) -> Result<Recreation> {
     let (required, wait_ms): (bool, Option<i64>) = sqlx::query_as(
         "SELECT needs_recreation, \
@@ -719,6 +728,8 @@ pub async fn submit_commit(
 
     let mut tx = state.db.begin().await?;
     let dm = lock(&mut tx, conversation, me).await?;
+    // First: a device that may no longer act learns nothing else.
+    sender_active(&mut tx, session).await?;
     let current = group_of(&mut tx, conversation).await?;
     let recreation = recreation(&mut tx, conversation).await?;
     // A group's first commit: its creation, or its recreation (section
@@ -727,44 +738,45 @@ pub async fn submit_commit(
         (Some(header), _) if header.group.conversation_id != *conversation.as_bytes() => {
             return Err(Refused::invalid_commit());
         }
-        (Some(CommitHeader { group, epoch: 0 }), None) if request.epoch == 0 => {
-            // After a restore, generation 0 may be taken already, by a group
-            // created after the backup: the recreation picks a later one.
-            match (recreation.required, group.generation) {
-                (false, 0) => Some(group),
-                (true, 0) => return Err(Refused::recreation_required()),
-                (true, _) => Some(group),
-                (false, _) => return Err(Refused::invalid_commit()),
-            }
-        }
-        (Some(CommitHeader { group, epoch: 0 }), Some((generation, _)))
-            if request.epoch == 0 && group.generation > generation =>
+        (Some(CommitHeader { group, epoch: 0 }), current)
+            if request.epoch == 0
+                && current.is_none_or(|(generation, _)| group.generation > generation) =>
         {
-            if !recreation.required {
-                // Asked by a user (section 11): the next generation, at
-                // most once an hour. After a restore, any later one: the
-                // devices may know generations the server lost.
-                if Some(group.generation) != generation.checked_add(1) {
-                    return Err(Refused::invalid_commit());
-                }
-                if let Some(wait_ms) = recreation.wait_ms {
-                    let in_group = members(&mut tx, conversation)
-                        .await?
-                        .contains(&session.device_id);
-                    // Recreated meanwhile by another device: it has a
-                    // Welcome to process, or the group to join.
-                    return Err(if in_group {
-                        Refused {
-                            retry_after_ms: wait_ms,
-                            ..Refused::new(
-                                proto::ErrorCode::RateLimited,
-                                "a conversation's group is recreated at most once an hour",
-                            )
-                        }
-                    } else {
-                        Refused::stale()
-                    });
-                }
+            // The one generation it may take: after a restore, the first of
+            // the new instance generation, which no group of the conversation
+            // had before (`tavern_protocol::group_generation`); at a user's
+            // request (section 11), the next one; a new group, 0.
+            let allowed = if recreation.required {
+                group_generation::after_restore(instance_generation(&mut tx).await?)
+            } else {
+                current.map_or(Some(0), |(generation, _)| {
+                    group_generation::next(generation)
+                })
+            };
+            if allowed != Some(group.generation) {
+                return Err(Refused::invalid_commit());
+            }
+            if !recreation.required
+                && current.is_some()
+                && let Some(wait_ms) = recreation.wait_ms
+            {
+                // At most once an hour. A device outside the group was not
+                // told of the recreation yet: it has a Welcome to process,
+                // or the group to join.
+                let in_group = members(&mut tx, conversation)
+                    .await?
+                    .contains(&session.device_id);
+                return Err(if in_group {
+                    Refused {
+                        retry_after_ms: wait_ms,
+                        ..Refused::new(
+                            proto::ErrorCode::RateLimited,
+                            "a conversation's group is recreated at most once an hour",
+                        )
+                    }
+                } else {
+                    Refused::stale()
+                });
             }
             Some(group)
         }
@@ -782,7 +794,6 @@ pub async fn submit_commit(
     if cut && !recreating && !(request.external && is_external_commit(&request.mls_commit)) {
         return Err(Refused::not_a_member());
     }
-    sender_active(&mut tx, session).await?;
     let participants = dm.participants();
     let roster = ServerRoster::load(&mut tx, &dm.users, state.settings.device_inactive_days)
         .await
@@ -1049,6 +1060,9 @@ pub async fn send_message(
 
     let mut tx = state.db.begin().await?;
     let dm = lock(&mut tx, conversation, me).await?;
+    // First: a device that may no longer act learns nothing else, not even
+    // the acknowledgement of a message it sent before.
+    sender_active(&mut tx, session).await?;
     let sent: Option<(Uuid, i64, i64)> = sqlx::query_as(
         "SELECT conversation_id, seq, (extract(epoch FROM sent_at) * 1000)::bigint \
          FROM sent_messages WHERE device_id = $1 AND client_message_id = $2",
@@ -1092,7 +1106,6 @@ pub async fn send_message(
     if !leaf {
         return Err(Refused::not_a_member());
     }
-    sender_active(&mut tx, session).await?;
     writable(&mut tx, me, dm.peer(me)).await?;
     let (generation, epoch) = current.ok_or_else(Refused::not_a_member)?;
     if (header.group.generation, header.epoch) < (generation, epoch) {

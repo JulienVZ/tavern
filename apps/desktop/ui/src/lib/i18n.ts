@@ -111,6 +111,10 @@ const en = {
     "This instance was restored from a backup of {backup}: everything done on it after that date is undone, and messages sent since may be missing. If you changed any of the following after {backup}, do it again now. First, change your password and create a new recovery key, if you had changed them. Then check your devices and revoke again those you had revoked, the people you block or removed from your friends, and your two-factor authentication.",
   "notice.instance_restored_undated":
     "This instance was restored from a backup: everything done on it after the backup is undone, and recent messages may be missing. If you changed any of the following recently, do it again now. First, change your password and create a new recovery key, if you had changed them. Then check your devices and revoke again those you had revoked, the people you block or removed from your friends, and your two-factor authentication.",
+  "notice.instance_restored_admin":
+    "As an administrator: the backup of {backup} also undid what administrators did after that date. Accounts disabled since are active again, and roles and two-factor authentication disabled by an administrator are as they were. Do these again now. Every invitation still valid was revoked: create new ones if needed.",
+  "notice.instance_restored_admin_undated":
+    "As an administrator: the restored backup also undid what administrators did after it. Accounts disabled since are active again, and roles and two-factor authentication disabled by an administrator are as they were. Do these again now. Every invitation still valid was revoked: create new ones if needed.",
   "notice.other":
     "A security-related change was made to your account ({date}). Update Tavern to see the details.",
   "notice.ack": "OK, noted",
@@ -387,6 +391,10 @@ const fr: Catalogue = {
     "Cette instance a été restaurée à partir d'une sauvegarde du {backup} : tout ce qui y a été fait après cette date est annulé, et des messages envoyés depuis peuvent manquer. Si vous avez modifié l'un des points suivants après le {backup}, refaites-le maintenant. D'abord, changez votre mot de passe et créez une nouvelle clé de récupération, si vous les aviez changés. Vérifiez ensuite vos appareils et révoquez de nouveau ceux que vous aviez révoqués, les personnes que vous bloquez ou que vous avez retirées de vos amis, et votre double authentification.",
   "notice.instance_restored_undated":
     "Cette instance a été restaurée à partir d'une sauvegarde : tout ce qui y a été fait après la sauvegarde est annulé, et des messages récents peuvent manquer. Si vous avez modifié récemment l'un des points suivants, refaites-le maintenant. D'abord, changez votre mot de passe et créez une nouvelle clé de récupération, si vous les aviez changés. Vérifiez ensuite vos appareils et révoquez de nouveau ceux que vous aviez révoqués, les personnes que vous bloquez ou que vous avez retirées de vos amis, et votre double authentification.",
+  "notice.instance_restored_admin":
+    "En tant qu'administrateur : la sauvegarde du {backup} a aussi annulé ce que les administrateurs ont fait après cette date. Les comptes désactivés depuis sont de nouveau actifs, et les rôles ainsi que les doubles authentifications désactivées par un administrateur sont revenus à leur état d'alors. Refaites-le maintenant. Toutes les invitations encore valides ont été révoquées : créez-en de nouvelles si besoin.",
+  "notice.instance_restored_admin_undated":
+    "En tant qu'administrateur : la sauvegarde restaurée a aussi annulé ce que les administrateurs ont fait après elle. Les comptes désactivés depuis sont de nouveau actifs, et les rôles ainsi que les doubles authentifications désactivées par un administrateur sont revenus à leur état d'alors. Refaites-le maintenant. Toutes les invitations encore valides ont été révoquées : créez-en de nouvelles si besoin.",
   "notice.other":
     "Une modification liée à la sécurité a été faite sur votre compte ({date}). Mettez Tavern à jour pour en voir le détail.",
   "notice.ack": "J'en prends note",

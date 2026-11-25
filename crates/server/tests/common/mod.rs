@@ -616,6 +616,24 @@ impl TestApp {
     }
 }
 
+impl TestApp {
+    /// Signs `device` in again: password, then the proof of its key (ADR
+    /// 0017), as after every session was revoked.
+    pub async fn reopen(&self, account: &Account, device: &mut Device) {
+        let grant = self.grant(account).await;
+        let reopened: SessionResponse = self
+            .post(
+                &format!("/v1/devices/{}/session", device.device_id),
+                Some(&grant.enrolment_token),
+                &ReopenSessionRequest {
+                    proof: session_proof(&grant, account, device),
+                },
+            )
+            .await;
+        device.session_token = reopened.session_token;
+    }
+}
+
 pub fn session_proof(grant: &LoginGrant, account: &Account, device: &Device) -> B64 {
     let nonce: [u8; 32] = grant.session_nonce.as_slice().try_into().unwrap();
     B64::from(device.key.sign_session_proof(&SessionChallenge {

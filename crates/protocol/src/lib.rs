@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod group_generation;
 pub mod handle;
 pub mod rest;
 

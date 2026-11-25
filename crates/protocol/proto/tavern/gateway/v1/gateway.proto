@@ -214,8 +214,8 @@ message SecurityNotice {
   bytes notice_id = 2;
   // Since minor 1.
   uint64 created_at_ms = 3;
-  // INSTANCE_RESTORED only: when the restored backup was taken, 0 if the
-  // server does not know. Since minor 7.
+  // INSTANCE_RESTORED and INSTANCE_RESTORED_ADMIN only: when the restored
+  // backup was taken, 0 if the server does not know. Since minor 7.
   uint64 backup_taken_at_ms = 4;
 }
 
@@ -237,6 +237,11 @@ enum SecurityNoticeKind {
   // the user changed after it is undone, and every device was signed out.
   // Since minor 7.
   SECURITY_NOTICE_KIND_INSTANCE_RESTORED = 6;
+  // The same restore, to an administrator (backup_taken_at_ms): what
+  // administrators did after it is undone (accounts disabled since, roles,
+  // TOTP disabled by an administrator), and every invitation still valid
+  // was revoked. Since minor 7.
+  SECURITY_NOTICE_KIND_INSTANCE_RESTORED_ADMIN = 7;
 }
 
 // The user dismissed these notices on this device. Unknown identifiers are

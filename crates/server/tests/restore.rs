@@ -21,10 +21,9 @@ mod common;
 use std::path::Path;
 
 use common::dm::*;
-use common::{Account, Device, TestApp, drop_database, fresh_database, session_proof};
+use common::{Account, Device, TestApp, drop_database, fresh_database};
 use reqwest::{Method, StatusCode};
 use tavern_protocol::gateway::v1 as proto;
-use tavern_protocol::rest::{ReopenSessionRequest, SessionResponse};
 use tavern_server::restore::{self, Handled, Marker, Start};
 
 /// What `restore.sh` does after `pg_restore`: the next generation, with the
@@ -62,21 +61,6 @@ async fn signed_in(app: &TestApp, device: &Device) -> bool {
         "{status}"
     );
     status == StatusCode::OK
-}
-
-/// Signs `device` in again: password, then the proof of its key (ADR 0017).
-async fn reopen(app: &TestApp, account: &Account, device: &mut Device) {
-    let grant = app.grant(account).await;
-    let reopened: SessionResponse = app
-        .post(
-            &format!("/v1/devices/{}/session", device.device_id),
-            Some(&grant.enrolment_token),
-            &ReopenSessionRequest {
-                proof: session_proof(&grant, account, device),
-            },
-        )
-        .await;
-    device.session_token = reopened.session_token;
 }
 
 /// The restore notices of `account`: their dates of backup.
@@ -147,8 +131,13 @@ async fn a_restore_is_handled_once_at_start_up() {
     assert_eq!(start, Start::Unchanged);
 
     let (alice, mut alice1, bob, bob1, dm) = group_of_two(&app).await;
-    upload_last_resort(&app, &bob1.device, bob1.device.key_package(true)).await;
+    let last_resort = bob1.device.key_package(true);
+    upload_last_resort(&app, &bob1.device, last_resort.clone()).await;
     let carol = app.register("rs", false).await;
+    // An administrator, and an invitation nobody used yet.
+    let admin = app.register("rs", true).await;
+    let invite = app.invite(false).await;
+    let seq_before = last_seq(&app, dm.conversation).await;
     assert_eq!(one_time_packages(&app, &bob1.device).await, (3, 1));
     let sessions: i64 =
         sqlx::query_scalar("SELECT count(*) FROM sessions WHERE revoked_at IS NULL")
@@ -171,7 +160,9 @@ async fn a_restore_is_handled_once_at_start_up() {
             by_marker: false,
             backup_taken_at_ms: Some(backup_ms),
             sessions: u64::try_from(sessions).unwrap(),
-            notices: 3,
+            notices: 4,
+            admin_notices: 1,
+            invitations: 1,
             key_packages: 3,
             conversations: 1,
         }
@@ -179,9 +170,29 @@ async fn a_restore_is_handled_once_at_start_up() {
     assert_eq!(generations(&app).await, (1, 1));
     assert!(!signed_in(&app, &alice1.device).await);
     assert!(!signed_in(&app, &bob1.device).await);
-    for account in [&alice, &bob, &carol] {
+    for account in [&alice, &bob, &carol, &admin] {
         assert_eq!(restore_notices(&app, account).await, [Some(backup_ms)]);
     }
+    // The administrator is told what the restore undid of their actions,
+    // and no invitation works any more.
+    let admin_notices: Vec<Option<i64>> = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM backup_taken_at) * 1000)::bigint FROM security_notices \
+         WHERE kind = 7 ORDER BY user_id",
+    )
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(admin_notices, [Some(backup_ms)]);
+    assert!(
+        app.register_with(&common::random_handle("rs"), common::PASSWORD, &invite)
+            .await
+            .is_err()
+    );
+    // The numbering goes on above any number given after the backup.
+    assert_eq!(
+        last_seq(&app, dm.conversation).await,
+        seq_before + restore::SEQUENCE_JUMP
+    );
     assert_eq!(one_time_packages(&app, &bob1.device).await, (0, 1));
     let to_recreate: bool =
         sqlx::query_scalar("SELECT needs_recreation FROM conversations WHERE id = $1")
@@ -199,7 +210,7 @@ async fn a_restore_is_handled_once_at_start_up() {
 
     // Alice signs in again on her device, which the database knows: the
     // generation and the notice, with the date of the backup.
-    reopen(&app, &alice, &mut alice1.device).await;
+    app.reopen(&alice, &mut alice1.device).await;
     let (_, ready) = common::ws::connect(&app, &alice1.device).await;
     assert_eq!(ready.instance_generation, 1);
     let [notice] = ready.security_notices.as_slice() else {
@@ -216,8 +227,20 @@ async fn a_restore_is_handled_once_at_start_up() {
     assert_eq!(ready.security_notices.len(), 1);
     // What Alice may claim of Bob's: his last resort only, until his
     // devices upload new packages.
-    let claimed = claim(&app, &alice1.device, &bob, &dm.keys).await;
-    assert_eq!(claimed.len(), 1);
+    let (status, bytes) = app
+        .send::<()>(
+            Method::POST,
+            &format!("/v1/users/{}/key-packages/claim", bob.user_id),
+            Some(&alice1.device.session_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let served: tavern_protocol::rest::KeyPackageClaim = serde_json::from_slice(&bytes).unwrap();
+    let [package] = served.key_packages.as_slice() else {
+        panic!("expected Bob's one device with packages: {served:?}");
+    };
+    assert_eq!(package.key_package, last_resort);
 
     drop_database(&url).await;
 }
@@ -410,6 +433,120 @@ async fn a_handling_that_fails_halfway_is_done_again_from_the_start() {
     assert!(!signed_in(&app, &alice1).await);
     assert_eq!(restore_notices(&app, &alice).await.len(), 1);
     assert_eq!(one_time_packages(&app, &alice1).await, (0, 0));
+
+    drop_database(&url).await;
+}
+
+/// The marker on disk, once it says at least `changes`.
+async fn marker_reaches(dir: &Path, changes: i64) -> Marker {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(marker) = restore::read_marker(dir).unwrap()
+                && marker.changes >= changes
+            {
+                return marker;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the marker was never brought up to date")
+}
+
+/// Section 15, the review's scenario: the database restored while the
+/// server runs. The marker loop follows the database as it changes, never
+/// writes a marker backwards, and stops the server instead; the next start
+/// then handles the restore, a revocation the restore undid included.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_restore_while_the_server_runs_stops_it_and_is_handled_at_the_next_start() {
+    let url = fresh_database().await;
+    let app = TestApp::spawn_on(&url, |_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_alice, alice1) = app.account_with_device("rs", false).await;
+    let every = std::time::Duration::from_millis(20);
+
+    let (app, dir, alice1) = (&app, &dir, &alice1);
+    // Bounded: if the loop never noticed, `serve` would wait for ever.
+    let ran = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        restore::run(&app.state.db, dir.path(), every, |start| async move {
+            assert_eq!(start, Start::Unchanged);
+            // What the backup holds: the counter, and alice1's session live.
+            let backup = restore::current(&app.state.db).await.unwrap();
+            // After it: alice1 revoked, which the marker follows.
+            sqlx::query("UPDATE sessions SET revoked_at = now() WHERE device_id = $1")
+                .bind(alice1.device_id)
+                .execute(&app.state.db)
+                .await
+                .unwrap();
+            let followed = marker_reaches(dir.path(), backup.changes + 1).await;
+            // The restore, made with the server running: the counter goes back
+            // with the data.
+            sqlx::query("UPDATE sessions SET revoked_at = NULL WHERE device_id = $1")
+                .bind(alice1.device_id)
+                .execute(&app.state.db)
+                .await
+                .unwrap();
+            sqlx::query("SELECT setval('instance_changes', $1)")
+                .bind(backup.changes)
+                .execute(&app.state.db)
+                .await
+                .unwrap();
+            // The server goes on serving until the loop sees it.
+            std::future::pending::<()>().await;
+            followed
+        }),
+    )
+    .await
+    .expect("the server went on serving a database that went back");
+    assert!(
+        matches!(ran, Err(restore::RestoreError::WentBack)),
+        "{ran:?}"
+    );
+    // The marker was not written backwards.
+    let on_disk = restore::read_marker(dir.path()).unwrap().unwrap();
+    assert!(on_disk.changes > restore::current(&app.state.db).await.unwrap().changes);
+    assert!(signed_in(app, alice1).await);
+
+    // The next start handles it.
+    let handled = restored(
+        restore::at_start(&app.state.db, dir.path())
+            .await
+            .unwrap()
+            .0,
+    );
+    assert!(handled.by_marker);
+    assert!(!signed_in(app, alice1).await);
+
+    drop_database(&url).await;
+}
+
+/// Section 15: the start-up comes first (a restore recorded by
+/// `restore.sh` is handled before anything is served), and a clean stop
+/// leaves the marker as the database is then, however recent the change.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn the_start_up_comes_first_and_a_clean_stop_records_the_marker() {
+    let url = fresh_database().await;
+    let app = TestApp::spawn_on(&url, |_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    restore_sh(&app, "2026-11-01T10:00:00Z").await;
+    // A loop slower than the test: only the stop can write the change.
+    let every = std::time::Duration::from_secs(3600);
+
+    let (app, dir) = (&app, &dir);
+    let changed = restore::run(&app.state.db, dir.path(), every, |start| async move {
+        assert!(matches!(start, Start::Restored(_)));
+        assert_eq!(generations(app).await, (1, 1));
+        app.register("rs", false).await;
+        restore::current(&app.state.db).await.unwrap()
+    })
+    .await
+    .unwrap();
+    let on_disk = restore::read_marker(dir.path()).unwrap().unwrap();
+    assert_eq!(on_disk, changed);
+    assert_eq!(on_disk.generation, 1);
 
     drop_database(&url).await;
 }

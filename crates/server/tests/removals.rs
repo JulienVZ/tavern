@@ -22,16 +22,16 @@
 mod common;
 
 use common::dm::*;
-use common::ws::{expect_close, expect_frame};
+use common::ws::{expect_close, expect_frame, hello, open, send};
 use common::{Account, Device, TestApp};
 use futures_util::SinkExt;
 use prost::Message as _;
 use reqwest::{Method, StatusCode};
 use tavern_crypto::mls::{Incoming, LeafError, MlsError, ServerSigner, VerifiedLeaf};
-use tavern_protocol::close_code;
 use tavern_protocol::gateway::v1 as proto;
 use tavern_protocol::gateway::v1::client_frame::Payload as ClientPayload;
 use tavern_protocol::gateway::v1::server_frame::Payload as ServerPayload;
+use tavern_protocol::{GATEWAY_SUBPROTOCOL, close_code};
 use tavern_server::delivery::{self, Refused};
 use tavern_server::gateway::Event;
 use tavern_server::{mls, removals};
@@ -247,7 +247,7 @@ async fn a_disabled_account_s_devices_leave_their_groups() {
         expect_close(&mut bob1.socket).await,
         Some(close_code::SESSION_REVOKED)
     );
-    // Cut off: the sequence up to its proposal, nothing sent.
+    // Cut off: the sequence up to its proposal.
     let session = session(&bob, &bob1.device);
     let batch = delivery::fetch_messages(
         &app.state,
@@ -262,12 +262,13 @@ async fn a_disabled_account_s_devices_leave_their_groups() {
     .unwrap();
     let seqs: Vec<u64> = batch.messages.iter().map(|message| message.seq).collect();
     assert_eq!(seqs, [2]);
+    // Nothing sent, and told first that its session ended.
     let held = bob1.encrypt(b"after the disabling");
     assert_eq!(
         refused_code(
             delivery::send_message(&app.state, &session, message_request(&dm, held)).await
         ),
-        proto::ErrorCode::NotAMember
+        proto::ErrorCode::Unauthenticated
     );
 
     let status = app
@@ -516,7 +517,9 @@ async fn send_raw(member: &mut Member, request_id: u64, payload: ClientPayload) 
 }
 
 /// Section 6: a revocation closes an idle connection at once, with
-/// `SessionRevoked`, without waiting for anything from the device.
+/// `SessionRevoked`, without waiting for anything from the device. That
+/// the end does not wait behind the connection's queue of events, nor let a
+/// request through, is what the next test checks.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn a_revocation_closes_an_idle_connection_at_once() {
@@ -722,4 +725,90 @@ async fn a_removal_stored_without_its_row_gets_its_row() {
             .unwrap()
     );
     assert_eq!(sequence(&app, dm.conversation).await, [(1, 2)]);
+}
+
+/// Section 6, the review's window: a session revoked after its `Hello` was
+/// checked, but before its connection was registered, had no connection
+/// to close (`Registry::end_session`). The connection checks the session
+/// again once registered: it closes with 4003 before `Ready`. The order is
+/// forced by a trigger that revokes the session from inside the `Hello`'s
+/// own record of activity, after its check.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_session_revoked_while_its_connection_opens_closes_it() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, device) = app.account_with_device("rm", false).await;
+    // Its activity is recorded at its next Hello (more than an hour ago).
+    sqlx::query(
+        "UPDATE sessions SET last_used_at = now() - interval '2 hours' WHERE device_id = $1",
+    )
+    .bind(device.device_id)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let name = format!("revoke_{}", device.device_id.simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.id = '{}' THEN \
+             UPDATE sessions SET revoked_at = now() WHERE device_id = NEW.id; \
+           END IF; RETURN NULL; END $$",
+        device.device_id
+    )))
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER {name} AFTER UPDATE ON devices FOR EACH ROW EXECUTE FUNCTION {name}()"
+    )))
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    let mut socket = open(&app, Some(GATEWAY_SUBPROTOCOL)).await.unwrap();
+    send(&mut socket, 1, hello(&device.session_token)).await;
+    let closed = expect_close(&mut socket).await;
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER {name} ON devices"
+    )))
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {name}()")))
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(closed, Some(close_code::SESSION_REVOKED));
+}
+
+/// Section 6: every request checks the session, reads included. A device
+/// revoked without its connection being told gets no `FetchMessages`
+/// through: the connection closes with 4003.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_revoked_session_reads_nothing_through_a_connection_still_open() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, _alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    revoked_in_the_database(&app, &bob1.device).await;
+    send_raw(
+        &mut bob1,
+        7,
+        ClientPayload::FetchMessages(proto::FetchMessages {
+            conversation_id: dm.conversation.as_bytes().to_vec(),
+            after_seq: 0,
+            limit: 10,
+        }),
+    )
+    .await;
+    loop {
+        match common::ws::receive(&mut bob1.socket).await {
+            common::ws::Received::Closed(code) => {
+                assert_eq!(code, Some(close_code::SESSION_REVOKED));
+                break;
+            }
+            common::ws::Received::Frame(frame) => {
+                assert_eq!(frame.request_id, 0, "the read was answered: {frame:?}");
+            }
+        }
+    }
 }

@@ -123,42 +123,57 @@ async fn every_database_column_is_classified() {
 
 /// Every write to the database advances the counter of changes, which the
 /// server's marker compares to tell a restored database (ADR 0019, section
-/// 15): every table has the trigger, but the instance's own state and the
-/// migrations' table. A table added later gets it in its migration.
+/// 15): every table but the instance's own state and the migrations' has
+/// the trigger, for every statement after an insert, an update, a delete
+/// or a truncation; and one statement advances the counter by one, even a
+/// statement that changes no row. On a database of its own: on the shared
+/// one, other tests advance the counter too.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn every_table_counts_its_changes() {
-    let database_url = common::database_url();
-    let pool = db::connect(&database_url, 1).await.unwrap();
+    let url = common::fresh_database().await;
+    let pool = db::connect(&url, 1).await.unwrap();
     db::migrate(&pool).await.unwrap();
 
-    let missing: Vec<String> = sqlx::query_scalar(
+    // tgtype: statement level and AFTER (bits 1 and 2 clear), INSERT 4,
+    // DELETE 8, UPDATE 16, TRUNCATE 32.
+    let wrong: Vec<String> = sqlx::query_scalar(
         "SELECT t.tablename::text FROM pg_tables t \
          WHERE t.schemaname = 'public' \
            AND t.tablename NOT IN ('instance_state', '_sqlx_migrations') \
            AND NOT EXISTS (SELECT 1 FROM pg_trigger g \
                            JOIN pg_class c ON c.oid = g.tgrelid \
-                           WHERE c.relname = t.tablename AND g.tgname = 'instance_changed') \
+                           WHERE c.relname = t.tablename AND g.tgname = 'instance_changed' \
+                             AND g.tgtype = 60 AND g.tgfoid = 'instance_changed'::regproc \
+                             AND g.tgenabled = 'O') \
          ORDER BY 1",
     )
     .fetch_all(&pool)
     .await
     .unwrap();
     assert!(
-        missing.is_empty(),
-        "tables without the instance_changed trigger: {missing:?}"
+        wrong.is_empty(),
+        "tables without the instance_changed trigger, as it must be: {wrong:?}"
     );
-    let before: (i64, bool) = sqlx::query_as("SELECT last_value, is_called FROM instance_changes")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let counter = || async {
+        let (last, called): (i64, bool) =
+            sqlx::query_as("SELECT last_value, is_called FROM instance_changes")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if called { last } else { 0 }
+    };
+    let before = counter().await;
     sqlx::query("UPDATE instance_invites SET uses = uses WHERE false")
         .execute(&pool)
         .await
         .unwrap();
-    let after: i64 = sqlx::query_scalar("SELECT last_value FROM instance_changes")
-        .fetch_one(&pool)
+    assert_eq!(counter().await, before + 1);
+    sqlx::query("UPDATE instance_state SET alive_at = now()")
+        .execute(&pool)
         .await
         .unwrap();
-    assert!(!before.1 || after > before.0);
+    assert_eq!(counter().await, before + 1, "instance_state is not counted");
+    pool.close().await;
+    common::drop_database(&url).await;
 }

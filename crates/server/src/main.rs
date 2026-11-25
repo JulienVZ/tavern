@@ -89,52 +89,48 @@ async fn run() -> anyhow::Result<()> {
         tracing::warn!("database migrations are disabled");
     }
 
-    // Before serving anything: a database restored from a backup revokes
-    // every session first (ADR 0019, section 15).
-    let (start, marker) = restore::at_start(&pool, &config.data_dir)
+    let settings = Settings {
+        message_retention_days: config.message_retention_days,
+        device_inactive_days: config.device_inactive_days,
+        claim_limits: config.claim_limits,
+        friend_requests_per_hour: config.friend_requests_per_hour,
+        ..Settings::new(
+            config.source_url.clone(),
+            config.trust_forwarded_for,
+            config.session_ttl,
+        )
+    };
+    // Before serving anything, a database restored from a backup revokes
+    // every session (ADR 0019, section 15); while serving, a database that
+    // goes back stops the server, whose next start handles it; at a clean
+    // stop, the marker as the database is then.
+    let (pool_of_serve, config_of_serve) = (&pool, &config);
+    let serve = |start| async move {
+        let (pool, config) = (pool_of_serve, config_of_serve);
+        if start == restore::Start::Unchanged {
+            tracing::info!("the database was not restored since the last start");
+        }
+        let state = AppState::new(pool.clone(), secrets, settings);
+        // At start-up, then every hour (ADR 0019, sections 12 and 15).
+        let purge = purge::spawn(state.clone());
+        let listener = TcpListener::bind(config.listen_addr)
+            .await
+            .with_context(|| format!("cannot listen on {}", config.listen_addr))?;
+        tracing::info!(addr = %config.listen_addr, "listening");
+        let served = axum::serve(
+            listener,
+            app(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("cannot start on this database")?;
-    if start == restore::Start::Unchanged {
-        tracing::info!("the database was not restored since the last start");
-    }
-    let marker = restore::spawn_marker(pool.clone(), config.data_dir.clone(), marker);
-
-    let state = AppState::new(
-        pool.clone(),
-        secrets,
-        Settings {
-            message_retention_days: config.message_retention_days,
-            device_inactive_days: config.device_inactive_days,
-            claim_limits: config.claim_limits,
-            friend_requests_per_hour: config.friend_requests_per_hour,
-            ..Settings::new(
-                config.source_url.clone(),
-                config.trust_forwarded_for,
-                config.session_ttl,
-            )
-        },
-    );
-    // At start-up, then every hour (ADR 0019, sections 12 and 15).
-    let purge = purge::spawn(state.clone());
-    let listener = TcpListener::bind(config.listen_addr)
+        .context("HTTP server failed");
+        purge.abort();
+        served
+    };
+    restore::run(&pool, &config.data_dir, restore::MARKER_INTERVAL, serve)
         .await
-        .with_context(|| format!("cannot listen on {}", config.listen_addr))?;
-    tracing::info!(addr = %config.listen_addr, "listening");
+        .context("cannot run on this database")??;
 
-    axum::serve(
-        listener,
-        app(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("HTTP server failed")?;
-
-    purge.abort();
-    marker.abort();
-    // The marker as the database is at the stop.
-    if let Err(error) = restore::record(&pool, &config.data_dir).await {
-        tracing::error!(%error, "cannot update the instance marker");
-    }
     pool.close().await;
     tracing::info!("shut down cleanly");
     Ok(())

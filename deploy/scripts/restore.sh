@@ -20,6 +20,8 @@
 
 set -eu
 
+. "$(dirname "$0")/lib/archive.sh"
+
 db_only=false
 assume_yes=false
 archive=""
@@ -71,34 +73,53 @@ if [ "$db_only" != true ]; then
     chmod 600 .env
 fi
 
-echo "Stopping the server..."
-docker compose stop server caddy >/dev/null 2>&1 || true
+# The database and the instance must be on the same schema: pg_restore
+# --clean puts back the dump's list of migrations but leaves the tables the
+# dump does not have, so the server could not start on the result.
 docker compose up -d --wait postgres
+instance_schema=$(docker compose exec -T postgres sh -c \
+    'psql --no-psqlrc --tuples-only --no-align --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+         --command "SELECT max(version) FROM _sqlx_migrations"' 2>/dev/null || true)
+instance_schema=${instance_schema:-0}
+backup_schema=$(docker compose exec -T postgres \
+    pg_restore --data-only --table=_sqlx_migrations --file=- <"$dir/db.dump" |
+    newest_migration_in_dump_listing)
+if [ "$instance_schema" -ne 0 ] && [ "$backup_schema" -lt "$instance_schema" ]; then
+    echo "restore.sh: this backup was made by an older version of Tavern (database schema" \
+        "$backup_schema, this instance: $instance_schema). Restoring it over this database" \
+        "would leave a database the server cannot start on. Restore it with the version of" \
+        "Tavern it was made with, then update." >&2
+    exit 1
+fi
+if [ "$instance_schema" -ne 0 ] && [ "$backup_schema" -gt "$instance_schema" ]; then
+    echo "restore.sh: this backup was made by a newer version of Tavern (database schema" \
+        "$backup_schema, this instance: $instance_schema). Update Tavern first." >&2
+    exit 1
+fi
+
+# Always with the server stopped: a server running on a database restored
+# under it would serve the restored sessions until it notices (it then
+# stops, and handles the restore at its next start).
+echo "Stopping the server..."
+docker compose stop server caddy >/dev/null
+if docker compose ps --status running --services | grep -qx server; then
+    echo "restore.sh: the server is still running; stop it (docker compose stop server)." >&2
+    exit 1
+fi
 
 echo "Restoring PostgreSQL..."
 docker compose exec -T postgres sh -c \
     'pg_restore --clean --if-exists --no-owner --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
     <"$dir/db.dump"
 
-# When the backup was taken: the file backup.sh writes, else the time in the
-# archive's name. Checked strictly: it goes into SQL.
-taken_at=""
-if [ -f "$dir/taken_at" ]; then
-    taken_at=$(cat "$dir/taken_at")
-else
-    stamp=$(basename "$dir" | sed -n 's/^tavern-\([0-9]\{8\}T[0-9]\{6\}Z\)$/\1/p')
-    if [ -n "$stamp" ]; then
-        taken_at=$(echo "$stamp" | sed 's/^\(....\)\(..\)\(..\)T\(..\)\(..\)\(..\)Z$/\1-\2-\3T\4:\5:\6Z/')
-    fi
-fi
-if ! echo "$taken_at" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+taken_at=$(backup_date "$dir")
+if [ -z "$taken_at" ]; then
     echo "restore.sh: the date of this backup is unknown; the restore notice gives an estimate." >&2
-    taken_at=""
 fi
 
 echo "Recording the restore..."
-# A dump older than the table (migration 0014) is told by the server's
-# marker instead.
+# The schema of the dump is the instance's (checked above), so the table
+# exists.
 docker compose exec -T postgres sh -c \
     'psql --quiet --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' <<SQL
 DO \$\$

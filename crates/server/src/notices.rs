@@ -41,17 +41,21 @@ pub enum NoticeKind {
     /// The instance was restored from a backup ([`crate::restore`]):
     /// recorded for every account, with the date of the backup.
     InstanceRestored = 6,
+    /// The same restore, to an administrator: what administrators did after
+    /// the backup is undone, and every invitation still valid was revoked.
+    InstanceRestoredAdmin = 7,
 }
 
 impl NoticeKind {
     /// Every kind, for tests and documentation checks.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::TotpDisabledByAdmin,
         Self::PasswordChanged,
         Self::AccountRecovered,
         Self::DeviceRevoked,
         Self::RecoveryKeyReplaced,
         Self::InstanceRestored,
+        Self::InstanceRestoredAdmin,
     ];
 
     /// Kinds also shown to devices enrolled after the event, until one device
@@ -65,10 +69,11 @@ impl NoticeKind {
     /// device is signed out, and one enrolled after the backup is unknown to
     /// the restored database: it is enrolled anew, after the notice. The
     /// other kinds are acknowledged at once by the device that acted.
-    pub const SHOWN_TO_LATER_DEVICES: [Self; 3] = [
+    pub const SHOWN_TO_LATER_DEVICES: [Self; 4] = [
         Self::TotpDisabledByAdmin,
         Self::AccountRecovered,
         Self::InstanceRestored,
+        Self::InstanceRestoredAdmin,
     ];
 
     fn from_db(value: i16) -> Option<Self> {
@@ -84,6 +89,7 @@ impl NoticeKind {
             Self::DeviceRevoked => proto::SecurityNoticeKind::DeviceRevoked,
             Self::RecoveryKeyReplaced => proto::SecurityNoticeKind::RecoveryKeyReplaced,
             Self::InstanceRestored => proto::SecurityNoticeKind::InstanceRestored,
+            Self::InstanceRestoredAdmin => proto::SecurityNoticeKind::InstanceRestoredAdmin,
         }
     }
 }
@@ -97,7 +103,7 @@ pub struct Notice {
     pub kind: NoticeKind,
     /// When, in milliseconds since the Unix epoch.
     pub created_at_ms: u64,
-    /// [`NoticeKind::InstanceRestored`] only: when the restored backup was
+    /// The notices of a restore only: when the restored backup was
     /// taken, in milliseconds since the Unix epoch, if the server knows.
     pub backup_taken_at_ms: Option<u64>,
 }
@@ -272,13 +278,13 @@ mod tests {
     #[test]
     fn kinds_keep_their_codes_and_match_the_protocol() {
         let codes: Vec<i16> = NoticeKind::ALL.iter().map(|kind| *kind as i16).collect();
-        assert_eq!(codes, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(codes, [1, 2, 3, 4, 5, 6, 7]);
         for kind in NoticeKind::ALL {
             // Database and wire codes are the same numbers.
             assert_eq!(i32::from(kind as i16), i32::from(kind.to_proto()));
             assert_eq!(NoticeKind::from_db(kind as i16), Some(kind));
         }
         assert_eq!(NoticeKind::from_db(0), None);
-        assert_eq!(NoticeKind::from_db(7), None);
+        assert_eq!(NoticeKind::from_db(8), None);
     }
 }

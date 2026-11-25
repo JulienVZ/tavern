@@ -121,8 +121,8 @@ CREATE TABLE security_notices (
     user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, -- META  the account concerned
     kind        smallint NOT NULL,                           -- META  enum: TOTP disabled by an admin, password changed, ...
     created_at  timestamptz NOT NULL DEFAULT now(),          -- META
-    backup_taken_at timestamptz,                             -- META  kind 6 (instance restored) only: when the backup was taken, if known (migration 0014)
-    CHECK (backup_taken_at IS NULL OR kind = 6)
+    backup_taken_at timestamptz,                             -- META  kinds 6 and 7 (instance restored) only: when the backup was taken, if known (migrations 0014, 0015)
+    CHECK (backup_taken_at IS NULL OR kind IN (6, 7))
 );
 CREATE INDEX security_notices_user_idx ON security_notices (user_id, created_at);
 
@@ -382,7 +382,8 @@ Commits and proposals are `PUB`: they are signed but not encrypted, and contain 
 -- (TAVERN_DATA_DIR/instance-marker, outside the database) shows the
 -- database behind. At start-up the server handles a generation once, in one
 -- transaction: every session revoked, the notice for every account, every
--- one-time KeyPackage deleted, every conversation to recreate; the
+-- one-time KeyPackage deleted, every invitation still valid revoked, every
+-- conversation to recreate with its numbering moved on by 2^32; the
 -- generation is marked handled at its end.
 CREATE TABLE instance_state (
     id                 boolean PRIMARY KEY DEFAULT true,     -- META  a single row

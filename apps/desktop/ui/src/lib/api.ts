@@ -114,6 +114,7 @@ export type SecurityNoticeKind =
   | "device_revoked"
   | "recovery_key_replaced"
   | "instance_restored"
+  | "instance_restored_admin"
   | "other";
 
 /** Something security-relevant that happened to the account. */
@@ -121,7 +122,7 @@ export interface SecurityNotice {
   noticeId: string;
   kind: SecurityNoticeKind;
   createdAtMs: number;
-  /** `instance_restored` only, when the instance knows the backup's date. */
+  /** The notices of a restore, when the instance knows the backup's date. */
   backupTakenAtMs?: number;
 }
 

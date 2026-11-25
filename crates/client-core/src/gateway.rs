@@ -84,6 +84,9 @@ pub enum SecurityNoticeKind {
     /// it ([`SecurityNotice::backup_taken_at_ms`]) is undone, and every
     /// device was signed out.
     InstanceRestored,
+    /// The same restore, told to an administrator: what administrators did
+    /// after the backup is undone, and every invitation was revoked.
+    InstanceRestoredAdmin,
     /// A kind introduced by an instance newer than this client. Still shown:
     /// the user must know that something happened.
     Other,
@@ -99,7 +102,7 @@ pub struct SecurityNotice {
     pub kind: SecurityNoticeKind,
     /// When, in milliseconds since the Unix epoch.
     pub created_at_ms: u64,
-    /// [`SecurityNoticeKind::InstanceRestored`]: when the restored backup was
+    /// The notices of a restore: when the restored backup was
     /// taken, in milliseconds since the Unix epoch, if the instance knows.
     pub backup_taken_at_ms: Option<u64>,
 }
@@ -119,14 +122,19 @@ impl SecurityNotice {
                 SecurityNoticeKind::RecoveryKeyReplaced
             }
             Ok(proto::SecurityNoticeKind::InstanceRestored) => SecurityNoticeKind::InstanceRestored,
+            Ok(proto::SecurityNoticeKind::InstanceRestoredAdmin) => {
+                SecurityNoticeKind::InstanceRestoredAdmin
+            }
             Ok(proto::SecurityNoticeKind::Unspecified) | Err(_) => SecurityNoticeKind::Other,
         };
         Some(Self {
             notice_id: uuid(&notice.notice_id)?,
             kind,
             created_at_ms: notice.created_at_ms,
-            backup_taken_at_ms: (kind == SecurityNoticeKind::InstanceRestored
-                && notice.backup_taken_at_ms != 0)
+            backup_taken_at_ms: (matches!(
+                kind,
+                SecurityNoticeKind::InstanceRestored | SecurityNoticeKind::InstanceRestoredAdmin
+            ) && notice.backup_taken_at_ms != 0)
                 .then_some(notice.backup_taken_at_ms),
         })
     }
@@ -595,6 +603,7 @@ mod tests {
         assert_eq!(kind(4), Some(SecurityNoticeKind::DeviceRevoked));
         assert_eq!(kind(5), Some(SecurityNoticeKind::RecoveryKeyReplaced));
         assert_eq!(kind(6), Some(SecurityNoticeKind::InstanceRestored));
+        assert_eq!(kind(7), Some(SecurityNoticeKind::InstanceRestoredAdmin));
         assert_eq!(kind(0), Some(SecurityNoticeKind::Other));
         assert_eq!(kind(99), Some(SecurityNoticeKind::Other));
 

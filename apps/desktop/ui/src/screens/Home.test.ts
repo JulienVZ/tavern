@@ -82,6 +82,7 @@ describe("security notices", () => {
       "device_revoked",
       "recovery_key_replaced",
       "instance_restored",
+      "instance_restored_admin",
       "other",
     ];
     render(Home);
@@ -108,6 +109,25 @@ describe("the notice of a restored backup", () => {
     expect(text).toContain("2026");
     expect(text).toContain("change your password and create a new recovery key");
     expect(text).toContain("revoke again");
+  });
+
+  it("tells an administrator what the restore undid of their actions", async () => {
+    render(Home);
+    handleGatewayEvent({
+      type: "connected",
+      newDevices: [],
+      securityNotices: [
+        {
+          ...notice,
+          kind: "instance_restored_admin",
+          backupTakenAtMs: Date.UTC(2026, 10, 2, 12),
+        },
+      ],
+    });
+    const text = (await screen.findByText(/As an administrator/)).textContent ?? "";
+    expect(text).toContain("2026");
+    expect(text).toContain("Accounts disabled since are active again");
+    expect(text).toContain("invitation");
   });
 
   it("says so when the date of the backup is unknown", async () => {

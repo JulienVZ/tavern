@@ -34,7 +34,13 @@ use sqlx::{PgConnection, PgPool};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::notices::NoticeKind;
 use crate::panics;
+
+/// How far each conversation's numbering jumps at a restore: above any
+/// number it can have given after the backup (2^32 messages, commits and
+/// proposals since the backup), with room for 2^31 restores in a `bigint`.
+pub const SEQUENCE_JUMP: i64 = 1 << 32;
 
 /// The marker's file, in `TAVERN_DATA_DIR`.
 pub const MARKER_FILE: &str = "instance-marker";
@@ -114,6 +120,12 @@ pub enum RestoreError {
     /// The database.
     #[error("cannot check whether the database was restored from a backup: {0}")]
     Database(#[from] sqlx::Error),
+    /// The database went back behind the marker while the server ran.
+    #[error(
+        "the database went back in time while the server was running: it was restored without \
+         stopping the server. The server stops; its next start handles the restore"
+    )]
+    WentBack,
 }
 
 fn marker_path(dir: &Path) -> PathBuf {
@@ -208,6 +220,10 @@ pub struct Handled {
     pub sessions: u64,
     /// Notices recorded: one per account.
     pub notices: u64,
+    /// Notices to administrators recorded: one per administrator.
+    pub admin_notices: u64,
+    /// Invitations still valid, revoked.
+    pub invitations: u64,
     /// One-time KeyPackages deleted.
     pub key_packages: u64,
     /// Conversations marked for the recreation of their group.
@@ -218,20 +234,51 @@ pub struct Handled {
 /// a restore if there is one ([`handle`]), then writes the marker for the
 /// database as it is now, which it returns. Any failure stops the start-up.
 pub async fn at_start(db: &PgPool, dir: &Path) -> Result<(Start, Marker), RestoreError> {
-    let read = dir.to_owned();
-    let marker = panics::blocking(move || read_marker(&read))
-        .await
-        .map_err(|_| MarkerError::Interrupted)??;
+    let marker = read(dir).await?;
     let start = handle(db, marker).await?;
-    let marker = record(db, dir).await?;
+    // Whatever the marker said, it is now behind, or of another database:
+    // replaced.
+    let marker = current(db).await?;
+    write(db, dir, marker).await?;
     Ok((start, marker))
 }
 
-/// Writes the marker for the database as it is now, and records in the
-/// database when it did: the date that stands for the backup's when
-/// `restore.sh` did not record one.
-pub async fn record(db: &PgPool, dir: &Path) -> Result<Marker, RestoreError> {
-    let marker = current(db).await?;
+/// What the server does from its start to its stop, around `serve`: the
+/// start-up ([`at_start`]) first, whose outcome `serve` is given; the marker
+/// brought up to date every `every` meanwhile ([`spawn_marker`]); and at a
+/// clean stop, the marker as the database is then ([`record`]). If the
+/// database goes back meanwhile (restored while the server ran), `serve` is
+/// dropped and [`RestoreError::WentBack`] returned: the server stops, and
+/// its next start handles the restore.
+pub async fn run<F, Fut, T>(
+    db: &PgPool,
+    dir: &Path,
+    every: Duration,
+    serve: F,
+) -> Result<T, RestoreError>
+where
+    F: FnOnce(Start) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let (start, last) = at_start(db, dir).await?;
+    let mut watch = spawn_marker(db.clone(), dir.to_owned(), last, every);
+    let outcome = tokio::select! {
+        outcome = serve(start) => outcome,
+        _ = &mut watch => return Err(RestoreError::WentBack),
+    };
+    watch.abort();
+    record(db, dir).await?;
+    Ok(outcome)
+}
+
+async fn read(dir: &Path) -> Result<Option<Marker>, MarkerError> {
+    let read = dir.to_owned();
+    panics::blocking(move || read_marker(&read))
+        .await
+        .map_err(|_| MarkerError::Interrupted)?
+}
+
+async fn write(db: &PgPool, dir: &Path, marker: Marker) -> Result<(), RestoreError> {
     sqlx::query("UPDATE instance_state SET alive_at = now()")
         .execute(db)
         .await?;
@@ -239,15 +286,40 @@ pub async fn record(db: &PgPool, dir: &Path) -> Result<Marker, RestoreError> {
     panics::blocking(move || write_marker(&write, marker))
         .await
         .map_err(|_| MarkerError::Interrupted)??;
+    Ok(())
+}
+
+/// Whether the database `now` is behind the marker `written`: another
+/// database, an earlier generation, or fewer changes at the same one.
+fn went_back(now: Marker, written: Marker) -> bool {
+    now.instance_id != written.instance_id
+        || now.generation < written.generation
+        || (now.generation == written.generation && now.changes < written.changes)
+}
+
+/// Writes the marker for the database as it is now, and records in the
+/// database when it did: the date that stands for the backup's when
+/// `restore.sh` did not record one. Never backwards: a database behind the
+/// marker on disk was restored while the server ran, and is left for the
+/// next start to handle ([`RestoreError::WentBack`]).
+pub async fn record(db: &PgPool, dir: &Path) -> Result<Marker, RestoreError> {
+    let marker = current(db).await?;
+    if let Some(written) = read(dir).await?
+        && went_back(marker, written)
+    {
+        return Err(RestoreError::WentBack);
+    }
+    write(db, dir, marker).await?;
     Ok(marker)
 }
 
-/// Brings the marker up to date every [`MARKER_INTERVAL`], when the database
-/// changed, until the runtime stops. A failure is logged, and the next
-/// pass tries again.
-pub fn spawn_marker(db: PgPool, dir: PathBuf, mut last: Marker) -> JoinHandle<()> {
+/// Brings the marker up to date every `every`, when the database changed
+/// ([`record`]). Ends only when the database went back: the restore is then
+/// for the next start. Any other failure is logged, and the next pass tries
+/// again.
+pub fn spawn_marker(db: PgPool, dir: PathBuf, mut last: Marker, every: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(MARKER_INTERVAL);
+        let mut ticks = tokio::time::interval(every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
@@ -260,6 +332,10 @@ pub fn spawn_marker(db: PgPool, dir: PathBuf, mut last: Marker) -> JoinHandle<()
             match panics::guard(pass).await {
                 Ok(Ok(Some(marker))) => last = marker,
                 Ok(Ok(None)) => {}
+                Ok(Err(RestoreError::WentBack)) => {
+                    tracing::error!("{}", RestoreError::WentBack);
+                    return;
+                }
                 Ok(Err(error)) => tracing::error!(%error, "cannot update the instance marker"),
                 Err(panics::Panicked) => tracing::error!("updating the instance marker panicked"),
             }
@@ -332,8 +408,30 @@ pub async fn handle(db: &PgPool, marker: Option<Marker>) -> Result<Start, sqlx::
         "INSERT INTO security_notices (user_id, kind, backup_taken_at) \
          SELECT id, $1, to_timestamp($2::double precision / 1000) FROM users",
     )
-    .bind(crate::notices::NoticeKind::InstanceRestored as i16)
+    .bind(NoticeKind::InstanceRestored as i16)
     .bind(backup_taken_at_ms)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    // What the administrators did after the backup is undone too: accounts
+    // disabled since are enabled again, roles and TOTP as they were. They
+    // are told, as administrators of the restored database.
+    let admin_notices = sqlx::query(
+        "INSERT INTO security_notices (user_id, kind, backup_taken_at) \
+         SELECT id, $1, to_timestamp($2::double precision / 1000) FROM users WHERE is_admin",
+    )
+    .bind(NoticeKind::InstanceRestoredAdmin as i16)
+    .bind(backup_taken_at_ms)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    // An invitation revoked or used up after the backup is valid again:
+    // none is, until an administrator creates new ones.
+    let invitations = sqlx::query(
+        "UPDATE instance_invites SET revoked_at = now() \
+         WHERE revoked_at IS NULL AND uses < max_uses \
+           AND (expires_at IS NULL OR expires_at > now())",
+    )
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -341,10 +439,15 @@ pub async fn handle(db: &PgPool, marker: Option<Marker>) -> Result<Start, sqlx::
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    let conversations = sqlx::query("UPDATE conversations SET needs_recreation = true")
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    // The sequence numbers given after the backup are lost with it: each
+    // conversation's numbering goes on above any of them, so that a device
+    // never takes a new message for one it read before the restore.
+    let conversations =
+        sqlx::query("UPDATE conversations SET needs_recreation = true, last_seq = last_seq + $1")
+            .bind(SEQUENCE_JUMP)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
     // Last: the generation counts as handled once all of it is done.
     sqlx::query("UPDATE instance_state SET handled_generation = generation")
         .execute(&mut *tx)
@@ -357,6 +460,8 @@ pub async fn handle(db: &PgPool, marker: Option<Marker>) -> Result<Start, sqlx::
         backup_taken_at_ms,
         sessions,
         notices,
+        admin_notices,
+        invitations,
         key_packages,
         conversations,
     };
@@ -365,6 +470,8 @@ pub async fn handle(db: &PgPool, marker: Option<Marker>) -> Result<Start, sqlx::
         by_marker = handled.by_marker,
         sessions = handled.sessions,
         notices = handled.notices,
+        admin_notices = handled.admin_notices,
+        invitations = handled.invitations,
         key_packages = handled.key_packages,
         conversations = handled.conversations,
         "the database was restored from a backup: every session is revoked, and every \

@@ -149,7 +149,7 @@ struct SecurityNoticeView {
     notice_id: Uuid,
     kind: &'static str,
     created_at_ms: u64,
-    /// `instance_restored` only, when the instance knows the backup's date.
+    /// The notices of a restore, when the instance knows the backup's date.
     #[serde(skip_serializing_if = "Option::is_none")]
     backup_taken_at_ms: Option<u64>,
 }
@@ -165,6 +165,7 @@ impl From<SecurityNotice> for SecurityNoticeView {
                 SecurityNoticeKind::DeviceRevoked => "device_revoked",
                 SecurityNoticeKind::RecoveryKeyReplaced => "recovery_key_replaced",
                 SecurityNoticeKind::InstanceRestored => "instance_restored",
+                SecurityNoticeKind::InstanceRestoredAdmin => "instance_restored_admin",
                 SecurityNoticeKind::Other => "other",
             },
             created_at_ms: notice.created_at_ms,
