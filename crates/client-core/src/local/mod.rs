@@ -31,6 +31,7 @@
 //! reveals neither the instance nor the account.
 
 mod migrations;
+pub mod mls;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -167,6 +168,27 @@ impl LocalStore {
         })
     }
 
+    /// A store without encryption, for the tests that read what the file
+    /// holds: SQLCipher without a key is plain SQLite, configured as the
+    /// encrypted store is (`secure_delete`, write-ahead log), so what they
+    /// find in the file is what the encrypted pages hold.
+    #[cfg(test)]
+    pub(crate) fn open_unencrypted(
+        path: &Path,
+        binding: Binding,
+        now_ms: u64,
+    ) -> Result<Self, LocalStoreError> {
+        let mut connection = Connection::open(path).map_err(|error| database(&error))?;
+        configure(&connection).map_err(|error| database(&error))?;
+        migrations::bring_up_to_date(&mut connection, binding, now_ms)?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                path: path.to_owned(),
+                connection: Mutex::new(Some(connection)),
+            }),
+        })
+    }
+
     /// The database file.
     pub fn path(&self) -> &Path {
         &self.inner.path
@@ -202,6 +224,102 @@ impl LocalStore {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Runs `work` in one transaction, on a thread where blocking is
+    /// allowed: committed if it returns `Ok`, rolled back otherwise. What
+    /// OpenMLS writes through [`mls::SqlStorage`] over the transaction, and
+    /// what the caller writes next to it, commit or fail together.
+    pub(crate) async fn transaction<T, E, F>(&self, work: F) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<LocalStoreError> + Send + 'static,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, E> + Send + 'static,
+    {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = store.lock();
+            let connection = guard.as_mut().ok_or(LocalStoreError::Closed)?;
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| database(&error))?;
+            let done = work(&transaction)?;
+            transaction.commit().map_err(|error| database(&error))?;
+            Ok(done)
+        })
+        .await
+        .map_err(|_| E::from(LocalStoreError::Closed))?
+    }
+
+    /// Empties the write-ahead log into the database file and truncates it.
+    /// With `secure_delete`, what was deleted is then overwritten in the
+    /// file, and no longer held by earlier frames of the log: the secrets
+    /// OpenMLS deleted, the text of deleted messages. Called after each
+    /// batch that deletes them. A reader of another window may keep the log
+    /// from being truncated; the next call does it.
+    pub async fn erase_journal(&self) -> Result<(), LocalStoreError> {
+        self.run(|connection| {
+            connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .map_err(|error| database(&error))
+        })
+        .await
+    }
+
+    /// Deletes the text of a message, which `secure_delete` overwrites in
+    /// the file (gone from the log at the next [`LocalStore::erase_journal`]).
+    /// Returns whether there was one.
+    pub async fn delete_message(
+        &self,
+        conversation: Uuid,
+        seq: u64,
+    ) -> Result<bool, LocalStoreError> {
+        self.run(move |connection| {
+            let deleted = connection
+                .execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1 AND seq = ?2",
+                    (
+                        conversation.as_bytes().as_slice(),
+                        i64::try_from(seq).unwrap_or(i64::MAX),
+                    ),
+                )
+                .map_err(|error| database(&error))?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
+
+    /// This device's certificate, if the store has it yet.
+    pub(crate) async fn certificate(&self) -> Result<Option<Vec<u8>>, LocalStoreError> {
+        self.run(|connection| {
+            connection
+                .query_row(
+                    "SELECT certificate FROM device_certificate WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| database(&error))
+        })
+        .await
+    }
+
+    /// Records this device's certificate.
+    pub(crate) async fn set_certificate(
+        &self,
+        certificate: Vec<u8>,
+    ) -> Result<(), LocalStoreError> {
+        self.run(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO device_certificate (id, certificate) VALUES (1, ?1) \
+                     ON CONFLICT (id) DO UPDATE SET certificate = excluded.certificate",
+                    [certificate],
+                )
+                .map(|_| ())
+                .map_err(|error| database(&error))
+        })
+        .await
+    }
+
     /// Runs `work` on the connection, on a thread where blocking is allowed.
     pub(crate) async fn run<T, F>(&self, work: F) -> Result<T, LocalStoreError>
     where
@@ -217,6 +335,45 @@ impl LocalStore {
         .await
         .map_err(|_| LocalStoreError::Closed)?
     }
+}
+
+/// A message's text, written in the transaction that processed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "written by the sync engine of task 10b of M2")
+)]
+pub(crate) struct StoredText<'a> {
+    pub(crate) conversation: Uuid,
+    pub(crate) seq: u64,
+    pub(crate) sender_device: Option<Uuid>,
+    pub(crate) sent_at_ms: u64,
+    pub(crate) body: &'a [u8],
+}
+
+/// Writes a message's text, in the caller's transaction.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the sync engine of task 10b of M2")
+)]
+pub(crate) fn store_text(
+    transaction: &rusqlite::Transaction<'_>,
+    text: &StoredText<'_>,
+) -> Result<(), LocalStoreError> {
+    transaction
+        .execute(
+            "INSERT INTO messages (conversation_id, seq, sender_device_id, sent_at_ms, body) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                text.conversation.as_bytes().as_slice(),
+                i64::try_from(text.seq).unwrap_or(i64::MAX),
+                text.sender_device.map(|device| device.as_bytes().to_vec()),
+                i64::try_from(text.sent_at_ms).unwrap_or(i64::MAX),
+                text.body,
+            ),
+        )
+        .map(|_| ())
+        .map_err(|error| database(&error))
 }
 
 /// Opens a connection to an encrypted database with the frozen parameters
@@ -434,5 +591,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+#[cfg(test)]
+mod mls_tests;
 #[cfg(test)]
 mod tests;

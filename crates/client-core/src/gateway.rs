@@ -11,6 +11,9 @@
 //! Frames from the instance are untrusted input: anything that does not
 //! decode ends the connection, which is then re-established.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -25,7 +28,7 @@ use tavern_protocol::{
     GATEWAY_MINOR_VERSION, GATEWAY_SUBPROTOCOL, MAX_SECURITY_NOTICE_ACKS, close_code,
 };
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -40,6 +43,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const EVENT_QUEUE: usize = 64;
+/// How long a request waits for its answer.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -183,6 +188,22 @@ pub enum GatewayEvent {
         /// the instance was restored from a backup, and the groups of the
         /// conversations are to be recreated (0 before gateway minor 7).
         instance_generation: u64,
+        /// The one-time KeyPackages of this device the instance can still
+        /// serve.
+        key_packages_remaining: u32,
+    },
+    /// A message, commit or proposal of a conversation's sequence: a
+    /// notification, not a reliable source (`protocol.md`, section 3). The
+    /// sequence is read in the order of its numbers, gaps filled with
+    /// [`Gateway::fetch_messages`].
+    Sequenced(proto::StoredMessage),
+    /// A Welcome for this device, sent again at each connection until
+    /// [`Gateway::ack_welcome`].
+    Welcome(proto::WelcomeEvent),
+    /// A claim left this device fewer than 10 one-time KeyPackages.
+    KeyPackagesLow {
+        /// How many the instance can still serve.
+        remaining: u32,
     },
     /// A device was just enrolled on the account. The user must be notified
     /// and offered to revoke it.
@@ -228,16 +249,46 @@ pub enum GatewayEvent {
     SessionEnded(SessionEnd),
 }
 
+/// A request of the gateway that got no usable answer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RequestError {
+    /// The instance refused it.
+    #[error("the instance refused the request ({code:?})")]
+    Refused {
+        /// Why.
+        code: proto::ErrorCode,
+        /// With `RATE_LIMITED`, how long to wait; 0 otherwise.
+        retry_after_ms: u32,
+        /// With `STALE_EPOCH`, the group's current epoch when known.
+        current_epoch: u64,
+    },
+    /// No answer came in time, the connection being up.
+    #[error("the instance did not answer in time")]
+    TimedOut,
+    /// Not connected, or the connection dropped before the answer. Nothing
+    /// says whether the instance handled it: a request is safe to send
+    /// again (messages are idempotent by `client_message_id`).
+    #[error("the gateway is not connected")]
+    Disconnected,
+    /// An answer of another kind than the request's.
+    #[error("the instance gave an unexpected answer")]
+    Unexpected,
+}
+
+type Reply = oneshot::Sender<Result<ServerPayload, RequestError>>;
+
 #[derive(Debug)]
 enum Command {
     AckDeviceList,
     AckSecurityNotices(Vec<Uuid>),
+    Request(ClientPayload, Reply),
 }
 
 /// Handle to the background connection. Dropping it closes the connection.
 #[derive(Debug)]
 pub struct Gateway {
     commands: mpsc::Sender<Command>,
+    connected: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -256,10 +307,109 @@ impl Gateway {
         // One TLS provider for the whole client; a no-op if already installed.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let (commands, command_queue) = mpsc::channel(8);
+        let (commands, command_queue) = mpsc::channel(64);
         let (events, event_queue) = mpsc::channel(EVENT_QUEUE);
-        let task = tokio::spawn(run(url, session_token, command_queue, events));
-        Ok((Self { commands, task }, event_queue))
+        let connected = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run(
+            url,
+            session_token,
+            command_queue,
+            events,
+            Arc::clone(&connected),
+        ));
+        Ok((
+            Self {
+                commands,
+                connected,
+                task,
+            },
+            event_queue,
+        ))
+    }
+
+    /// Whether the connection is up and authenticated.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Sends a request and waits for its answer, at most
+    /// [`REQUEST_TIMEOUT`]. Refused at once while not connected.
+    pub async fn request(&self, payload: ClientPayload) -> Result<ServerPayload, RequestError> {
+        if !self.is_connected() {
+            return Err(RequestError::Disconnected);
+        }
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Request(payload, reply))
+            .await
+            .map_err(|_| RequestError::Disconnected)?;
+        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(RequestError::Disconnected),
+            Err(_) => Err(RequestError::TimedOut),
+        }
+    }
+
+    /// `SendMessage`: an application message for the group's current epoch.
+    pub async fn send_message(
+        &self,
+        request: proto::SendMessage,
+    ) -> Result<proto::SendMessageAck, RequestError> {
+        match self.request(ClientPayload::SendMessage(request)).await? {
+            ServerPayload::SendMessageAck(ack) => Ok(ack),
+            _ => Err(RequestError::Unexpected),
+        }
+    }
+
+    /// `SubmitCommit`: a commit for the group's current epoch, or a group's
+    /// first commit.
+    pub async fn submit_commit(
+        &self,
+        request: proto::SubmitCommit,
+    ) -> Result<proto::CommitAck, RequestError> {
+        match self.request(ClientPayload::SubmitCommit(request)).await? {
+            ServerPayload::CommitAck(ack) => Ok(ack),
+            _ => Err(RequestError::Unexpected),
+        }
+    }
+
+    /// `FetchMessages`: the sequence of a conversation after `after_seq`.
+    pub async fn fetch_messages(
+        &self,
+        request: proto::FetchMessages,
+    ) -> Result<proto::MessageBatch, RequestError> {
+        match self.request(ClientPayload::FetchMessages(request)).await? {
+            ServerPayload::MessageBatch(batch) => Ok(batch),
+            _ => Err(RequestError::Unexpected),
+        }
+    }
+
+    /// `AckMessages`: everything up to a number is durably processed.
+    pub async fn ack_messages(&self, request: proto::AckMessages) -> Result<(), RequestError> {
+        match self.request(ClientPayload::AckMessages(request)).await? {
+            ServerPayload::Ack(_) => Ok(()),
+            _ => Err(RequestError::Unexpected),
+        }
+    }
+
+    /// `AckWelcome`: a Welcome is processed, or ignored for good.
+    pub async fn ack_welcome(&self, request: proto::AckWelcome) -> Result<(), RequestError> {
+        match self.request(ClientPayload::AckWelcome(request)).await? {
+            ServerPayload::Ack(_) => Ok(()),
+            _ => Err(RequestError::Unexpected),
+        }
+    }
+
+    /// `FetchGroupInfo`: the group's latest GroupInfo, to join it by
+    /// external commit.
+    pub async fn fetch_group_info(
+        &self,
+        request: proto::FetchGroupInfo,
+    ) -> Result<proto::GroupInfo, RequestError> {
+        match self.request(ClientPayload::FetchGroupInfo(request)).await? {
+            ServerPayload::GroupInfo(info) => Ok(info),
+            _ => Err(RequestError::Unexpected),
+        }
     }
 
     /// Tells the instance that the user has seen the current device list, so
@@ -300,11 +450,27 @@ async fn run(
     session_token: B64,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<GatewayEvent>,
+    up: Arc<AtomicBool>,
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
         let mut connected = false;
-        let ended = connection(&url, &session_token, &mut commands, &events, &mut connected).await;
+        let ended = connection(
+            &url,
+            &session_token,
+            &mut commands,
+            &events,
+            &mut connected,
+            &up,
+        )
+        .await;
+        up.store(false, Ordering::Release);
+        // Requests sent while it was down get no answer: they fail now.
+        while let Ok(command) = commands.try_recv() {
+            if let Command::Request(_, reply) = command {
+                let _ = reply.send(Err(RequestError::Disconnected));
+            }
+        }
         match ended {
             Ended::Stopped => return,
             Ended::Session(reason) => {
@@ -393,6 +559,7 @@ async fn connection(
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<GatewayEvent>,
     connected: &mut bool,
+    up: &AtomicBool,
 ) -> Ended {
     let Some(mut socket) = open(url).await else {
         return Ended::Dropped;
@@ -424,6 +591,7 @@ async fn connection(
     };
 
     *connected = true;
+    up.store(true, Ordering::Release);
     let new_devices = ready
         .new_devices
         .iter()
@@ -444,6 +612,7 @@ async fn connection(
             new_devices,
             security_notices,
             instance_generation: ready.instance_generation,
+            key_packages_remaining: ready.key_packages_remaining,
         })
         .await
         .is_err()
@@ -461,6 +630,9 @@ async fn connection(
     heartbeat.tick().await;
     let patience = Duration::from_millis(GATEWAY_HEARTBEAT_TIMEOUT_MS);
     let mut request_id: u64 = 1;
+    // Requests waiting for their answer. Dropped with the connection: their
+    // callers get `Disconnected`.
+    let mut pending: HashMap<u64, Reply> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -473,6 +645,15 @@ async fn connection(
             }
             command = commands.recv() => {
                 let payload = match command {
+                    Some(Command::Request(payload, reply)) => {
+                        request_id += 1;
+                        if socket.send(encode(request_id, payload)).await.is_err() {
+                            let _ = reply.send(Err(RequestError::Disconnected));
+                            return Ended::Dropped;
+                        }
+                        pending.insert(request_id, reply);
+                        continue;
+                    }
                     Some(Command::AckDeviceList) => {
                         ClientPayload::AckDeviceList(proto::AckDeviceList {})
                     }
@@ -496,7 +677,22 @@ async fn connection(
                     Ok(frame) => frame,
                     Err(ended) => return ended,
                 };
+                if frame.request_id != 0
+                    && let Some(reply) = pending.remove(&frame.request_id)
+                {
+                    let _ = reply.send(answer(frame.payload));
+                    continue;
+                }
                 let event = match frame.payload {
+                    Some(
+                        ServerPayload::MessageEvent(proto::MessageEvent { message })
+                        | ServerPayload::CommitEvent(proto::CommitEvent { message })
+                        | ServerPayload::ProposalEvent(proto::ProposalEvent { message }),
+                    ) => message.map(GatewayEvent::Sequenced),
+                    Some(ServerPayload::WelcomeEvent(welcome)) => Some(GatewayEvent::Welcome(welcome)),
+                    Some(ServerPayload::KeyPackagesLow(low)) => Some(GatewayEvent::KeyPackagesLow {
+                        remaining: low.remaining,
+                    }),
                     Some(ServerPayload::DeviceListChanged(change)) => {
                         uuid(&change.device_id).map(|device_id| {
                             if change.added {
@@ -551,6 +747,19 @@ async fn connection(
     }
 }
 
+/// The answer to a request: its payload, or the instance's refusal.
+fn answer(payload: Option<ServerPayload>) -> Result<ServerPayload, RequestError> {
+    match payload {
+        Some(ServerPayload::Error(error)) => Err(RequestError::Refused {
+            code: proto::ErrorCode::try_from(error.code).unwrap_or(proto::ErrorCode::Unspecified),
+            retry_after_ms: error.retry_after_ms,
+            current_epoch: error.current_epoch,
+        }),
+        Some(payload) => Ok(payload),
+        None => Err(RequestError::Unexpected),
+    }
+}
+
 fn session_end(reason: i32) -> SessionEnd {
     match proto::RevocationReason::try_from(reason) {
         Ok(proto::RevocationReason::Revoked) => SessionEnd::Revoked,
@@ -584,6 +793,46 @@ mod tests {
         ] {
             assert_eq!(session_end_for_close(code), None, "{code:?}");
         }
+    }
+
+    /// A request while the gateway is not connected fails at once, with
+    /// nothing sent: the caller may send it again later.
+    #[tokio::test]
+    async fn a_request_without_a_connection_fails_at_once() {
+        // Nothing listens there: the gateway never connects.
+        let url = Url::parse("ws://127.0.0.1:9/gateway/v1").unwrap();
+        let (gateway, _events) = Gateway::start(url, B64(vec![0; 32])).unwrap();
+        assert!(!gateway.is_connected());
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            gateway.request(ClientPayload::Heartbeat(proto::Heartbeat {})),
+        )
+        .await
+        .expect("answered at once");
+        assert_eq!(answer, Err(RequestError::Disconnected));
+    }
+
+    /// An answer is the request's payload, or the instance's refusal with
+    /// its code, its wait and the group's epoch.
+    #[test]
+    fn an_answer_is_a_payload_or_a_typed_refusal() {
+        let ack = ServerPayload::Ack(proto::Ack {});
+        assert_eq!(answer(Some(ack.clone())), Ok(ack));
+        let refusal = ServerPayload::Error(proto::Error {
+            code: proto::ErrorCode::StaleEpoch.into(),
+            message: "for a past epoch".to_owned(),
+            retry_after_ms: 0,
+            current_epoch: 4,
+        });
+        assert_eq!(
+            answer(Some(refusal)),
+            Err(RequestError::Refused {
+                code: proto::ErrorCode::StaleEpoch,
+                retry_after_ms: 0,
+                current_epoch: 4,
+            })
+        );
+        assert_eq!(answer(None), Err(RequestError::Unexpected));
     }
 
     #[test]

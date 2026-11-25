@@ -44,6 +44,7 @@ use crate::api::{Api, Auth};
 use crate::error::ClientError;
 use crate::gateway::Gateway;
 use crate::instance::InstanceUrl;
+use crate::key_packages;
 use crate::local::{AccountDirectory, Binding, LocalStore};
 use crate::password;
 use crate::store::{KnownAccounts, Records, SecretStore, StoredDevice};
@@ -504,6 +505,7 @@ impl InstanceClient {
                 session_token: session.session_token,
                 store_key,
                 local,
+                key_packages: Arc::default(),
             },
             new_device,
             store_reset: key_reset || store_reset,
@@ -709,6 +711,7 @@ impl InstanceClient {
                 session_token,
                 store_key,
                 local,
+                key_packages: Arc::default(),
             },
             new_device: false,
             store_reset,
@@ -743,6 +746,8 @@ pub struct Client {
     store_key: Arc<Secret<32>>,
     /// The local store, open while signed in.
     local: LocalStore,
+    /// Held while the KeyPackages are kept up.
+    key_packages: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -757,6 +762,86 @@ impl std::fmt::Debug for Client {
 impl Client {
     fn auth(&self) -> Auth<'_> {
         Auth::Session(&self.session_token)
+    }
+
+    /// This device's key, from the system keychain.
+    fn device_key(&self) -> Result<DeviceKey, ClientError> {
+        let device = self
+            .instance
+            .records
+            .device(self.user_id)?
+            .ok_or(ClientError::SessionEnded)?;
+        let seed = Secret::<32>::from_slice(device.device_seed.as_slice())
+            .ok_or_else(|| ClientError::Store("the device key is unreadable".to_owned()))?;
+        Ok(DeviceKey::from_seed(&seed))
+    }
+
+    /// This device's certificate, as it enrolled: kept in the local store,
+    /// read once from the instance's list of devices. The instance checks
+    /// it again at every upload of KeyPackages, which carry it.
+    async fn certificate(&self) -> Result<Vec<u8>, ClientError> {
+        if let Some(certificate) = self.local.certificate().await? {
+            return Ok(certificate);
+        }
+        let certificate = self
+            .devices()
+            .await?
+            .devices
+            .into_iter()
+            .find(|device| device.device_id == self.device_id)
+            .ok_or(ClientError::ServerError)?
+            .certificate
+            .0;
+        self.local.set_certificate(certificate.clone()).await?;
+        Ok(certificate)
+    }
+
+    /// Keeps this device's KeyPackages up (ADR 0019, section 3): uploads
+    /// the one-time packages missing on the instance, and a new last-resort
+    /// package when due, or when a Welcome used it (`replace_last_resort`).
+    /// Forgets what is no longer needed. Packages the instance refuses are
+    /// forgotten; an upload whose answer did not come is sent again next
+    /// time. Runs at each connection of the gateway and on
+    /// `KeyPackagesLow`, one run at a time.
+    pub async fn maintain_key_packages(
+        &self,
+        replace_last_resort: bool,
+    ) -> Result<(), ClientError> {
+        let _one_at_a_time = self.key_packages.lock().await;
+        let certificate = self.certificate().await?;
+        let remaining = self.key_package_count().await?;
+        let upload = key_packages::prepare(
+            &self.local,
+            self.device_key()?,
+            certificate,
+            remaining,
+            replace_last_resort,
+            now_ms(),
+        )
+        .await?;
+        if !upload.is_empty() {
+            let sent = self
+                .upload_key_packages(
+                    upload
+                        .one_time
+                        .iter()
+                        .map(|(_, bytes)| bytes.clone())
+                        .collect(),
+                    upload.last_resort.as_ref().map(|(_, bytes)| bytes.clone()),
+                )
+                .await;
+            match sent {
+                Ok(_) => key_packages::uploaded(&self.local, &upload, now_ms()).await?,
+                Err(error @ ClientError::Api { .. }) => {
+                    key_packages::refused(&self.local, &upload).await?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // What was forgotten leaves the journal too.
+        self.local.erase_journal().await?;
+        Ok(())
     }
 
     fn api(&self) -> &Api {
@@ -1006,7 +1091,9 @@ impl Client {
         Ok(())
     }
 
-    /// Opens the real-time connection of this device.
+    /// Opens the real-time connection of this device. At each connection,
+    /// and on `KeyPackagesLow`, the device keeps its KeyPackages up by
+    /// itself ([`Client::maintain_key_packages`]); every event is passed on.
     pub fn connect_gateway(
         &self,
     ) -> Result<
@@ -1016,10 +1103,45 @@ impl Client {
         ),
         ClientError,
     > {
-        Gateway::start(
+        use crate::gateway::GatewayEvent;
+        let (gateway, mut raw) = Gateway::start(
             self.api().instance().gateway_url()?,
             self.session_token.clone(),
-        )
+        )?;
+        let (events, received) = tokio::sync::mpsc::channel(64);
+        let client = self.duplicate();
+        tokio::spawn(async move {
+            while let Some(event) = raw.recv().await {
+                if matches!(
+                    event,
+                    GatewayEvent::Connected { .. } | GatewayEvent::KeyPackagesLow { .. }
+                ) {
+                    let client = client.duplicate();
+                    tokio::spawn(async move {
+                        if let Err(error) = client.maintain_key_packages(false).await {
+                            tracing::warn!(%error, "cannot keep the KeyPackages up");
+                        }
+                    });
+                }
+                if events.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok((gateway, received))
+    }
+
+    /// Another handle on this signed-in client, for its background tasks.
+    fn duplicate(&self) -> Self {
+        Self {
+            instance: self.instance.clone(),
+            user_id: self.user_id,
+            device_id: self.device_id,
+            session_token: self.session_token.clone(),
+            store_key: Arc::clone(&self.store_key),
+            local: self.local.clone(),
+            key_packages: Arc::clone(&self.key_packages),
+        }
     }
 
     // --- Credential changes ---

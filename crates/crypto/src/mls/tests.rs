@@ -4133,3 +4133,45 @@ fn group_ids_carry_the_conversation_and_the_generation() {
         ));
     }
 }
+
+/// A device forgets a KeyPackage it built: its private parts leave the
+/// storage, and a Welcome for it can no longer be processed.
+#[test]
+fn a_forgotten_key_package_cannot_be_joined_with() {
+    let mut dm = Dm::new();
+    let bob3 = dm.bob.device(0xb3);
+    let package = bob3.key_package();
+    let reference = key_package::reference(&bob3.provider, &package).unwrap();
+    assert_eq!(
+        reference,
+        package
+            .hash_ref(bob3.provider.crypto())
+            .unwrap()
+            .as_slice()
+            .to_vec()
+    );
+    assert!(key_package::is_held(&bob3.provider, &reference).unwrap());
+    let claimed = claim(&bob3, &package, &dm.pins);
+    let pins = dm.pins.clone();
+    let commit = {
+        let device = &dm.devices[0];
+        dm.groups[0]
+            .add(&device.provider, &device.signer(), &[claimed], &pins)
+            .unwrap()
+    };
+    key_package::forget(&bob3.provider, &reference).unwrap();
+    assert!(!key_package::is_held(&bob3.provider, &reference).unwrap());
+    let joined = Group::join(
+        &bob3.provider,
+        &commit.welcome.unwrap(),
+        &expected(),
+        &pins,
+        &dm.server.public_bytes(),
+    );
+    assert!(
+        matches!(joined, Err(MlsError::UnexpectedGroup)),
+        "{joined:?}"
+    );
+    // Forgetting what is not there changes nothing.
+    key_package::forget(&bob3.provider, &reference).unwrap();
+}

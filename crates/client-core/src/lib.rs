@@ -15,6 +15,7 @@ mod api;
 pub mod error;
 pub mod gateway;
 pub mod instance;
+mod key_packages;
 pub mod local;
 pub mod password;
 pub mod qr;
@@ -25,7 +26,8 @@ pub use account::{
 };
 pub use error::ClientError;
 pub use gateway::{
-    Gateway, GatewayEvent, NewDevice, Relation, SecurityNotice, SecurityNoticeKind, SessionEnd,
+    Gateway, GatewayEvent, NewDevice, Relation, RequestError, SecurityNotice, SecurityNoticeKind,
+    SessionEnd,
 };
 pub use instance::{
     Compatibility, InstanceUrl, InstanceUrlError, compatibility, fetch_health, fetch_version,

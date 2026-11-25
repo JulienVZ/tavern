@@ -27,7 +27,47 @@ const V1_STORE_INFO: &str = "
     ) STRICT;
 ";
 
-pub(super) const MIGRATIONS: &[&str] = &[V1_STORE_INFO];
+const V2_MLS: &str = "
+    -- The MLS state of this device, as OpenMLS stores it (ADR 0019,
+    -- section 13; local::mls). What OpenMLS deletes is deleted.
+    CREATE TABLE mls_state (
+        label TEXT NOT NULL,
+        key   BLOB NOT NULL,
+        value BLOB NOT NULL,
+        PRIMARY KEY (label, key)
+    ) STRICT, WITHOUT ROWID;
+
+    -- The KeyPackages this device built (ADR 0019, section 3): their
+    -- private parts are in mls_state until used or forgotten, the public
+    -- package here until the instance confirmed the upload (sent again
+    -- otherwise). A replaced last-resort package is kept for a grace period;
+    -- a one-time package, until its lifetime ends.
+    CREATE TABLE key_packages (
+        reference      BLOB    PRIMARY KEY,
+        last_resort    INTEGER NOT NULL CHECK (last_resort IN (0, 1)),
+        package        BLOB,
+        created_at_ms  INTEGER NOT NULL,
+        replaced_at_ms INTEGER
+    ) STRICT;
+
+    -- This device's certificate, as it enrolled: its KeyPackages carry it.
+    CREATE TABLE device_certificate (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        certificate BLOB    NOT NULL
+    ) STRICT;
+
+    -- The plaintext of conversations, by the number of their sequence.
+    CREATE TABLE messages (
+        conversation_id  BLOB    NOT NULL CHECK (length(conversation_id) = 16),
+        seq              INTEGER NOT NULL CHECK (seq > 0),
+        sender_device_id BLOB    CHECK (length(sender_device_id) = 16),
+        sent_at_ms       INTEGER NOT NULL,
+        body             BLOB    NOT NULL,
+        PRIMARY KEY (conversation_id, seq)
+    ) STRICT;
+";
+
+pub(super) const MIGRATIONS: &[&str] = &[V1_STORE_INFO, V2_MLS];
 
 /// The schema version this client writes.
 pub const LATEST_VERSION: u32 = MIGRATIONS.len() as u32;

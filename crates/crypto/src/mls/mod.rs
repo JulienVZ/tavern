@@ -37,6 +37,8 @@ use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
 pub use credential::{LeafError, Roster, VerifiedLeaf};
 pub use group::{Commit, ExpectedGroup, Group, Incoming, Joined, MembershipChanges, Plaintext};
 pub use key_package::ClaimedKeyPackage;
+/// A leaf's credential and signature key ([`credential::for_device`]).
+pub use openmls::prelude::CredentialWithKey;
 pub use policy::{Alarm, PolicyError};
 pub use public::{
     ApplicationHeader, CommitHeader, MergedCommit, PROPOSAL_QUEUE_KIND, PublicEntries, PublicState,

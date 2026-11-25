@@ -6608,6 +6608,7 @@ dependencies = [
  "data-encoding",
  "futures-util",
  "keyring",
+ "openmls_traits",
  "prost",
  "qrcode",
  "reqwest",

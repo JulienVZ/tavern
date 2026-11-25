@@ -502,6 +502,18 @@ impl Group {
         }
     }
 
+    /// The group of `identity` as this device's storage holds it, if it
+    /// has one. Nothing is checked again: everything in the storage was
+    /// checked before it was written.
+    pub fn load<P: OpenMlsProvider>(
+        provider: &P,
+        identity: GroupIdentity,
+    ) -> Result<Option<Self>, MlsError> {
+        Ok(MlsGroup::load(provider.storage(), &identity.to_group_id())
+            .map_err(library)?
+            .map(|inner| Self { inner }))
+    }
+
     /// Deletes the group's state: after leaving it, after the server refused
     /// an external commit, or when the conversation's group is recreated.
     pub fn delete<P: OpenMlsProvider>(mut self, provider: &P) -> Result<(), MlsError> {

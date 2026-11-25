@@ -44,6 +44,22 @@ async fn login(computer: &InstanceClient, handle: &str) -> (Client, bool) {
     }
 }
 
+/// A connection with no new device and no notice to tell the user.
+async fn assert_connected_with_nothing_to_tell(server: &Server, event: GatewayEvent) {
+    let GatewayEvent::Connected {
+        new_devices,
+        security_notices,
+        instance_generation,
+        ..
+    } = event
+    else {
+        panic!("expected the connection, got {event:?}");
+    };
+    assert!(new_devices.is_empty());
+    assert!(security_notices.is_empty());
+    assert_eq!(instance_generation, generation(server).await);
+}
+
 /// The instance generation the server announces in `Ready`.
 async fn generation(server: &Server) -> u64 {
     tavern_server::restore::generation(&server.state.db)
@@ -84,14 +100,7 @@ async fn a_user_registers_with_an_invitation_and_logs_in_from_two_devices() {
     let (laptop_client, new_device) = login(&laptop, &handle).await;
     assert!(new_device, "the first login on a computer enrols it");
     let (laptop_gateway, mut laptop_events) = laptop_client.connect_gateway().unwrap();
-    assert_eq!(
-        next_event(&mut laptop_events).await,
-        GatewayEvent::Connected {
-            new_devices: Vec::new(),
-            security_notices: Vec::new(),
-            instance_generation: generation(&server).await,
-        }
-    );
+    assert_connected_with_nothing_to_tell(&server, next_event(&mut laptop_events).await).await;
 
     // Second login, from another computer: a second device.
     let (desktop_client, new_device) = login(&desktop, &handle).await;
@@ -178,14 +187,7 @@ async fn a_device_that_was_away_learns_about_new_devices_when_it_reconnects() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     drop(gateway);
     let (_gateway, mut events) = laptop_client.connect_gateway().unwrap();
-    assert_eq!(
-        next_event(&mut events).await,
-        GatewayEvent::Connected {
-            new_devices: Vec::new(),
-            security_notices: Vec::new(),
-            instance_generation: generation(&server).await,
-        }
-    );
+    assert_connected_with_nothing_to_tell(&server, next_event(&mut events).await).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

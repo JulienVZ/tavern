@@ -9,9 +9,12 @@
 //! [`ClaimedKeyPackage`] can be added to a group.
 
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _};
-use openmls::prelude::{CredentialWithKey, KeyPackage, KeyPackageIn, Lifetime, ProtocolVersion};
+use openmls::prelude::{
+    CredentialWithKey, KeyPackage, KeyPackageIn, KeyPackageRef, Lifetime, ProtocolVersion,
+};
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
+use openmls_traits::storage::StorageProvider as _;
 
 use super::credential::{LeafError, Roster, VerifiedLeaf, verify_leaf};
 use super::{CIPHERSUITE, DeviceSigner, MlsError, capabilities, library};
@@ -56,6 +59,50 @@ pub fn build<P: OpenMlsProvider>(
 /// The bytes to upload.
 pub fn to_bytes(key_package: &KeyPackage) -> Result<Vec<u8>, MlsError> {
     key_package.tls_serialize_detached().map_err(library)
+}
+
+/// The reference of a KeyPackage (`KeyPackageRef`): how a Welcome names it,
+/// and how its private parts are found in the storage.
+pub fn reference<P: OpenMlsProvider>(
+    provider: &P,
+    key_package: &KeyPackage,
+) -> Result<Vec<u8>, MlsError> {
+    Ok(key_package
+        .hash_ref(provider.crypto())
+        .map_err(library)?
+        .as_slice()
+        .to_vec())
+}
+
+/// A `KeyPackageRef` from its bytes ([`reference`]): the hash, as the
+/// TLS encoding of a variable-length vector.
+fn key_package_ref(bytes: &[u8]) -> Result<KeyPackageRef, MlsError> {
+    let encoded = openmls::prelude::tls_codec::VLBytes::from(bytes)
+        .tls_serialize_detached()
+        .map_err(|_| MlsError::Malformed)?;
+    KeyPackageRef::tls_deserialize_exact_bytes(&encoded).map_err(|_| MlsError::Malformed)
+}
+
+/// Deletes this device's private parts of a KeyPackage it built (its init
+/// key and its leaf's encryption key): a Welcome for it can no longer be
+/// processed. A replaced last-resort package, after its grace period
+/// (section 3), or every package after a restore (section 15).
+pub fn forget<P: OpenMlsProvider>(provider: &P, reference: &[u8]) -> Result<(), MlsError> {
+    let reference = key_package_ref(reference)?;
+    provider
+        .storage()
+        .delete_key_package(&reference)
+        .map_err(library)
+}
+
+/// Whether this device still holds the private parts of a KeyPackage.
+pub fn is_held<P: OpenMlsProvider>(provider: &P, reference: &[u8]) -> Result<bool, MlsError> {
+    let reference = key_package_ref(reference)?;
+    let bundle: Option<openmls::prelude::KeyPackageBundle> = provider
+        .storage()
+        .key_package(&reference)
+        .map_err(library)?;
+    Ok(bundle.is_some())
 }
 
 /// Why a KeyPackage was refused.

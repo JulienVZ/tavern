@@ -121,3 +121,110 @@ async fn a_client_counts_claims_and_checks_what_it_is_served() {
         Err(ClientError::UntrustedKeyMaterial)
     ));
 }
+
+/// One-time KeyPackages of a device the instance can serve, and whether it
+/// has a last-resort one.
+async fn on_the_instance(server: &Server, client: &Client) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE NOT last_resort AND served_at IS NULL), \
+                count(*) FILTER (WHERE last_resort) \
+         FROM key_packages WHERE device_id = $1 AND octet_length(key_package) > 0",
+    )
+    .bind(client.device_id())
+    .fetch_one(&server.state.db)
+    .await
+    .unwrap()
+}
+
+/// Waits until the instance holds `one_time` one-time packages of `client`
+/// and its last resort: the device keeps them up on its own.
+async fn kept_up(server: &Server, client: &Client, one_time: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while on_the_instance(server, client).await != (one_time, 1) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the device never kept its KeyPackages up");
+}
+
+/// ADR 0019, section 3: a device connected to the gateway uploads its 20
+/// one-time KeyPackages and a last-resort one by itself, and tops them up
+/// when the instance says fewer than 10 are left (`KeyPackagesLow`). Every
+/// package it is served checks out for the device that claims it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL"]
+async fn a_connected_device_keeps_its_key_packages_up() {
+    let server = Server::spawn().await;
+    let computer = server.new_computer();
+    let handle = register(&server, &computer).await;
+    let laptop = sign_in(&computer, &handle).await;
+    let phone = sign_in(&server.new_computer(), &handle).await;
+    let me = laptop.me().await.unwrap();
+    let own = Own(
+        laptop.user_id(),
+        IdentityPublicKey::from_bytes(me.identity_key.as_slice()).unwrap(),
+    );
+
+    let (_gateway, _events) = laptop.connect_gateway().unwrap();
+    kept_up(&server, &laptop, 20).await;
+    assert_eq!(laptop.key_package_count().await.unwrap(), 20);
+
+    // The phone claims eleven: nine left, and the laptop is told.
+    for _ in 0..11 {
+        let claimed = phone
+            .claim_key_packages(laptop.user_id(), &own)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+    }
+    kept_up(&server, &laptop, 20).await;
+
+    // Kept up again at the next connection, and never more than 20.
+    laptop.maintain_key_packages(false).await.unwrap();
+    assert_eq!(on_the_instance(&server, &laptop).await, (20, 1));
+}
+
+/// The gateway's requests: the answer, or the instance's refusal with its
+/// code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL"]
+async fn a_request_gets_its_answer_or_its_refusal() {
+    use tavern_client_core::{GatewayEvent, RequestError};
+    use tavern_protocol::gateway::v1 as proto;
+
+    let server = Server::spawn().await;
+    let computer = server.new_computer();
+    let handle = register(&server, &computer).await;
+    let laptop = sign_in(&computer, &handle).await;
+    let (gateway, mut events) = laptop.connect_gateway().unwrap();
+    assert!(matches!(
+        tavern_e2e_tests::next_event(&mut events).await,
+        GatewayEvent::Connected { .. }
+    ));
+    let refused = gateway
+        .fetch_group_info(proto::FetchGroupInfo {
+            conversation_id: Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        RequestError::Refused {
+            code: proto::ErrorCode::NotAMember,
+            retry_after_ms: 0,
+            current_epoch: 0,
+        }
+    );
+    let batch = gateway
+        .fetch_messages(proto::FetchMessages {
+            conversation_id: Uuid::new_v4().as_bytes().to_vec(),
+            after_seq: 0,
+            limit: 10,
+        })
+        .await;
+    assert!(
+        matches!(batch, Err(RequestError::Refused { .. })),
+        "{batch:?}"
+    );
+}

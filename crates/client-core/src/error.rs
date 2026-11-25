@@ -74,6 +74,10 @@ pub enum ClientError {
     /// The local store of the account could not be opened or used.
     #[error("local store: {0}")]
     LocalStore(#[from] crate::local::LocalStoreError),
+
+    /// An MLS operation of this device failed.
+    #[error("MLS: {0}")]
+    Mls(#[from] tavern_crypto::mls::MlsError),
     /// A background task was cancelled.
     #[error("the operation was interrupted")]
     Interrupted,
