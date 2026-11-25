@@ -54,6 +54,8 @@ use crate::session::{self, Session};
 
 /// Refused requests in a row after which a connection is closed (4007).
 const STRIKES_BEFORE_CLOSE: u32 = 10;
+/// How long a closing connection waits for the client's Close.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// Largest upload announced to clients (used from milestone M5).
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -135,6 +137,19 @@ async fn close(mut socket: WebSocket, code: u16) {
             reason: "".into(),
         })))
         .await;
+    // The closing handshake: what the client still sends is read and
+    // dropped, never handled, until its own Close, for a short while at
+    // most. A socket closed with data left unread is reset, and the reset
+    // can lose the frames sent just before it: `SessionRevoked`, and the
+    // close code itself.
+    let _ = tokio::time::timeout(CLOSE_GRACE, async {
+        while let Some(Ok(message)) = socket.recv().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 /// What the next message from the client turned out to be.
