@@ -44,5 +44,7 @@ rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# A simulated clock for the tests of timers.
+tokio = { workspace = true, features = ["test-util"] }
 [lints]
 workspace = true

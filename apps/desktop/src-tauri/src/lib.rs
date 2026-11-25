@@ -212,6 +212,7 @@ impl GatewayView {
                 security_notices,
                 instance_generation: _,
                 key_packages_remaining: _,
+                server_time_ms: _,
             } => Self::Connected {
                 new_devices: new_devices
                     .into_iter()
@@ -240,7 +241,11 @@ impl GatewayView {
             | GatewayEvent::JoinConversation { .. }
             | GatewayEvent::Sequenced(_)
             | GatewayEvent::Welcome(_)
-            | GatewayEvent::KeyPackagesLow { .. } => return None,
+            | GatewayEvent::KeyPackagesLow { .. }
+            // Shown by the interface of task 12.
+            | GatewayEvent::ClockSkew { .. }
+            // The engine of task 10b reads the sequences again.
+            | GatewayEvent::EventsMissed => return None,
         })
     }
 }
@@ -768,6 +773,7 @@ mod tests {
                 security_notices: Vec::new(),
                 instance_generation: 3,
                 key_packages_remaining: 20,
+                server_time_ms: 1,
             }),
             r#"{"type":"connected","newDevices":[],"securityNotices":[]}"#
         );

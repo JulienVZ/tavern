@@ -164,6 +164,21 @@ impl Device {
     fn database(&self) -> std::path::PathBuf {
         self.dir.path().join(DATABASE_FILE)
     }
+
+    /// Closes the store and opens it again, as a restart of the client.
+    fn reopen(&mut self) {
+        self.store.close();
+        self.store = LocalStore::open(
+            &self.database(),
+            &Secret::from_slice(&[7; 32]).unwrap(),
+            Binding {
+                user_id: self.user_id,
+                device_id: self.device_id,
+            },
+            NOW_MS,
+        )
+        .unwrap();
+    }
 }
 
 /// The DM of Alice and Bob, as its devices know it.
@@ -304,7 +319,7 @@ fn text_of(incoming: Incoming) -> Vec<u8> {
 async fn a_group_lives_in_the_store_through_every_operation() {
     let (alice, bob) = (Account::new(1), Account::new(2));
     let dm = Dm::new(&alice, &bob);
-    let alice1 = Device::new(&alice, 1, true);
+    let mut alice1 = Device::new(&alice, 1, true);
     let mut bob1 = Device::new(&bob, 1, true);
 
     let welcome = create(&alice1, &dm, vec![bob1.claimed(&dm.keys).await]).await;
@@ -315,18 +330,9 @@ async fn a_group_lives_in_the_store_through_every_operation() {
         b"hello Bob"
     );
 
-    // Bob's store closes and opens again: the group is still there.
-    bob1.store.close();
-    bob1.store = LocalStore::open(
-        &bob1.database(),
-        &Secret::from_slice(&[7; 32]).unwrap(),
-        Binding {
-            user_id: bob1.user_id,
-            device_id: bob1.device_id,
-        },
-        NOW_MS,
-    )
-    .unwrap();
+    // Bob's store closes and opens again: the group is still there. So
+    // after each step below, for every device.
+    bob1.reopen();
     let message = encrypt(&bob1, b"hello Alice").await;
     assert_eq!(
         text_of(process(&alice1, &dm, message).await.unwrap()),
@@ -345,9 +351,11 @@ async fn a_group_lives_in_the_store_through_every_operation() {
         Incoming::Commit { .. }
     ));
     assert_eq!(epoch(&alice1).await, epoch(&bob1).await);
+    alice1.reopen();
+    bob1.reopen();
 
     // Alice adds her second device.
-    let alice2 = Device::new(&alice, 2, true);
+    let mut alice2 = Device::new(&alice, 2, true);
     let claimed = alice2.claimed(&dm.keys).await;
     let keys = dm.keys.clone();
     let added = alice1
@@ -361,9 +369,12 @@ async fn a_group_lives_in_the_store_through_every_operation() {
         .unwrap();
     process(&bob1, &dm, added.commit).await.unwrap();
     join(&alice2, &dm, added.welcome.unwrap()).await;
+    for device in [&mut alice1, &mut alice2, &mut bob1] {
+        device.reopen();
+    }
 
     // Bob's second device joins by external commit.
-    let bob2 = Device::new(&bob, 2, true);
+    let mut bob2 = Device::new(&bob, 2, true);
     let (group_info, dm_for_join) = (added.group_info, dm.clone());
     let external = bob2
         .mls(move |provider, signer, _, credential| {
@@ -383,6 +394,9 @@ async fn a_group_lives_in_the_store_through_every_operation() {
         .unwrap();
     for device in [&alice1, &alice2, &bob1] {
         process(device, &dm, external.commit.clone()).await.unwrap();
+    }
+    for device in [&mut alice1, &mut alice2, &mut bob1, &mut bob2] {
+        device.reopen();
     }
     let message = encrypt(&bob2, b"from my laptop").await;
     for device in [&alice1, &alice2, &bob1] {
@@ -433,7 +447,7 @@ async fn an_operation_that_fails_halfway_writes_nothing() {
     join(&bob1, &dm, welcome).await;
     let message = encrypt(&alice1, b"only once").await;
 
-    let receive = |fail: bool| {
+    let receive = |fail: bool, seq: u64| {
         let (message, keys) = (message.clone(), dm.keys.clone());
         bob1.mls(move |provider, _, transaction, _| {
             let text = text_of(load(provider)?.process(provider, &message, &keys)?);
@@ -441,7 +455,7 @@ async fn an_operation_that_fails_halfway_writes_nothing() {
                 transaction,
                 &StoredText {
                     conversation: CONVERSATION,
-                    seq: 2,
+                    seq,
                     sender_device: None,
                     sent_at_ms: NOW_MS,
                     body: &text,
@@ -453,7 +467,7 @@ async fn an_operation_that_fails_halfway_writes_nothing() {
             Ok(text)
         })
     };
-    assert!(matches!(receive(true).await, Err(Failure::OnPurpose)));
+    assert!(matches!(receive(true, 2).await, Err(Failure::OnPurpose)));
     let stored: i64 = bob1
         .store
         .run(|connection| {
@@ -464,9 +478,11 @@ async fn an_operation_that_fails_halfway_writes_nothing() {
         .await
         .unwrap();
     assert_eq!(stored, 0);
-    // Its key was not consumed: processed now, then never again.
-    assert_eq!(receive(false).await.unwrap(), b"only once");
-    assert!(receive(false).await.is_err());
+    // Its key was not consumed: processed now, then never again, OpenMLS
+    // itself refusing it (stored under another number, it would not
+    // collide in the table).
+    assert_eq!(receive(false, 2).await.unwrap(), b"only once");
+    assert!(matches!(receive(false, 3).await, Err(Failure::Mls(_))));
 }
 
 /// The rows of a device's MLS state.
@@ -808,4 +824,240 @@ async fn write_the_mls_state_of_the_first_release() {
         message,
     };
     std::fs::write(mls_fixture("txt"), context.encode()).unwrap();
+}
+
+/// The rows of a device's queue of proposals.
+async fn queued(device: &Device) -> i64 {
+    device
+        .store
+        .run(|connection| {
+            connection
+                .query_row(
+                    "SELECT count(*) FROM mls_state \
+                     WHERE label IN ('QueuedProposal', 'ProposalQueueRefs')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| super::database(&error))
+        })
+        .await
+        .unwrap()
+}
+
+/// Review of task 10a, point 7: the queue of proposals through the store.
+/// The server's `Remove` (an external proposal) is stored by the members,
+/// a member's commit carries it by reference, and once merged the queue is
+/// empty, its content gone from the file. On stores without encryption, to
+/// read the files.
+#[tokio::test]
+async fn the_queue_of_proposals_goes_through_the_store() {
+    use tavern_crypto::mls::{PublicState, ServerSigner};
+    let (alice, bob) = (Account::new(1), Account::new(2));
+    let mut dm = Dm::new(&alice, &bob);
+    let server = ExternalSenderKey::generate();
+    dm.external_sender = server.public_bytes();
+    let alice1 = Device::new(&alice, 1, false);
+    let bob1 = Device::new(&bob, 1, false);
+    let bob2 = Device::new(&bob, 2, false);
+    let added = vec![bob1.claimed(&dm.keys).await, bob2.claimed(&dm.keys).await];
+    let for_create = dm.clone();
+    let commit = alice1
+        .mls(move |provider, signer, _, credential| {
+            let (mut group, commit) = Group::create(
+                provider,
+                signer,
+                credential,
+                &expected(&for_create),
+                &for_create.external_sender,
+                &added,
+                &for_create.keys,
+            )?;
+            group.merge_pending_commit(provider)?;
+            Ok(commit)
+        })
+        .await
+        .unwrap();
+    for device in [&bob1, &bob2] {
+        join(device, &dm, commit.welcome.clone().unwrap()).await;
+    }
+
+    // The server removes Bob's second device.
+    let (mut state, _) = PublicState::create(
+        &commit.group_info,
+        &expected(&dm),
+        alice1.leaf(),
+        &dm.keys,
+        &dm.external_sender,
+    )
+    .unwrap();
+    let leaf = state.leaf_of(bob2.leaf()).unwrap();
+    let proposal = state
+        .remove(leaf, &ServerSigner::new(&server))
+        .unwrap()
+        .expect("a new removal");
+    // Delivered to every member, the removed device included.
+    for device in [&alice1, &bob1, &bob2] {
+        assert!(matches!(
+            process(device, &dm, proposal.clone()).await.unwrap(),
+            Incoming::Proposal
+        ));
+        assert!(queued(device).await > 0, "stored in the queue");
+    }
+
+    // Alice commits it, by reference; once merged, nothing is queued, and
+    // what the queue held left the file.
+    let keys = dm.keys.clone();
+    let removal = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let kept = std::sync::Arc::clone(&removal);
+    let committer = &alice1;
+    erased_after(
+        &alice1,
+        "the queue of proposals, once committed",
+        || async move {
+            let commit = committer
+                .mls(move |provider, signer, _, _| {
+                    let mut group = load(provider)?;
+                    let commit = group
+                        .commit_pending_proposals(provider, signer, &keys)?
+                        .expect("the removal to commit");
+                    group.merge_pending_commit(provider)?;
+                    Ok(commit)
+                })
+                .await
+                .unwrap();
+            *kept.lock().unwrap() = Some(commit);
+        },
+    )
+    .await;
+    assert_eq!(queued(&alice1).await, 0);
+    let removal = removal.lock().unwrap().take().unwrap();
+    assert!(matches!(
+        process(&bob1, &dm, removal.commit.clone()).await.unwrap(),
+        Incoming::Commit { .. }
+    ));
+    assert_eq!(queued(&bob1).await, 0);
+    assert!(matches!(
+        process(&bob2, &dm, removal.commit).await.unwrap(),
+        Incoming::Commit {
+            self_removed: true,
+            ..
+        }
+    ));
+}
+
+/// The labels of the rows of one group's state.
+const GROUP_LABELS: [&str; 14] = [
+    "MlsGroupJoinConfig",
+    "OwnLeafNodes",
+    "QueuedProposal",
+    "ProposalQueueRefs",
+    "Tree",
+    "InterimTranscriptHash",
+    "GroupContext",
+    "ConfirmationTag",
+    "GroupState",
+    "MessageSecrets",
+    "ResumptionPsk",
+    "OwnLeafNodeIndex",
+    "EpochSecrets",
+    "EpochKeyPairs",
+];
+
+/// Review of task 10a, point 16: a group deleted from a device (left,
+/// recreated, or its external commit refused) leaves no row of its state,
+/// and nothing of it in the file.
+#[tokio::test]
+async fn a_deleted_group_leaves_nothing_behind() {
+    let (alice, bob) = (Account::new(1), Account::new(2));
+    let dm = Dm::new(&alice, &bob);
+    let alice1 = Device::new(&alice, 1, false);
+    let bob1 = Device::new(&bob, 1, false);
+    let welcome = create(&alice1, &dm, vec![bob1.claimed(&dm.keys).await]).await;
+    join(&bob1, &dm, welcome).await;
+    let message = encrypt(&alice1, b"before leaving").await;
+    process(&bob1, &dm, message).await.unwrap();
+
+    erased_after(&bob1, "a deleted group", || async {
+        bob1.mls(|provider, _, _, _| Ok(load(provider)?.delete(provider)?))
+            .await
+            .unwrap();
+    })
+    .await;
+    let left: Vec<String> = bob1
+        .store
+        .run(|connection| {
+            let mut statement = connection
+                .prepare("SELECT label FROM mls_state")
+                .map_err(|error| super::database(&error))?;
+            let rows = statement
+                .query_map([], |row| row.get(0))
+                .map_err(|error| super::database(&error))?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|error| super::database(&error))?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    assert!(
+        left.iter()
+            .all(|label| !GROUP_LABELS.contains(&label.as_str())),
+        "{left:?}"
+    );
+    assert!(
+        bob1.mls(|provider, _, _, _| Ok(Group::load(provider, Dm::identity())?.is_none()))
+            .await
+            .unwrap()
+    );
+}
+
+/// Review of task 10a, point 1, the reviewer's scenario: a one-time
+/// KeyPackage built on day 0, claimed on day 85; its device is offline from
+/// day 80 to day 100 (its hourly upkeep, which needs no connection, runs
+/// every day), and processes the Welcome on day 100: the private parts are
+/// still there, and the join works.
+#[tokio::test]
+async fn a_welcome_waiting_past_the_lifetime_of_its_package_still_joins() {
+    use tavern_crypto::identity::DeviceKey as Key;
+
+    use crate::key_packages::{self, Outcome};
+    const DAY: u64 = 24 * 3600 * 1000;
+    let (alice, bob) = (Account::new(1), Account::new(2));
+    let dm = Dm::new(&alice, &bob);
+    let alice1 = Device::new(&alice, 1, false);
+    let bob1 = Device::new(&bob, 1, false);
+    let upload = key_packages::prepare(
+        &bob1.store,
+        Key::from_seed(&Secret::from_slice(&bob1.seed).unwrap()),
+        bob1.certificate.clone(),
+        0,
+        false,
+        NOW_MS,
+    )
+    .await
+    .unwrap();
+    key_packages::settle(&bob1.store, &upload, Outcome::Taken, NOW_MS)
+        .await
+        .unwrap();
+    for day in 1..80 {
+        key_packages::forget_due(&bob1.store, NOW_MS + day * DAY)
+            .await
+            .unwrap();
+    }
+    // Day 85: Alice claims it and makes the Welcome.
+    let claimed =
+        key_package::validate_claimed(&upload.one_time[0].1, bob1.leaf(), &dm.keys).unwrap();
+    let welcome = create(&alice1, &dm, vec![claimed]).await;
+    // Days 80 to 100: Bob is offline; his upkeep runs.
+    for day in 80..=100 {
+        key_packages::forget_due(&bob1.store, NOW_MS + day * DAY)
+            .await
+            .unwrap();
+    }
+    join(&bob1, &dm, welcome).await;
+    assert_eq!(epoch(&bob1).await, epoch(&alice1).await);
+    let message = encrypt(&alice1, b"welcome, late").await;
+    assert_eq!(
+        text_of(process(&bob1, &dm, message).await.unwrap()),
+        b"welcome, late"
+    );
 }

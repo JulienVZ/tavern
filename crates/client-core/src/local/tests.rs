@@ -554,3 +554,153 @@ fn removing_a_directory_that_does_not_exist_is_fine() {
         .remove()
         .unwrap();
 }
+
+/// Every commit is durable before it returns (review of task 10a, point 5):
+/// `synchronous = FULL`, with the write-ahead log.
+#[tokio::test]
+async fn commits_are_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+    // 2 is FULL.
+    assert_eq!(pragma(&store, "synchronous").await, "2");
+    assert_eq!(pragma(&store, "journal_mode").await, "wal");
+    // On macOS, fsync alone does not reach the disk.
+    if cfg!(target_os = "macos") {
+        assert_eq!(pragma(&store, "fullfsync").await, "1");
+        assert_eq!(pragma(&store, "checkpoint_fullfsync").await, "1");
+    }
+}
+
+/// How long a small commit takes, by durability setting: the measure asked
+/// with point 5 of the review of task 10a. Bounded (300 commits of a row).
+#[tokio::test]
+#[ignore = "a measurement, run on demand"]
+#[expect(clippy::print_stdout, reason = "the measurement is printed")]
+async fn measure_durable_commits() {
+    for setting in ["NORMAL", "FULL", "FULL_FULLFSYNC"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+        let elapsed = store
+            .run(move |connection| {
+                let (synchronous, fullfsync) = match setting {
+                    "FULL_FULLFSYNC" => ("FULL", "ON"),
+                    other => (other, "OFF"),
+                };
+                connection
+                    .execute_batch(&format!(
+                        "PRAGMA synchronous = {synchronous}; PRAGMA fullfsync = {fullfsync};
+                         CREATE TABLE probe (n INTEGER);"
+                    ))
+                    .map_err(|error| super::database(&error))?;
+                let start = std::time::Instant::now();
+                for n in 0..300 {
+                    let transaction = connection
+                        .transaction()
+                        .map_err(|error| super::database(&error))?;
+                    transaction
+                        .execute("INSERT INTO probe VALUES (?1)", [n])
+                        .map_err(|error| super::database(&error))?;
+                    transaction
+                        .commit()
+                        .map_err(|error| super::database(&error))?;
+                }
+                Ok(start.elapsed())
+            })
+            .await
+            .unwrap();
+        println!(
+            "{setting}: {:.3} ms per commit",
+            elapsed.as_secs_f64() * 1000.0 / 300.0
+        );
+    }
+}
+
+/// Review of task 10a, point 16: a store of each earlier version, brought up
+/// to date, then used by MLS: KeyPackages built in it, their upload settled,
+/// and their private parts forgotten, through the tables of every version.
+#[tokio::test]
+async fn an_upgraded_store_runs_mls_operations() {
+    use tavern_crypto::identity::{AccountRootSecret, DeviceKey};
+
+    use crate::key_packages::{self, Outcome};
+    for from in 1..LATEST_VERSION {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_path(&dir);
+        let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+        store
+            .run(move |connection| {
+                rebuild_at(connection, from);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.close();
+        let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+
+        let device_key = DeviceKey::generate();
+        let certificate = AccountRootSecret::generate()
+            .identity_key()
+            .unwrap()
+            .certify_device(
+                binding().user_id.as_bytes(),
+                binding().device_id.as_bytes(),
+                &device_key.public(),
+                NOW_MS,
+            );
+        let upload = key_packages::prepare(&store, device_key, certificate, 0, false, NOW_MS)
+            .await
+            .unwrap();
+        assert_eq!(upload.one_time.len(), 20, "from version {from}");
+        key_packages::settle(&store, &upload, Outcome::Unknown, NOW_MS)
+            .await
+            .unwrap();
+        key_packages::settle(&store, &upload, Outcome::Taken, NOW_MS)
+            .await
+            .unwrap();
+        let later = NOW_MS + key_packages::ONE_TIME_KEPT_MS + key_packages::LAST_RESORT_GRACE_MS;
+        assert!(key_packages::forget_due(&store, later).await.unwrap());
+        store.close();
+    }
+}
+
+/// Review of task 10a, point 11: a reader in another connection keeps the
+/// journal from being emptied: `erase_journal` tries again, then says so
+/// (`Busy`) rather than reporting it emptied; once the reader is gone, the
+/// next call empties it.
+#[tokio::test]
+async fn an_incomplete_checkpoint_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = store_path(&dir);
+    let store = LocalStore::open_unencrypted(&path, binding(), NOW_MS).unwrap();
+    store
+        .run(|connection| {
+            connection
+                .execute_batch("CREATE TABLE probe (n INTEGER); INSERT INTO probe VALUES (1);")
+                .map_err(|error| super::database(&error))
+        })
+        .await
+        .unwrap();
+    // Another window reads, from the journal's current state.
+    let reader = Connection::open(&path).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM probe;")
+        .unwrap();
+    store
+        .run(|connection| {
+            connection
+                .execute_batch("INSERT INTO probe VALUES (2);")
+                .map_err(|error| super::database(&error))
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.erase_journal().await,
+        Err(LocalStoreError::Busy)
+    ));
+    reader.execute_batch("COMMIT;").unwrap();
+    drop(reader);
+    store.erase_journal().await.unwrap();
+    let wal = path.with_file_name(format!("{DATABASE_FILE}-wal"));
+    let wal_len = std::fs::metadata(&wal).map_or(0, |metadata| metadata.len());
+    assert_eq!(wal_len, 0, "the journal is emptied");
+}

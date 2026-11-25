@@ -109,6 +109,7 @@ impl From<ClientError> for CommandError {
                 Self::code("local_store_too_new")
             }
             ClientError::LocalStore(_) => Self::code("local_store_unavailable"),
+            ClientError::ClockSkew { .. } => Self::code("clock_skew"),
             ClientError::Crypto(_) | ClientError::Mls(_) | ClientError::Interrupted => {
                 Self::code("internal")
             }

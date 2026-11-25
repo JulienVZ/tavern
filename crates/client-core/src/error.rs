@@ -75,6 +75,15 @@ pub enum ClientError {
     #[error("local store: {0}")]
     LocalStore(#[from] crate::local::LocalStoreError),
 
+    /// This device's clock is off by more than an hour from the instance's:
+    /// the instance refuses the KeyPackages it builds. The user must set
+    /// the clock right.
+    #[error("this device's clock is off by {offset_ms} ms from the instance's")]
+    ClockSkew {
+        /// The instance's clock minus this device's.
+        offset_ms: i64,
+    },
+
     /// An MLS operation of this device failed.
     #[error("MLS: {0}")]
     Mls(#[from] tavern_crypto::mls::MlsError),

@@ -506,6 +506,7 @@ impl InstanceClient {
                 store_key,
                 local,
                 key_packages: Arc::default(),
+                clock_skew: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             },
             new_device,
             store_reset: key_reset || store_reset,
@@ -712,6 +713,7 @@ impl InstanceClient {
                 store_key,
                 local,
                 key_packages: Arc::default(),
+                clock_skew: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             },
             new_device: false,
             store_reset,
@@ -748,6 +750,9 @@ pub struct Client {
     local: LocalStore,
     /// Held while the KeyPackages are kept up.
     key_packages: Arc<tokio::sync::Mutex<()>>,
+    /// The instance's clock minus this device's, in milliseconds, measured
+    /// at each connection of the gateway; `i64::MIN` until then.
+    clock_skew: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl std::fmt::Debug for Client {
@@ -758,6 +763,11 @@ impl std::fmt::Debug for Client {
             .finish_non_exhaustive()
     }
 }
+
+/// How far this device's clock may be from the instance's before the
+/// KeyPackages it builds are refused (OpenMLS starts their lifetime an hour
+/// in the past).
+const CLOCK_TOLERANCE_MS: u64 = 3600 * 1000;
 
 impl Client {
     fn auth(&self) -> Auth<'_> {
@@ -777,7 +787,9 @@ impl Client {
     }
 
     /// This device's certificate, as it enrolled: kept in the local store,
-    /// read once from the instance's list of devices. The instance checks
+    /// read once from the instance's list of devices, and checked before it
+    /// is kept: it must certify this device's key, for this account and
+    /// this device, under the account's identity key. The instance checks
     /// it again at every upload of KeyPackages, which carry it.
     async fn certificate(&self) -> Result<Vec<u8>, ClientError> {
         if let Some(certificate) = self.local.certificate().await? {
@@ -792,22 +804,58 @@ impl Client {
             .ok_or(ClientError::ServerError)?
             .certificate
             .0;
+        key_packages::check_certificate(
+            &self.me().await?.identity_key.0,
+            &certificate,
+            self.user_id,
+            self.device_id,
+            &self.device_key()?,
+        )?;
         self.local.set_certificate(certificate.clone()).await?;
         Ok(certificate)
     }
 
-    /// Keeps this device's KeyPackages up (ADR 0019, section 3): uploads
-    /// the one-time packages missing on the instance, and a new last-resort
-    /// package when due, or when a Welcome used it (`replace_last_resort`).
-    /// Forgets what is no longer needed. Packages the instance refuses are
-    /// forgotten; an upload whose answer did not come is sent again next
-    /// time. Runs at each connection of the gateway and on
-    /// `KeyPackagesLow`, one run at a time.
+    /// Keeps this device's KeyPackages up (ADR 0019, section 3; module
+    /// `key_packages`): first forgets what is due, which never waits for the
+    /// instance; then uploads the one-time packages missing on the instance,
+    /// and a new last-resort package when due, or when a Welcome used it
+    /// (`replace_last_resort`). Runs at each connection of the gateway, on
+    /// `KeyPackagesLow` and every hour, one run at a time. The journal is
+    /// erased whatever the outcome, once something was forgotten.
+    ///
+    /// When the instance refuses packages because this device's clock is
+    /// off by more than an hour (they would not be valid yet), it fails
+    /// with [`ClientError::ClockSkew`], and builds nothing more for a day
+    /// unless the clock is right again: no loop of building and refusing.
     pub async fn maintain_key_packages(
         &self,
         replace_last_resort: bool,
     ) -> Result<(), ClientError> {
         let _one_at_a_time = self.key_packages.lock().await;
+        let forgot = key_packages::forget_due(&self.local, now_ms()).await;
+        let result = match forgot {
+            Ok(_) => self.keep_key_packages_up(replace_last_resort).await,
+            Err(error) => Err(error.into()),
+        };
+        // What was forgotten (or what a refusal made forget) leaves the
+        // journal too, whatever happened after.
+        if let Err(error) = self.local.erase_journal().await {
+            tracing::warn!(%error, "cannot erase the journal of the local store");
+        }
+        result
+    }
+
+    async fn keep_key_packages_up(&self, replace_last_resort: bool) -> Result<(), ClientError> {
+        if let Some(refused_at) = key_packages::refused_at(&self.local).await? {
+            match self.clock_skew_ms() {
+                Some(skew) if skew.unsigned_abs() > CLOCK_TOLERANCE_MS => {
+                    if now_ms().saturating_sub(refused_at) < key_packages::REFUSAL_BACKOFF_MS {
+                        return Err(ClientError::ClockSkew { offset_ms: skew });
+                    }
+                }
+                _ => key_packages::set_refused_at(&self.local, None).await?,
+            }
+        }
         let certificate = self.certificate().await?;
         let remaining = self.key_package_count().await?;
         let upload = key_packages::prepare(
@@ -819,29 +867,42 @@ impl Client {
             now_ms(),
         )
         .await?;
-        if !upload.is_empty() {
-            let sent = self
-                .upload_key_packages(
-                    upload
-                        .one_time
-                        .iter()
-                        .map(|(_, bytes)| bytes.clone())
-                        .collect(),
-                    upload.last_resort.as_ref().map(|(_, bytes)| bytes.clone()),
-                )
-                .await;
-            match sent {
-                Ok(_) => key_packages::uploaded(&self.local, &upload, now_ms()).await?,
-                Err(error @ ClientError::Api { .. }) => {
-                    key_packages::refused(&self.local, &upload).await?;
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            }
+        if upload.is_empty() {
+            return Ok(());
         }
-        // What was forgotten leaves the journal too.
-        self.local.erase_journal().await?;
-        Ok(())
+        let sent = self
+            .upload_key_packages(
+                upload
+                    .one_time
+                    .iter()
+                    .map(|(_, bytes)| bytes.clone())
+                    .collect(),
+                upload.last_resort.as_ref().map(|(_, bytes)| bytes.clone()),
+            )
+            .await;
+        let outcome = key_packages::Outcome::of(&sent);
+        key_packages::settle(&self.local, &upload, outcome, now_ms()).await?;
+        match sent {
+            Ok(_) => Ok(()),
+            Err(error) => match self.clock_skew_ms() {
+                Some(skew)
+                    if skew.unsigned_abs() > CLOCK_TOLERANCE_MS
+                        && error.api_code() == Some(ErrorCode::InvalidKeyPackage) =>
+                {
+                    key_packages::set_refused_at(&self.local, Some(now_ms())).await?;
+                    Err(ClientError::ClockSkew { offset_ms: skew })
+                }
+                _ => Err(error),
+            },
+        }
+    }
+
+    /// How far this device's clock is behind the instance's (positive) or
+    /// ahead of it (negative), in milliseconds, as last measured at the
+    /// connection of the gateway.
+    fn clock_skew_ms(&self) -> Option<i64> {
+        let skew = self.clock_skew.load(std::sync::atomic::Ordering::Acquire);
+        (skew != i64::MIN).then_some(skew)
     }
 
     fn api(&self) -> &Api {
@@ -1110,25 +1171,56 @@ impl Client {
         )?;
         let (events, received) = tokio::sync::mpsc::channel(64);
         let client = self.duplicate();
+        // Every hour whatever the connection, and while the gateway lives:
+        // what is due locally never waits for a connection.
+        let hourly = key_packages::spawn_every(key_packages::UPKEEP_INTERVAL, {
+            let (client, events) = (client.duplicate(), events.clone());
+            move || {
+                let (client, events) = (client.duplicate(), events.clone());
+                async move { client.upkeep(&events).await }
+            }
+        });
         tokio::spawn(async move {
             while let Some(event) = raw.recv().await {
+                if let GatewayEvent::Connected { server_time_ms, .. } = &event {
+                    let skew = i64::try_from(*server_time_ms)
+                        .unwrap_or(i64::MAX)
+                        .saturating_sub(i64::try_from(now_ms()).unwrap_or(i64::MAX));
+                    client
+                        .clock_skew
+                        .store(skew, std::sync::atomic::Ordering::Release);
+                }
                 if matches!(
                     event,
                     GatewayEvent::Connected { .. } | GatewayEvent::KeyPackagesLow { .. }
                 ) {
-                    let client = client.duplicate();
-                    tokio::spawn(async move {
-                        if let Err(error) = client.maintain_key_packages(false).await {
-                            tracing::warn!(%error, "cannot keep the KeyPackages up");
-                        }
-                    });
+                    let (client, events) = (client.duplicate(), events.clone());
+                    tokio::spawn(async move { client.upkeep(&events).await });
                 }
                 if events.send(event).await.is_err() {
                     break;
                 }
             }
+            hourly.abort();
         });
         Ok((gateway, received))
+    }
+
+    /// One run of the upkeep of the KeyPackages, in the background: a
+    /// failure is logged, and a clock that makes the instance refuse them
+    /// is told to the application ([`crate::gateway::GatewayEvent::ClockSkew`]).
+    async fn upkeep(&self, events: &tokio::sync::mpsc::Sender<crate::gateway::GatewayEvent>) {
+        match self.maintain_key_packages(false).await {
+            Ok(()) => {}
+            Err(ClientError::ClockSkew { offset_ms }) => {
+                tracing::warn!(
+                    offset_ms,
+                    "this device's clock makes the instance refuse its KeyPackages"
+                );
+                let _ = events.try_send(crate::gateway::GatewayEvent::ClockSkew { offset_ms });
+            }
+            Err(error) => tracing::warn!(%error, "cannot keep the KeyPackages up"),
+        }
     }
 
     /// Another handle on this signed-in client, for its background tasks.
@@ -1141,6 +1233,7 @@ impl Client {
             store_key: Arc::clone(&self.store_key),
             local: self.local.clone(),
             key_packages: Arc::clone(&self.key_packages),
+            clock_skew: Arc::clone(&self.clock_skew),
         }
     }
 

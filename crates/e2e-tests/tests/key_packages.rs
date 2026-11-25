@@ -170,13 +170,19 @@ async fn a_connected_device_keeps_its_key_packages_up() {
     kept_up(&server, &laptop, 20).await;
     assert_eq!(laptop.key_package_count().await.unwrap(), 20);
 
-    // The phone claims eleven: nine left, and the laptop is told.
-    for _ in 0..11 {
+    // The phone claims until fewer than ten are left, and the laptop is
+    // told. Eleven claims, or a few more: the upkeep that started with the
+    // connection (the hourly one runs at once too) may top them up between
+    // two claims.
+    let mut claims = 0;
+    while on_the_instance(&server, &laptop).await.0 >= 10 {
         let claimed = phone
             .claim_key_packages(laptop.user_id(), &own)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
+        claims += 1;
+        assert!(claims <= 40, "the packages never ran low");
     }
     kept_up(&server, &laptop, 20).await;
 
@@ -202,6 +208,18 @@ async fn a_request_gets_its_answer_or_its_refusal() {
         tavern_e2e_tests::next_event(&mut events).await,
         GatewayEvent::Connected { .. }
     ));
+    // An answer (review of task 10a, point 16).
+    let answer = gateway
+        .request(proto::client_frame::Payload::Heartbeat(proto::Heartbeat {}))
+        .await;
+    assert!(
+        matches!(
+            answer,
+            Ok(proto::server_frame::Payload::HeartbeatAck(proto::HeartbeatAck { server_time_ms }))
+                if server_time_ms > 0
+        ),
+        "{answer:?}"
+    );
     let refused = gateway
         .fetch_group_info(proto::FetchGroupInfo {
             conversation_id: Uuid::new_v4().as_bytes().to_vec(),

@@ -18,6 +18,7 @@
 use openmls_traits::storage::{CURRENT_VERSION, Key, StorageProvider, traits};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 /// The labels of the rows, one per kind of value. Never renamed: they are
 /// stored.
@@ -79,30 +80,35 @@ pub struct SqlStorage<'c> {
 }
 
 impl<'c> SqlStorage<'c> {
-    /// The storage over `connection`, which should be in a transaction.
-    pub fn new(connection: &'c Connection) -> Self {
-        Self { connection }
+    /// The storage over `transaction`: every write commits with it, or not
+    /// at all.
+    pub fn new(transaction: &'c rusqlite::Transaction<'_>) -> Self {
+        Self {
+            connection: transaction,
+        }
     }
 
     fn put(&self, label: &str, key: &[u8], value: &impl Serialize) -> Result<()> {
-        let value = serde_json::to_vec(value)?;
+        // Secrets go through this buffer: erased when dropped.
+        let value = Zeroizing::new(serde_json::to_vec(value)?);
         self.connection
             .prepare(
                 "INSERT INTO mls_state (label, key, value) VALUES (?1, ?2, ?3) \
                  ON CONFLICT (label, key) DO UPDATE SET value = excluded.value",
             )?
-            .execute(params![label, key, value])?;
+            .execute(params![label, key, value.as_slice()])?;
         Ok(())
     }
 
     fn get<V: serde::de::DeserializeOwned>(&self, label: &str, key: &[u8]) -> Result<Option<V>> {
-        let value: Option<Vec<u8>> = self
+        let value: Option<Zeroizing<Vec<u8>>> = self
             .connection
             .prepare("SELECT value FROM mls_state WHERE label = ?1 AND key = ?2")?
-            .query_row(params![label, key], |row| row.get(0))
-            .optional()?;
+            .query_row(params![label, key], |row| row.get::<_, Vec<u8>>(0))
+            .optional()?
+            .map(Zeroizing::new);
         value
-            .map(|value: Vec<u8>| serde_json::from_slice(&value).map_err(SqlStorageError::from))
+            .map(|value| serde_json::from_slice(&value).map_err(SqlStorageError::from))
             .transpose()
     }
 
@@ -113,27 +119,34 @@ impl<'c> SqlStorage<'c> {
         Ok(())
     }
 
-    /// A list stored in one row: each item encoded on its own.
-    fn items(&self, label: &str, key: &[u8]) -> Result<Vec<Vec<u8>>> {
-        Ok(self.get(label, key)?.unwrap_or_default())
+    /// A list stored in one row: each item encoded on its own, erased from
+    /// memory when dropped.
+    fn items(&self, label: &str, key: &[u8]) -> Result<Vec<Zeroizing<Vec<u8>>>> {
+        let items: Vec<Vec<u8>> = self.get(label, key)?.unwrap_or_default();
+        Ok(items.into_iter().map(Zeroizing::new).collect())
+    }
+
+    fn write_items(&self, label: &str, key: &[u8], items: &[Zeroizing<Vec<u8>>]) -> Result<()> {
+        let plain: Vec<&[u8]> = items.iter().map(|item| item.as_slice()).collect();
+        self.put(label, key, &plain)
     }
 
     fn push(&self, label: &str, key: &[u8], item: &impl Serialize) -> Result<()> {
         let mut items = self.items(label, key)?;
-        items.push(serde_json::to_vec(item)?);
-        self.put(label, key, &items)
+        items.push(Zeroizing::new(serde_json::to_vec(item)?));
+        self.write_items(label, key, &items)
     }
 
     fn pull(&self, label: &str, key: &[u8], item: &impl Serialize) -> Result<()> {
         let mut items = self.items(label, key)?;
-        let item = serde_json::to_vec(item)?;
-        if let Some(position) = items.iter().position(|stored| *stored == item) {
+        let item = Zeroizing::new(serde_json::to_vec(item)?);
+        if let Some(position) = items.iter().position(|stored| **stored == *item) {
             items.remove(position);
         }
         if items.is_empty() {
             self.remove(label, key)
         } else {
-            self.put(label, key, &items)
+            self.write_items(label, key, &items)
         }
     }
 

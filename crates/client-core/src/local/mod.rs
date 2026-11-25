@@ -56,6 +56,11 @@ const PAGE_CACHE_KIB: i64 = 2048;
 /// How long a write waits for another connection (another window of the
 /// same profile) to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many times, and how far apart, a checkpoint of the journal is tried
+/// when a reader keeps it from completing. Each try already waits for the
+/// readers up to [`BUSY_TIMEOUT`].
+const JOURNAL_ATTEMPTS: u32 = 2;
+const JOURNAL_RETRY: Duration = Duration::from_millis(100);
 /// The files SQLite may create next to a database.
 const COMPANION_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
@@ -82,6 +87,11 @@ pub enum LocalStoreError {
     /// The account signed out: the store is closed and its key forgotten.
     #[error("the local store is closed")]
     Closed,
+    /// Another connection (another window of the same profile) kept the
+    /// journal from being emptied: what was deleted may still be in it
+    /// until the next try.
+    #[error("the journal of the local store could not be emptied yet")]
+    Busy,
     /// SQLite failed. Holds the error code only, never any SQL.
     #[error("the local store failed ({0})")]
     Database(String),
@@ -253,15 +263,29 @@ impl LocalStore {
     /// With `secure_delete`, what was deleted is then overwritten in the
     /// file, and no longer held by earlier frames of the log: the secrets
     /// OpenMLS deleted, the text of deleted messages. Called after each
-    /// batch that deletes them. A reader of another window may keep the log
-    /// from being truncated; the next call does it.
+    /// batch that deletes them, on its error paths too. A reader in another
+    /// window of the same profile may keep the log from being emptied: the
+    /// checkpoint waits for it, is tried again, then [`LocalStoreError::Busy`]
+    /// says it is incomplete (the next call completes it).
     pub async fn erase_journal(&self) -> Result<(), LocalStoreError> {
-        self.run(|connection| {
-            connection
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-                .map_err(|error| database(&error))
-        })
-        .await
+        for attempt in 0..JOURNAL_ATTEMPTS {
+            let busy = self
+                .run(|connection| {
+                    connection
+                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .map_err(|error| database(&error))
+                })
+                .await?;
+            if busy == 0 {
+                return Ok(());
+            }
+            if attempt + 1 < JOURNAL_ATTEMPTS {
+                tokio::time::sleep(JOURNAL_RETRY).await;
+            }
+        }
+        Err(LocalStoreError::Busy)
     }
 
     /// Deletes the text of a message, which `secure_delete` overwrites in
@@ -439,8 +463,17 @@ fn configure(connection: &Connection) -> rusqlite::Result<()> {
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(rusqlite::Error::InvalidQuery);
     }
+    // FULL: a committed transaction is on disk before the commit returns,
+    // power cut included. Whatever the instance learns afterwards (an
+    // acknowledgement, an upload of KeyPackages, a commit) comes after a
+    // local write that survives (decided 2026-11-25, after the review of
+    // task 10a). On macOS, `fsync` leaves the data in the drive's cache:
+    // `fullfsync` flushes it (about 4 ms a commit, measured), as FULL does
+    // elsewhere.
+    #[cfg(target_os = "macos")]
+    connection.execute_batch("PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")?;
     connection.execute_batch(&format!(
-        "PRAGMA synchronous = NORMAL;
+        "PRAGMA synchronous = FULL;
          PRAGMA foreign_keys = ON;
          PRAGMA secure_delete = ON;
          PRAGMA temp_store = MEMORY;

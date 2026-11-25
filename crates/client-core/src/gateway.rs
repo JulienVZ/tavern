@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -191,6 +191,15 @@ pub enum GatewayEvent {
         /// The one-time KeyPackages of this device the instance can still
         /// serve.
         key_packages_remaining: u32,
+        /// The instance's clock at the connection, in milliseconds since the
+        /// Unix epoch.
+        server_time_ms: u64,
+    },
+    /// This device's clock is off by more than an hour from the instance's,
+    /// which refuses its KeyPackages: the user must set the clock right.
+    ClockSkew {
+        /// The instance's clock minus this device's, in milliseconds.
+        offset_ms: i64,
     },
     /// A message, commit or proposal of a conversation's sequence: a
     /// notification, not a reliable source (`protocol.md`, section 3). The
@@ -243,6 +252,10 @@ pub enum GatewayEvent {
         /// `true` for an enrolment.
         added: bool,
     },
+    /// Events were dropped because the application did not read them fast
+    /// enough: it reads the sequence of every conversation again
+    /// ([`Gateway::fetch_messages`]), as after a reconnection.
+    EventsMissed,
     /// The connection dropped; the gateway is reconnecting.
     Disconnected,
     /// The session ended. The gateway stopped; the user must log in again.
@@ -262,13 +275,21 @@ pub enum RequestError {
         /// With `STALE_EPOCH`, the group's current epoch when known.
         current_epoch: u64,
     },
-    /// No answer came in time, the connection being up.
+    /// Never sent, and never will be: the gateway was not connected, or the
+    /// request waited too long to be sent. The instance knows nothing of it:
+    /// it may be sent again as it is, and no attempt is spent.
+    #[error("the request was not sent")]
+    NotSent,
+    /// Sent, and no answer came in time while connected. The result is
+    /// unknown: the instance may have handled it. A message may be sent
+    /// again (idempotent by `client_message_id`); a commit may not be taken
+    /// for lost: the sequence says whether it was accepted (ADR 0019, task
+    /// 10a).
     #[error("the instance did not answer in time")]
     TimedOut,
-    /// Not connected, or the connection dropped before the answer. Nothing
-    /// says whether the instance handled it: a request is safe to send
-    /// again (messages are idempotent by `client_message_id`).
-    #[error("the gateway is not connected")]
+    /// Sent, and the connection dropped before the answer. The result is
+    /// unknown, as for [`RequestError::TimedOut`].
+    #[error("the connection dropped before the answer")]
     Disconnected,
     /// An answer of another kind than the request's.
     #[error("the instance gave an unexpected answer")]
@@ -277,11 +298,55 @@ pub enum RequestError {
 
 type Reply = oneshot::Sender<Result<ServerPayload, RequestError>>;
 
+/// Where a request is: waiting to be sent, sent, or abandoned by its caller
+/// before it was sent (then it never is). One compare-and-swap decides
+/// between the connection sending it and its caller giving up.
+#[derive(Debug, Default)]
+struct RequestState(AtomicU8);
+
+impl RequestState {
+    const QUEUED: u8 = 0;
+    const SENT: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// The connection takes it to send: `false` if its caller gave up.
+    fn send(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::SENT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Its caller gives up: `true` if it was not sent, and never will be.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn was_sent(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::SENT
+    }
+}
+
 #[derive(Debug)]
 enum Command {
     AckDeviceList,
     AckSecurityNotices(Vec<Uuid>),
-    Request(ClientPayload, Reply),
+    Request {
+        payload: ClientPayload,
+        reply: Reply,
+        state: Arc<RequestState>,
+    },
 }
 
 /// Handle to the background connection. Dropping it closes the connection.
@@ -289,6 +354,7 @@ enum Command {
 pub struct Gateway {
     commands: mpsc::Sender<Command>,
     connected: Arc<AtomicBool>,
+    request_timeout: Duration,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -303,6 +369,15 @@ impl Gateway {
     pub(crate) fn start(
         url: Url,
         session_token: B64,
+    ) -> Result<(Self, mpsc::Receiver<GatewayEvent>), ClientError> {
+        Self::start_with(url, session_token, REQUEST_TIMEOUT)
+    }
+
+    /// [`Gateway::start`], requests waiting `request_timeout` at most.
+    fn start_with(
+        url: Url,
+        session_token: B64,
+        request_timeout: Duration,
     ) -> Result<(Self, mpsc::Receiver<GatewayEvent>), ClientError> {
         // One TLS provider for the whole client; a no-op if already installed.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -321,6 +396,7 @@ impl Gateway {
             Self {
                 commands,
                 connected,
+                request_timeout,
                 task,
             },
             event_queue,
@@ -332,21 +408,42 @@ impl Gateway {
         self.connected.load(Ordering::Acquire)
     }
 
-    /// Sends a request and waits for its answer, at most
-    /// [`REQUEST_TIMEOUT`]. Refused at once while not connected.
+    /// Sends a request and waits for its answer: [`REQUEST_TIMEOUT`] at
+    /// most in all, the wait to be sent included. Not sent while the gateway
+    /// is not connected ([`RequestError::NotSent`]); a request its caller
+    /// gave up on before it was sent is never sent.
     pub async fn request(&self, payload: ClientPayload) -> Result<ServerPayload, RequestError> {
         if !self.is_connected() {
-            return Err(RequestError::Disconnected);
+            return Err(RequestError::NotSent);
         }
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let state = Arc::new(RequestState::default());
         let (reply, answer) = oneshot::channel();
-        self.commands
-            .send(Command::Request(payload, reply))
+        let command = Command::Request {
+            payload,
+            reply,
+            state: Arc::clone(&state),
+        };
+        if tokio::time::timeout_at(deadline, self.commands.send(command))
             .await
-            .map_err(|_| RequestError::Disconnected)?;
-        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+            .map_or(true, |sent| sent.is_err())
+        {
+            return Err(RequestError::NotSent);
+        }
+        match tokio::time::timeout_at(deadline, answer).await {
             Ok(Ok(answer)) => answer,
-            Ok(Err(_)) => Err(RequestError::Disconnected),
-            Err(_) => Err(RequestError::TimedOut),
+            // Dropped by the connection: unsent (it was down), or sent and
+            // then lost with it.
+            Ok(Err(_)) => Err(if state.was_sent() {
+                RequestError::Disconnected
+            } else {
+                RequestError::NotSent
+            }),
+            Err(_) => Err(if state.abandon() {
+                RequestError::NotSent
+            } else {
+                RequestError::TimedOut
+            }),
         }
     }
 
@@ -416,7 +513,7 @@ impl Gateway {
     /// that already announced devices are not reported again.
     pub async fn ack_device_list(&self) -> Result<(), ClientError> {
         self.commands
-            .send(Command::AckDeviceList)
+            .send_timeout(Command::AckDeviceList, self.request_timeout)
             .await
             .map_err(|_| ClientError::Interrupted)
     }
@@ -427,7 +524,10 @@ impl Gateway {
         // One frame names a bounded number of notices.
         for chunk in notice_ids.chunks(MAX_SECURITY_NOTICE_ACKS) {
             self.commands
-                .send(Command::AckSecurityNotices(chunk.to_vec()))
+                .send_timeout(
+                    Command::AckSecurityNotices(chunk.to_vec()),
+                    self.request_timeout,
+                )
                 .await
                 .map_err(|_| ClientError::Interrupted)?;
         }
@@ -467,8 +567,10 @@ async fn run(
         up.store(false, Ordering::Release);
         // Requests sent while it was down get no answer: they fail now.
         while let Ok(command) = commands.try_recv() {
-            if let Command::Request(_, reply) = command {
-                let _ = reply.send(Err(RequestError::Disconnected));
+            if let Command::Request { reply, state, .. } = command
+                && state.abandon()
+            {
+                let _ = reply.send(Err(RequestError::NotSent));
             }
         }
         match ended {
@@ -613,6 +715,7 @@ async fn connection(
             security_notices,
             instance_generation: ready.instance_generation,
             key_packages_remaining: ready.key_packages_remaining,
+            server_time_ms: ready.server_time_ms,
         })
         .await
         .is_err()
@@ -633,10 +736,21 @@ async fn connection(
     // Requests waiting for their answer. Dropped with the connection: their
     // callers get `Disconnected`.
     let mut pending: HashMap<u64, Reply> = HashMap::new();
+    // Events dropped because the application did not keep up: it is told
+    // with `EventsMissed` as soon as there is room.
+    let mut missed = false;
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                // Requests whose callers stopped waiting: no answer will be
+                // read for them.
+                pending.retain(|_, reply| !reply.is_closed());
+                // Events missed while the application had no room: told as
+                // soon as it has, even if no other event comes.
+                if missed && events.try_send(GatewayEvent::EventsMissed).is_ok() {
+                    missed = false;
+                }
                 request_id += 1;
                 let frame = encode(request_id, ClientPayload::Heartbeat(proto::Heartbeat {}));
                 if socket.send(frame).await.is_err() {
@@ -645,7 +759,11 @@ async fn connection(
             }
             command = commands.recv() => {
                 let payload = match command {
-                    Some(Command::Request(payload, reply)) => {
+                    Some(Command::Request { payload, reply, state }) => {
+                        // Its caller gave up before it could be sent: never.
+                        if !state.send() {
+                            continue;
+                        }
                         request_id += 1;
                         if socket.send(encode(request_id, payload)).await.is_err() {
                             let _ = reply.send(Err(RequestError::Disconnected));
@@ -737,13 +855,52 @@ async fn connection(
                     // does not know: nothing to tell the application.
                     _ => None,
                 };
-                if let Some(event) = event
-                    && events.send(event).await.is_err()
-                {
-                    return Ended::Stopped;
+                if let Some(event) = event {
+                    match deliver(events, event, &mut missed) {
+                        Delivered::Yes | Delivered::Dropped => {}
+                        Delivered::Gone => return Ended::Stopped,
+                    }
                 }
             }
         }
+    }
+}
+
+/// What became of an event.
+enum Delivered {
+    Yes,
+    /// The queue was full: dropped, and `EventsMissed` owed.
+    Dropped,
+    /// The application dropped its receiver.
+    Gone,
+}
+
+/// Hands an event to the application without ever waiting for it: the
+/// connection's loop keeps reading answers and sending heartbeats whatever
+/// the application does. Events are notifications (`protocol.md`, section
+/// 3): when the queue is full, the event is dropped, and the application is
+/// told with [`GatewayEvent::EventsMissed`] first thing once there is room,
+/// so that it reads the sequences again.
+fn deliver(
+    events: &mpsc::Sender<GatewayEvent>,
+    event: GatewayEvent,
+    missed: &mut bool,
+) -> Delivered {
+    use mpsc::error::TrySendError;
+    if *missed {
+        match events.try_send(GatewayEvent::EventsMissed) {
+            Ok(()) => *missed = false,
+            Err(TrySendError::Full(_)) => return Delivered::Dropped,
+            Err(TrySendError::Closed(_)) => return Delivered::Gone,
+        }
+    }
+    match events.try_send(event) {
+        Ok(()) => Delivered::Yes,
+        Err(TrySendError::Full(_)) => {
+            *missed = true;
+            Delivered::Dropped
+        }
+        Err(TrySendError::Closed(_)) => Delivered::Gone,
     }
 }
 
@@ -809,7 +966,305 @@ mod tests {
         )
         .await
         .expect("answered at once");
-        assert_eq!(answer, Err(RequestError::Disconnected));
+        assert_eq!(answer, Err(RequestError::NotSent));
+    }
+
+    /// What a fake instance does with each frame of the client after its
+    /// `Ready`: the frames to send back, or `None` to close.
+    type Script = Box<dyn FnMut(proto::ClientFrame) -> Option<Vec<proto::ServerFrame>> + Send>;
+
+    fn server_frame(request_id: u64, payload: ServerPayload) -> proto::ServerFrame {
+        proto::ServerFrame {
+            request_id,
+            payload: Some(payload),
+        }
+    }
+
+    fn ack(request_id: u64) -> proto::ServerFrame {
+        server_frame(request_id, ServerPayload::Ack(proto::Ack {}))
+    }
+
+    /// A fake instance on the loopback: answers `Hello` with `Ready`
+    /// (heartbeats every second), then follows `script`. Returns the
+    /// gateway's URL, and the frames the client sent.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the handshake callback's type is tungstenite's"
+    )]
+    async fn fake_instance(
+        mut script: Script,
+    ) -> (Url, Arc<std::sync::Mutex<Vec<proto::ClientFrame>>>) {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "ws://{}/gateway/v1",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |_: &Request, mut response: Response| {
+                    response.headers_mut().insert(
+                        "sec-websocket-protocol",
+                        GATEWAY_SUBPROTOCOL.parse().unwrap(),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let send = |frame: proto::ServerFrame| Message::Binary(frame.encode_to_vec().into());
+            let Some(Ok(Message::Binary(hello))) = socket.next().await else {
+                return;
+            };
+            let hello = proto::ClientFrame::decode(hello.as_ref()).unwrap();
+            let ready = proto::Ready {
+                limits: Some(proto::Limits {
+                    heartbeat_interval_ms: 1_000,
+                    ..proto::Limits::default()
+                }),
+                ..proto::Ready::default()
+            };
+            socket
+                .send(send(server_frame(
+                    hello.request_id,
+                    ServerPayload::Ready(ready),
+                )))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Binary(bytes) = message else {
+                    continue;
+                };
+                let frame = proto::ClientFrame::decode(bytes.as_ref()).unwrap();
+                log.lock().unwrap().push(frame.clone());
+                match script(frame) {
+                    Some(frames) => {
+                        for frame in frames {
+                            if socket.send(send(frame)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    None => return,
+                }
+            }
+        });
+        (url, received)
+    }
+
+    /// Connects a gateway to `url`; requests wait `timeout` at most.
+    async fn connected(url: Url, timeout: Duration) -> (Gateway, mpsc::Receiver<GatewayEvent>) {
+        let (gateway, mut events) = Gateway::start_with(url, B64(vec![0; 32]), timeout).unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            GatewayEvent::Connected { .. }
+        ));
+        (gateway, events)
+    }
+
+    fn is_heartbeat(frame: &proto::ClientFrame) -> bool {
+        matches!(frame.payload, Some(ClientPayload::Heartbeat(_)))
+    }
+
+    /// Review of task 10a, point 16: a request gets its answer; an answer of
+    /// another kind is `Unexpected`; an answer to an identifier nobody waits
+    /// for is ignored.
+    #[tokio::test]
+    async fn answers_reach_their_request_and_nothing_else() {
+        let (url, _) = fake_instance(Box::new(|frame| {
+            Some(match frame.payload {
+                Some(ClientPayload::FetchGroupInfo(_)) => vec![ack(frame.request_id)],
+                Some(ClientPayload::FetchMessages(_)) => vec![
+                    ack(999),
+                    server_frame(
+                        frame.request_id,
+                        ServerPayload::MessageBatch(proto::MessageBatch::default()),
+                    ),
+                ],
+                _ => Vec::new(),
+            })
+        }))
+        .await;
+        let (gateway, _events) = connected(url, REQUEST_TIMEOUT).await;
+        assert_eq!(
+            gateway
+                .fetch_messages(proto::FetchMessages::default())
+                .await,
+            Ok(proto::MessageBatch::default())
+        );
+        assert_eq!(
+            gateway
+                .fetch_group_info(proto::FetchGroupInfo::default())
+                .await,
+            Err(RequestError::Unexpected)
+        );
+    }
+
+    /// Review of task 10a, points 3 and 16: a request sent and left without
+    /// an answer is `TimedOut` (its result unknown); one sent when the
+    /// connection drops is `Disconnected`.
+    #[tokio::test]
+    async fn an_unanswered_request_times_out_and_a_lost_one_is_disconnected() {
+        let (url, _) = fake_instance(Box::new(|frame| match frame.payload {
+            Some(ClientPayload::FetchMessages(_)) => Some(Vec::new()),
+            Some(ClientPayload::FetchGroupInfo(_)) => None,
+            _ => Some(Vec::new()),
+        }))
+        .await;
+        let (gateway, _events) = connected(url, Duration::from_millis(300)).await;
+        assert_eq!(
+            gateway
+                .fetch_messages(proto::FetchMessages::default())
+                .await,
+            Err(RequestError::TimedOut)
+        );
+        assert_eq!(
+            gateway
+                .fetch_group_info(proto::FetchGroupInfo::default())
+                .await,
+            Err(RequestError::Disconnected)
+        );
+    }
+
+    /// Review of task 10a, point 3: a request its caller gave up on before
+    /// it could be sent is never sent.
+    #[test]
+    fn an_abandoned_request_is_never_sent() {
+        let state = RequestState::default();
+        assert!(state.abandon());
+        assert!(!state.send());
+        let state = RequestState::default();
+        assert!(state.send());
+        assert!(!state.abandon(), "sent first: its result is unknown");
+        assert!(state.was_sent());
+    }
+
+    /// Review of task 10a, point 3, in the connection's loop: a request
+    /// whose caller gave up while it waited in the queue is not sent; the
+    /// next one is.
+    #[tokio::test]
+    async fn the_connection_skips_an_abandoned_request() {
+        let (url, received) = fake_instance(Box::new(|frame| {
+            Some(match frame.payload {
+                Some(ClientPayload::FetchMessages(_)) => vec![server_frame(
+                    frame.request_id,
+                    ServerPayload::MessageBatch(proto::MessageBatch::default()),
+                )],
+                _ => Vec::new(),
+            })
+        }))
+        .await;
+        let (gateway, _events) = connected(url, REQUEST_TIMEOUT).await;
+        let state = Arc::new(RequestState::default());
+        assert!(state.abandon());
+        let (reply, _answer) = oneshot::channel();
+        gateway
+            .commands
+            .send(Command::Request {
+                payload: ClientPayload::FetchGroupInfo(proto::FetchGroupInfo::default()),
+                reply,
+                state,
+            })
+            .await
+            .unwrap();
+        assert!(
+            gateway
+                .fetch_messages(proto::FetchMessages::default())
+                .await
+                .is_ok()
+        );
+        let sent = received.lock().unwrap().clone();
+        assert!(
+            sent.iter()
+                .all(|frame| !matches!(frame.payload, Some(ClientPayload::FetchGroupInfo(_)))),
+            "the abandoned request was sent"
+        );
+        assert!(
+            sent.iter()
+                .any(|frame| matches!(frame.payload, Some(ClientPayload::FetchMessages(_))))
+        );
+    }
+
+    /// Review of task 10a, point 4: a burst of events the application does
+    /// not read blocks neither the answers nor the heartbeats; the events
+    /// that did not fit are dropped, and the application is told
+    /// (`EventsMissed`).
+    #[tokio::test]
+    async fn a_burst_of_events_never_blocks_the_connection() {
+        let (url, received) = fake_instance(Box::new(|frame| {
+            Some(match frame.payload {
+                Some(ClientPayload::FetchMessages(_)) => {
+                    let mut frames: Vec<_> = (1..=300)
+                        .map(|seq| {
+                            server_frame(
+                                0,
+                                ServerPayload::CommitEvent(proto::CommitEvent {
+                                    message: Some(proto::StoredMessage {
+                                        seq,
+                                        ..proto::StoredMessage::default()
+                                    }),
+                                }),
+                            )
+                        })
+                        .collect();
+                    frames.push(server_frame(
+                        frame.request_id,
+                        ServerPayload::MessageBatch(proto::MessageBatch::default()),
+                    ));
+                    frames
+                }
+                Some(ClientPayload::Heartbeat(_)) => vec![server_frame(
+                    frame.request_id,
+                    ServerPayload::HeartbeatAck(proto::HeartbeatAck::default()),
+                )],
+                _ => Vec::new(),
+            })
+        }))
+        .await;
+        let (gateway, mut events) = connected(url, Duration::from_secs(5)).await;
+        // Nobody reads the events meanwhile.
+        assert!(
+            gateway
+                .fetch_messages(proto::FetchMessages::default())
+                .await
+                .is_ok()
+        );
+        let heartbeats = || {
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|frame| is_heartbeat(frame))
+                .count()
+        };
+        let before = heartbeats();
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(heartbeats() > before, "the heartbeats went on");
+
+        let mut sequenced = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                GatewayEvent::Sequenced(_) => sequenced += 1,
+                GatewayEvent::EventsMissed => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(sequenced < 300, "{sequenced}");
+        // Room again: told what it missed, at the next heartbeat at most.
+        let told = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if events.recv().await == Some(GatewayEvent::EventsMissed) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(told.is_ok(), "never told of the missed events");
     }
 
     /// An answer is the request's payload, or the instance's refusal with

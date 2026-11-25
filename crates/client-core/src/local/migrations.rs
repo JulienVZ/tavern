@@ -67,7 +67,20 @@ const V2_MLS: &str = "
     ) STRICT;
 ";
 
-pub(super) const MIGRATIONS: &[&str] = &[V1_STORE_INFO, V2_MLS];
+const V3_KEY_PACKAGE_UPLOADS: &str = "
+    -- Whether a KeyPackage was sent to the instance at least once: then
+    -- the instance may hold it, even if a later send was refused, and its
+    -- private parts are kept until it can no longer be used.
+    ALTER TABLE key_packages ADD COLUMN sent INTEGER NOT NULL DEFAULT 0 CHECK (sent IN (0, 1));
+
+    -- Small values of this device's state, by name.
+    CREATE TABLE client_state (
+        name  TEXT    PRIMARY KEY,
+        value INTEGER NOT NULL
+    ) STRICT;
+";
+
+pub(super) const MIGRATIONS: &[&str] = &[V1_STORE_INFO, V2_MLS, V3_KEY_PACKAGE_UPLOADS];
 
 /// The schema version this client writes.
 pub const LATEST_VERSION: u32 = MIGRATIONS.len() as u32;
