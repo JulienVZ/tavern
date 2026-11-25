@@ -305,20 +305,20 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
         // Checked again once the connection is registered: a session that
         // ended between the Hello and the registration had nothing to close
         // yet (`Registry::end_session`).
-        if !session_is_live(&state, &session).await {
-            return Ok(None);
+        if let Some(code) = session_ended_code(&state, &session).await {
+            return Ok(Err(code));
         }
         let notices = notices::pending(&state, &session).await?;
         let key_packages = key_packages::remaining(&state.db, session.device_id).await?;
         let generation = restore::generation(&state.db).await?;
-        Ok::<_, crate::error::ApiError>(Some((notices, key_packages, generation)))
+        Ok::<_, crate::error::ApiError>(Ok((notices, key_packages, generation)))
     };
     let (security_notices, key_packages_remaining, instance_generation) =
         match failed(panics::guard(pending).await) {
-            Ok(Some(pending)) => pending,
-            Ok(None) => {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(code)) => {
                 drop(registered);
-                close(socket, close_code::SESSION_REVOKED).await;
+                close(socket, code).await;
                 return;
             }
             Err(code) => {
@@ -558,8 +558,8 @@ async fn on_message(
     }
     // Every request, reads included: a session that ended without its
     // connection being told (it was not registered yet) is caught here.
-    if !session_is_live(state, session).await {
-        return Next::Close(close_code::SESSION_REVOKED);
+    if let Some(code) = session_ended_code(state, session).await {
+        return Next::Close(code);
     }
     let reply = match request.payload {
         Some(ClientPayload::SubmitCommit(request)) => answer(
@@ -658,11 +658,14 @@ async fn acknowledge_notices(
     }
 }
 
-/// Whether the session behind a connection still exists and is usable. A
-/// live connection is the device's activity, as a REST request is: recorded
-/// at most once an hour ([`session::touch`]), so that a device connected for
-/// longer than `TAVERN_DEVICE_INACTIVE_DAYS` is never removed as inactive.
-async fn session_is_live(state: &AppState, session: &Session) -> bool {
+/// Whether the session behind a connection still exists and is usable:
+/// `None` if it does, otherwise the close code. A live connection is the
+/// device's activity, as a REST request is: recorded at most once an hour
+/// ([`session::touch`]), so that a device connected for longer than
+/// `TAVERN_DEVICE_INACTIVE_DAYS` is never removed as inactive. A database
+/// that cannot tell lets nothing through: the connection closes with 1011,
+/// and the client connects again (4003 would sign it out).
+async fn session_ended_code(state: &AppState, session: &Session) -> Option<u16> {
     let live: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
         "SELECT s.last_used_at < now() - interval '1 hour' FROM sessions s \
              JOIN devices d ON d.id = s.device_id \
@@ -681,11 +684,13 @@ async fn session_is_live(state: &AppState, session: &Session) -> bool {
             {
                 tracing::error!(%error, "cannot record a connected device's activity");
             }
-            true
+            None
         }
-        Ok(None) => false,
-        // A database hiccup must not log everyone out.
-        Err(_) => true,
+        Ok(None) => Some(close_code::SESSION_REVOKED),
+        Err(error) => {
+            tracing::error!(%error, "cannot check a connection's session");
+            Some(close_code::INTERNAL_ERROR)
+        }
     }
 }
 

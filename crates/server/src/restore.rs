@@ -45,15 +45,15 @@ pub const SEQUENCE_JUMP: i64 = 1 << 32;
 /// The marker's file, in `TAVERN_DATA_DIR`.
 pub const MARKER_FILE: &str = "instance-marker";
 /// How often the marker is brought up to date, when something changed.
-pub const MARKER_INTERVAL: Duration = Duration::from_secs(10);
+pub const MARKER_INTERVAL: Duration = Duration::from_secs(1);
 
 const MARKER_HEADER: &str = "tavern-instance-marker 1";
 
 /// What the server last saw of its database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Marker {
-    /// The database it was (`instance_state.instance_id`): a marker of
-    /// another database tells nothing about this one.
+    /// The database it was (`instance_state.instance_id`): a database
+    /// that finds the marker of another is handled as restored.
     pub instance_id: Uuid,
     /// The instance generation.
     pub generation: i64,
@@ -175,17 +175,19 @@ async fn changes(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
     Ok(if called { last } else { 0 })
 }
 
-/// What the database is now, as the marker records it.
+/// What the database is now, as the marker records it: one query, which
+/// is all the marker loop costs each second when nothing changed.
 pub async fn current(db: &PgPool) -> Result<Marker, sqlx::Error> {
-    let mut conn = db.acquire().await?;
-    let (instance_id, generation): (Uuid, i64) =
-        sqlx::query_as("SELECT instance_id, generation FROM instance_state")
-            .fetch_one(&mut *conn)
-            .await?;
+    let (instance_id, generation, last, called): (Uuid, i64, i64, bool) = sqlx::query_as(
+        "SELECT s.instance_id, s.generation, c.last_value, c.is_called \
+         FROM instance_state s, instance_changes c",
+    )
+    .fetch_one(db)
+    .await?;
     Ok(Marker {
         instance_id,
         generation,
-        changes: changes(&mut conn).await?,
+        changes: if called { last } else { 0 },
     })
 }
 
@@ -363,29 +365,34 @@ pub async fn handle(db: &PgPool, marker: Option<Marker>) -> Result<Start, sqlx::
     .fetch_one(&mut *tx)
     .await?;
     let changes = changes(&mut tx).await?;
-    let marker = match marker {
-        Some(marker) if marker.instance_id != instance_id => {
-            tracing::warn!(
-                "the instance marker is for another database: it is replaced, and does not \
-                 tell whether this one was restored"
-            );
-            None
-        }
-        marker => marker,
-    };
-    let behind = marker.is_some_and(|marker| {
-        generation < marker.generation
-            || (generation == marker.generation && changes < marker.changes)
-    });
+    // A marker of another database: this database may be a backup of the
+    // instance restored on a new volume, or a new instance on an old one.
+    // Handled as a restore: a false alarm costs every device a sign-in.
+    let foreign = marker.is_some_and(|marker| marker.instance_id != instance_id);
+    if foreign {
+        tracing::warn!(
+            "the instance marker in TAVERN_DATA_DIR was written for another database: this \
+             database is handled as restored from a backup (every session revoked, every \
+             conversation's group to recreate). If it is a new database on an old data \
+             volume, nothing is lost but a sign-in on every device"
+        );
+    }
+    let behind = foreign
+        || marker.is_some_and(|marker| {
+            generation < marker.generation
+                || (generation == marker.generation && changes < marker.changes)
+        });
     let recorded = generation > handled;
     if !behind && !recorded {
         tx.rollback().await?;
         return Ok(Start::Unchanged);
     }
-    // Above every generation the devices may have seen.
+    // A new generation (`restore.sh` raised it already), above every
+    // generation the devices may have seen.
+    let new_generation = if recorded { generation } else { generation + 1 };
     let new_generation = match marker {
-        Some(marker) if generation <= marker.generation => marker.generation + 1,
-        _ => generation,
+        Some(marker) if new_generation <= marker.generation => marker.generation + 1,
+        _ => new_generation,
     };
     // `restore.sh` records the date of the backup it restores; otherwise
     // the last change the server recorded before the backup stands for it,

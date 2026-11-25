@@ -354,26 +354,35 @@ async fn an_older_backup_gets_a_generation_never_seen() {
     drop_database(&url).await;
 }
 
-/// The marker of another database tells nothing about this one: it is
-/// replaced, and nothing is handled. A data directory the server cannot
-/// write to stops the start-up.
+/// Section 15: a database that finds the marker of another (a backup
+/// restored on a new volume, or a new instance on an old one) is handled as
+/// restored: every session revoked, a generation above both, and the
+/// marker replaced by its own. A false alarm costs a sign-in. A data
+/// directory the server cannot write to stops the start-up.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
-async fn a_marker_of_another_database_tells_nothing() {
+async fn a_marker_of_another_database_is_handled_as_a_restore() {
     let url = fresh_database().await;
     let app = TestApp::spawn_on(&url, |_| {}).await;
     let dir = tempfile::tempdir().unwrap();
+    let (_, alice1) = app.account_with_device("rs", false).await;
     let current = restore::current(&app.state.db).await.unwrap();
     let elsewhere = Marker {
         instance_id: uuid::Uuid::new_v4(),
         generation: 5,
-        changes: current.changes + 1_000,
+        changes: 1,
     };
     restore::write_marker(dir.path(), elsewhere).unwrap();
     let (start, marker) = restore::at_start(&app.state.db, dir.path()).await.unwrap();
-    assert_eq!(start, Start::Unchanged);
+    let handled = restored(start);
+    assert!(handled.by_marker);
+    assert_eq!(handled.generation, 6);
+    assert!(!signed_in(&app, &alice1).await);
     assert_eq!(marker.instance_id, current.instance_id);
     assert_eq!(restore::read_marker(dir.path()).unwrap(), Some(marker));
+    // Its own marker now: the next start finds nothing.
+    let (start, _) = restore::at_start(&app.state.db, dir.path()).await.unwrap();
+    assert_eq!(start, Start::Unchanged);
 
     let file = dir.path().join("not-a-directory");
     std::fs::write(&file, "").unwrap();

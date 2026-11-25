@@ -746,38 +746,21 @@ async fn a_session_revoked_while_its_connection_opens_closes_it() {
     .execute(&app.state.db)
     .await
     .unwrap();
-    let name = format!("revoke_{}", device.device_id.simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
-           IF NEW.id = '{}' THEN \
-             UPDATE sessions SET revoked_at = now() WHERE device_id = NEW.id; \
-           END IF; RETURN NULL; END $$",
-        device.device_id
-    )))
-    .execute(&app.state.db)
-    .await
-    .unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TRIGGER {name} AFTER UPDATE ON devices FOR EACH ROW EXECUTE FUNCTION {name}()"
-    )))
-    .execute(&app.state.db)
-    .await
-    .unwrap();
+    // Dropped even if the test panics.
+    let trigger = Trigger::install_on(
+        &app,
+        "devices",
+        "UPDATE",
+        &format!("NEW.id = '{}'", device.device_id),
+        "UPDATE sessions SET revoked_at = now() WHERE device_id = NEW.id;",
+    )
+    .await;
 
     let mut socket = open(&app, Some(GATEWAY_SUBPROTOCOL)).await.unwrap();
     send(&mut socket, 1, hello(&device.session_token)).await;
     let closed = expect_close(&mut socket).await;
 
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP TRIGGER {name} ON devices"
-    )))
-    .execute(&app.state.db)
-    .await
-    .unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {name}()")))
-        .execute(&app.state.db)
-        .await
-        .unwrap();
+    trigger.remove(&app).await;
     assert_eq!(closed, Some(close_code::SESSION_REVOKED));
 }
 
@@ -811,4 +794,47 @@ async fn a_revoked_session_reads_nothing_through_a_connection_still_open() {
             }
         }
     }
+}
+
+/// Section 6: a database that cannot tell whether a session is live lets
+/// nothing through. The connection closes with 1011, and the client
+/// connects again: 4003 would sign it out for a fault of the server.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_session_that_cannot_be_checked_lets_nothing_through() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, _alice1, _, mut bob1, _) = group_of_two(&app).await;
+    app.state.db.close().await;
+    send_raw(&mut bob1, 7, ClientPayload::Heartbeat(proto::Heartbeat {})).await;
+    loop {
+        match common::ws::receive(&mut bob1.socket).await {
+            common::ws::Received::Closed(code) => {
+                assert_eq!(code, Some(close_code::INTERNAL_ERROR));
+                break;
+            }
+            common::ws::Received::Frame(frame) => {
+                assert_eq!(frame.request_id, 0, "the request was answered: {frame:?}");
+            }
+        }
+    }
+}
+
+/// The tests' triggers are dropped with their guard, as when a test panics
+/// before it removes them: none is left behind for the other tests.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_trigger_is_dropped_with_its_guard() {
+    let app = TestApp::spawn_unlimited().await;
+    let trigger = Trigger::install_on(&app, "devices", "UPDATE", "false", "NULL;").await;
+    let name = trigger.name.clone();
+    drop(trigger);
+    let left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM pg_trigger WHERE tgname = $1) \
+              + (SELECT count(*) FROM pg_proc WHERE proname = $1)",
+    )
+    .bind(&name)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
 }

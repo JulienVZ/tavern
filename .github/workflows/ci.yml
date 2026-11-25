@@ -421,6 +421,54 @@ jobs:
           echo "SELECT generation, handled_generation FROM instance_state" | sql | tee state.txt
           grep -qx '2|2' state.txt
           echo "SELECT count(*) FROM sessions WHERE revoked_at IS NULL" | sql | grep -qx 0
+      - name: A database restored under the running server stops it, and its restart handles it
+        working-directory: deploy
+        run: |
+          sql() {
+            docker compose exec -T postgres sh -c \
+              'psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"'
+          }
+          server() { docker compose ps -q server; }
+          # In the backup, a live session; revoked after it.
+          sql <<'SQL'
+          WITH u AS (
+              INSERT INTO users (handle, display_name, opaque_suite, opaque_record, identity_key,
+                                 identity_key_wrapped_pw, identity_key_wrapped_rk)
+              VALUES ('ci_hot', 'CI', 1, '\x00', '\x00', '\x00', '\x00') RETURNING id
+          ), d AS (
+              INSERT INTO devices (user_id, signature_key, certificate, platform)
+              SELECT id, '\x03', '\x00', 3 FROM u RETURNING id
+          )
+          INSERT INTO sessions (device_id, token_hash, expires_at)
+          SELECT id, '\x04', now() + interval '1 day' FROM d;
+          SQL
+          ./scripts/backup.sh
+          rm -rf hot && mkdir hot
+          tar -xzf "$(ls backups/*.tar.gz | tail -n 1)" -C hot
+          echo "UPDATE sessions SET revoked_at = now() WHERE token_hash = '\x04'" | sql
+          # The marker follows the revocation (it checks every second).
+          sleep 3
+          restarts=$(docker inspect --format '{{.RestartCount}}' "$(server)")
+          # Restored by hand, the server running: the revoked session is live
+          # again, the counter of changes behind the marker.
+          docker compose exec -T postgres sh -c \
+            'pg_restore --clean --if-exists --no-owner --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+            < hot/*/db.dump
+          # The server stops in error, and Docker starts it again.
+          now=$restarts
+          for attempt in $(seq 1 60); do
+            now=$(docker inspect --format '{{.RestartCount}}' "$(server)")
+            [ "$now" -gt "$restarts" ] && break
+            sleep 2
+          done
+          test "$now" -gt "$restarts"
+          docker compose logs server | grep -q "went back in time"
+          docker compose up -d --wait --wait-timeout 120
+          # Its next start handled the restore: a new generation, the
+          # session revoked again.
+          echo "SELECT generation, handled_generation FROM instance_state" | sql | tee state.txt
+          grep -qx '3|3' state.txt
+          echo "SELECT count(*) FROM sessions WHERE revoked_at IS NULL" | sql | grep -qx 0
       - name: Show logs on failure
         if: failure()
         working-directory: deploy

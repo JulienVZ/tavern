@@ -84,6 +84,14 @@ instance_schema=${instance_schema:-0}
 backup_schema=$(docker compose exec -T postgres \
     pg_restore --data-only --table=_sqlx_migrations --file=- <"$dir/db.dump" |
     newest_migration_in_dump_listing)
+# Migration 0014 holds what records a restore (instance_state): an older
+# backup could not be told restored, on this machine or a new one.
+if [ "$backup_schema" -lt 14 ]; then
+    echo "restore.sh: this backup was made by a version of Tavern too old to be restored" \
+        "(database schema $backup_schema, before 14): the server could not tell that its" \
+        "database was restored." >&2
+    exit 1
+fi
 if [ "$instance_schema" -ne 0 ] && [ "$backup_schema" -lt "$instance_schema" ]; then
     echo "restore.sh: this backup was made by an older version of Tavern (database schema" \
         "$backup_schema, this instance: $instance_schema). Restoring it over this database" \
@@ -108,9 +116,14 @@ if docker compose ps --status running --services | grep -qx server; then
 fi
 
 echo "Restoring PostgreSQL..."
-docker compose exec -T postgres sh -c \
+if ! docker compose exec -T postgres sh -c \
     'pg_restore --clean --if-exists --no-owner --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-    <"$dir/db.dump"
+    <"$dir/db.dump"; then
+    echo "restore.sh: pg_restore failed (its errors are above). The database may be partly" \
+        "restored, and the restore is not recorded. The server is left stopped: do not start" \
+        "it on this database. Fix the cause, then run restore.sh again with the same backup." >&2
+    exit 1
+fi
 
 taken_at=$(backup_date "$dir")
 if [ -z "$taken_at" ]; then
@@ -118,19 +131,17 @@ if [ -z "$taken_at" ]; then
 fi
 
 echo "Recording the restore..."
-# The schema of the dump is the instance's (checked above), so the table
-# exists.
-docker compose exec -T postgres sh -c \
+# The dump's schema is 14 or later (checked above): instance_state exists.
+if ! docker compose exec -T postgres sh -c \
     'psql --quiet --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' <<SQL
-DO \$\$
-BEGIN
-    IF to_regclass('instance_state') IS NOT NULL THEN
-        UPDATE instance_state SET generation = generation + 1,
-            backup_taken_at = NULLIF('$taken_at', '')::timestamptz;
-    END IF;
-END
-\$\$;
+UPDATE instance_state SET generation = generation + 1,
+    backup_taken_at = NULLIF('$taken_at', '')::timestamptz;
 SQL
+then
+    echo "restore.sh: the database is restored, but the restore could not be recorded (the" \
+        "error is above). The server is left stopped: run restore.sh again with the same backup." >&2
+    exit 1
+fi
 
 docker compose up -d
 echo "Restore complete."

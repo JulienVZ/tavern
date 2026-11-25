@@ -657,44 +657,108 @@ pub async fn hold_cursor(
     (tx, pid)
 }
 
-/// A trigger that runs `body` (PL/pgSQL) after each row inserted into
-/// `table` for `conversation`, and for no other: the tests share one
-/// database. It makes a request fail, or wait, at a precise point.
+/// A trigger that runs `body` (PL/pgSQL) after each row written to `table`
+/// that `when` holds for, and for no other: the tests share one database.
+/// It makes a request fail, or wait, or race, at a precise point. Dropped
+/// with its function by [`Trigger::remove`], or, if the test panics before,
+/// when the guard is dropped: never left behind for the other tests.
 pub struct Trigger {
     pub name: String,
     pub table: &'static str,
+    options: sqlx::postgres::PgConnectOptions,
+    removed: bool,
 }
 
 impl Trigger {
+    /// After each row inserted into `table` for `conversation`.
     pub async fn install(
         app: &TestApp,
         table: &'static str,
         conversation: Uuid,
         body: &str,
     ) -> Self {
+        Self::install_on(
+            app,
+            table,
+            "INSERT",
+            &format!("NEW.conversation_id = '{conversation}'"),
+            body,
+        )
+        .await
+    }
+
+    /// After each row `event` writes to `table` for which `when` holds.
+    pub async fn install_on(
+        app: &TestApp,
+        table: &'static str,
+        event: &str,
+        when: &str,
+        body: &str,
+    ) -> Self {
         let name = format!("test_{}", Uuid::new_v4().simple());
-        // Built from a random name, a table and a body of this file, and a
-        // UUID: nothing from outside.
+        // Built from a random name, and from a table, an event, a condition
+        // and a body of the tests: nothing from outside.
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS \
              $$ BEGIN {body} RETURN NULL; END $$; \
-             CREATE TRIGGER {name} AFTER INSERT ON {table} FOR EACH ROW \
-             WHEN (NEW.conversation_id = '{conversation}') EXECUTE FUNCTION {name}();"
+             CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW \
+             WHEN ({when}) EXECUTE FUNCTION {name}();"
         )))
         .execute(&app.state.db)
         .await
         .unwrap();
-        Self { name, table }
+        Self {
+            name,
+            table,
+            options: (*app.state.db.connect_options()).clone(),
+            removed: false,
+        }
     }
 
-    pub async fn remove(self, app: &TestApp) {
-        let Self { name, table } = self;
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP TRIGGER {name} ON {table}; DROP FUNCTION {name}();"
-        )))
-        .execute(&app.state.db)
-        .await
-        .unwrap();
+    fn drop_sql(&self) -> String {
+        format!(
+            "DROP TRIGGER IF EXISTS {name} ON {table}; DROP FUNCTION IF EXISTS {name}();",
+            name = self.name,
+            table = self.table
+        )
+    }
+
+    pub async fn remove(mut self, app: &TestApp) {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(self.drop_sql()))
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+        self.removed = true;
+    }
+}
+
+impl Drop for Trigger {
+    fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
+        // A test that panicked: its runtime may be gone, so a runtime of
+        // its own, on a thread of its own, with a connection of its own.
+        let sql = self.drop_sql();
+        let options = self.options.clone();
+        let _ = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async {
+                use sqlx::Connection as _;
+                if let Ok(mut connection) = sqlx::PgConnection::connect_with(&options).await {
+                    let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                        .execute(&mut connection)
+                        .await;
+                    let _ = connection.close().await;
+                }
+            });
+        })
+        .join();
     }
 }
 
