@@ -927,6 +927,24 @@ impl PublicState {
             .collect()
     }
 
+    /// The leaves still as their KeyPackage made them, never updated, each
+    /// with the end of the package's lifetime (seconds since the Unix
+    /// epoch). Once one is over, OpenMLS refuses to join the group: the
+    /// server asks to remove such a leaf 7 days before (section 3).
+    pub fn key_package_leaves(&self) -> Vec<(u32, u64)> {
+        self.group
+            .members()
+            .filter_map(
+                |member| match self.group.leaf(member.index)?.leaf_node_source() {
+                    openmls::treesync::LeafNodeSource::KeyPackage(lifetime) => {
+                        Some((member.index.u32(), lifetime.not_after()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
     /// The leaf of a device, if it is in the group.
     pub fn leaf_of(&self, device: VerifiedLeaf) -> Option<LeafNodeIndex> {
         policy::named_leaves(self.group.members())

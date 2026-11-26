@@ -108,6 +108,7 @@ impl From<ClientError> for CommandError {
             ClientError::LocalStore(LocalStoreError::TooNew { .. }) => {
                 Self::code("local_store_too_new")
             }
+            ClientError::LocalStore(LocalStoreError::ProfileInUse) => Self::code("profile_in_use"),
             ClientError::LocalStore(_) => Self::code("local_store_unavailable"),
             ClientError::ClockSkew { .. } => Self::code("clock_skew"),
             ClientError::Crypto(_) | ClientError::Mls(_) | ClientError::Interrupted => {

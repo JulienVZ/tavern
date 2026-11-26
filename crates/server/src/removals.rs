@@ -11,11 +11,24 @@
 //! takes no application message until a member commits the removal
 //! (`REMOVAL_PENDING`).
 //!
+//! The server also removes a leaf still as its KeyPackage made it, never
+//! updated, 7 days before the end of its lifetime
+//! ([`LEAF_EXPIRY_MARGIN_DAYS`]): once it is over, OpenMLS refuses every
+//! join of the group, by Welcome and by external commit. Such a leaf is a
+//! device that never processed its Welcome, or never updated since; once
+//! removed, it rejoins by external commit if it is active
+//! (`JoinConversation`), as any device left out (ADR 0019, section 3).
+//!
 //! A revocation and the disabling of an account ask for their removals
 //! right after their own transaction, which cannot fail because of them;
 //! the hourly [`sweep`] asks for any that is missing (an inactive device, or
 //! a server stopped in between). Asking twice changes nothing: one proposal
 //! per device and group.
+
+/// Days before the end of its lifetime at which the server asks to remove a
+/// leaf still as its KeyPackage made it (ADR 0019, section 3): once that
+/// lifetime is over, OpenMLS refuses to join the group.
+pub const LEAF_EXPIRY_MARGIN_DAYS: i32 = 7;
 
 use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::{ServerSigner, VerifiedLeaf};
@@ -65,20 +78,22 @@ pub async fn remove_user_devices(state: &AppState, user: Uuid) -> Result<usize, 
 
 /// Asks for every removal that is missing: each leaf whose device is no
 /// longer active (revoked, of a disabled account, or away for longer than
-/// `TAVERN_DEVICE_INACTIVE_DAYS`) and that the server has not asked to
-/// remove yet. Returns the number of proposals issued. A failure in one
-/// conversation is logged and does not stop the others.
+/// `TAVERN_DEVICE_INACTIVE_DAYS`), and each leaf never updated whose
+/// lifetime ends within [`LEAF_EXPIRY_MARGIN_DAYS`], that the server has not
+/// asked to remove yet. Returns the number of proposals issued. A failure
+/// in one conversation is logged and does not stop the others.
 pub async fn sweep(state: &AppState) -> Result<usize, StateError> {
     let leaves: Vec<(Uuid, Uuid)> = sqlx::query_as(concat!(
         "SELECT c.conversation_id, c.device_id FROM conversation_devices c \
          JOIN devices d ON d.id = c.device_id JOIN users u ON u.id = d.user_id \
-         WHERE c.left_seq IS NULL AND NOT (",
+         WHERE c.left_seq IS NULL AND (NOT (",
         activity::active_device!("$1"),
-        ") AND ",
+        ") OR c.leaf_expires_at <= now() + make_interval(days => $2)) AND ",
         delivery::not_cut_off!("c"),
         " ORDER BY c.conversation_id, c.device_id"
     ))
     .bind(activity::window(state.settings.device_inactive_days))
+    .bind(LEAF_EXPIRY_MARGIN_DAYS)
     .fetch_all(&state.db)
     .await?;
     let mut issued = 0;

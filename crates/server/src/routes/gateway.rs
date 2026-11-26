@@ -309,7 +309,8 @@ async fn serve(state: AppState, socket: WebSocket, translate: Translate) {
             return Ok(Err(code));
         }
         let notices = notices::pending(&state, &session).await?;
-        let key_packages = key_packages::remaining(&state.db, session.device_id).await?;
+        let key_packages =
+            key_packages::remaining(&state.db, session.device_id, &state.settings).await?;
         let generation = restore::generation(&state.db).await?;
         Ok::<_, crate::error::ApiError>(Ok((notices, key_packages, generation)))
     };

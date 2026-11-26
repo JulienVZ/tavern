@@ -32,13 +32,33 @@ use crate::panics;
 use crate::routes::friends;
 use crate::session::Session;
 
-/// The one-time packages a claim may serve: not served already, not
-/// expired, nor about to be (the device that claims one must still be able to add it to
-/// a group). A string literal, for `concat!`: queries stay static.
-macro_rules! servable {
-    () => {
-        "served_at IS NULL AND expires_at > now() + interval '1 hour'"
+/// Whether a package lives long enough to be served: at least the
+/// retention and 7 days more ([`serving_margin_days`]), bound as `$m`. The
+/// Welcome made with it may wait the retention for its device, and the leaf
+/// it makes must be updated, or removed by the server 7 days before its end
+/// (ADR 0019, section 3): a leaf past its lifetime blocks every join of its
+/// group. A string literal, for `concat!`: queries stay static.
+macro_rules! lives_long_enough {
+    ($m:literal) => {
+        concat!("expires_at > now() + make_interval(days => ", $m, ")")
     };
+}
+
+/// The one-time packages a claim may serve: not served already, and living
+/// long enough ([`lives_long_enough`]).
+macro_rules! servable {
+    ($m:literal) => {
+        concat!("served_at IS NULL AND ", lives_long_enough!($m))
+    };
+}
+
+/// Days a package must still live to be served: the retention of messages,
+/// and the 7 days before its end at which the server asks to remove a leaf
+/// never updated (37 by default; ADR 0019, section 3).
+pub fn serving_margin_days(message_retention_days: u32) -> i32 {
+    i32::try_from(message_retention_days)
+        .unwrap_or(i32::MAX)
+        .saturating_add(crate::removals::LEAF_EXPIRY_MARGIN_DAYS)
 }
 
 fn refused(error: &KeyPackageError) -> ApiError {
@@ -58,13 +78,20 @@ fn refused(error: &KeyPackageError) -> ApiError {
     ApiError::new(ErrorCode::InvalidKeyPackage, message)
 }
 
-/// One-time packages of `device` that a claim can still serve.
-pub(crate) async fn remaining<'c>(db: impl PgExecutor<'c>, device: Uuid) -> ApiResult<u32> {
+/// One-time packages of `device` that a claim can still serve: a package
+/// that no longer lives long enough is not counted, so that the device
+/// replaces it.
+pub(crate) async fn remaining<'c>(
+    db: impl PgExecutor<'c>,
+    device: Uuid,
+    settings: &crate::Settings,
+) -> ApiResult<u32> {
     let count: i64 = sqlx::query_scalar(concat!(
         "SELECT count(*) FROM key_packages WHERE device_id = $1 AND NOT last_resort AND ",
-        servable!()
+        servable!("$2")
     ))
     .bind(device)
+    .bind(serving_margin_days(settings.message_retention_days))
     .fetch_one(db)
     .await?;
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -225,7 +252,7 @@ pub(crate) async fn upload(
             "a device keeps at most 200 KeyPackages on the server",
         ));
     }
-    let one_time = remaining(&mut *tx, device).await?;
+    let one_time = remaining(&mut *tx, device, &state.settings).await?;
     tx.commit().await?;
     Ok(Json(KeyPackageCount { one_time }))
 }
@@ -242,7 +269,7 @@ pub(crate) async fn count(
     State(state): State<AppState>,
     session: Session,
 ) -> ApiResult<Json<KeyPackageCount>> {
-    let one_time = remaining(&state.db, session.device_id).await?;
+    let one_time = remaining(&state.db, session.device_id, &state.settings).await?;
     Ok(Json(KeyPackageCount { one_time }))
 }
 
@@ -295,6 +322,7 @@ pub(crate) async fn claim(
     .fetch_all(&mut *tx)
     .await?;
 
+    let margin = serving_margin_days(state.settings.message_retention_days);
     let mut served = Vec::with_capacity(devices.len());
     let mut low = Vec::new();
     for device in devices {
@@ -305,13 +333,14 @@ pub(crate) async fn claim(
             "WITH taken AS ( \
                  SELECT id, key_package FROM key_packages \
                  WHERE device_id = $1 AND NOT last_resort AND ",
-            servable!(),
+            servable!("$2"),
             " ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE key_packages k SET served_at = now(), key_package = '\\x' \
              FROM taken WHERE k.id = taken.id \
              RETURNING taken.key_package"
         ))
         .bind(device)
+        .bind(margin)
         .fetch_optional(&mut *tx)
         .await?;
         // The last resort is served again and again, and keeps its bytes;
@@ -319,13 +348,14 @@ pub(crate) async fn claim(
         let package = match one_time {
             Some(package) => Some(package),
             None => {
-                sqlx::query_scalar(
+                sqlx::query_scalar(concat!(
                     "UPDATE key_packages SET served_at = COALESCE(served_at, now()) \
-                     WHERE device_id = $1 AND last_resort \
-                       AND expires_at > now() + interval '1 hour' \
-                     RETURNING key_package",
-                )
+                     WHERE device_id = $1 AND last_resort AND ",
+                    lives_long_enough!("$2"),
+                    " RETURNING key_package"
+                ))
                 .bind(device)
+                .bind(margin)
                 .fetch_optional(&mut *tx)
                 .await?
             }
@@ -333,7 +363,7 @@ pub(crate) async fn claim(
         let Some(package) = package else {
             continue;
         };
-        let left = remaining(&mut *tx, device).await?;
+        let left = remaining(&mut *tx, device, &state.settings).await?;
         if usize::try_from(left).unwrap_or(usize::MAX) < LOW_WATERMARK {
             low.push((device, left));
         }

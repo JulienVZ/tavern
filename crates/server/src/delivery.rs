@@ -166,6 +166,7 @@ fn commit_refused(error: MlsError, current_epoch: u64) -> Refused {
         | MlsError::Padding(_)
         | MlsError::Malformed
         | MlsError::Parameters
+        | MlsError::Expired
         | MlsError::UnexpectedGroup => Refused::invalid_commit(),
     }
 }
@@ -551,11 +552,14 @@ async fn settle_removals(
 /// Writes the group's devices as the merged tree has them, `seq` being the
 /// commit that made it so: a device gone leaves at it, a device that joins,
 /// or that came back under another leaf (a resync), reads the sequence
-/// after it.
+/// after it. Each leaf still as its KeyPackage made it (`expiring`) has the
+/// end of its lifetime, for the removal asked 7 days before
+/// ([`crate::removals::sweep`]); the others have none.
 async fn sync_leaves(
     conn: &mut PgConnection,
     conversation: Uuid,
     leaves: &[(u32, VerifiedLeaf)],
+    expiring: &[(u32, u64)],
     seq: i64,
 ) -> Result<()> {
     let devices: Vec<Uuid> = leaves
@@ -592,6 +596,26 @@ async fn sync_leaves(
     .bind(&devices)
     .bind(&indexes)
     .bind(seq)
+    .execute(&mut *conn)
+    .await?;
+    let (expiring_leaves, ends): (Vec<i32>, Vec<i64>) = expiring
+        .iter()
+        .map(|(leaf, end)| {
+            (
+                i32::try_from(*leaf).unwrap_or(i32::MAX),
+                i64::try_from(*end).unwrap_or(i64::MAX),
+            )
+        })
+        .unzip();
+    sqlx::query(
+        "UPDATE conversation_devices c SET leaf_expires_at = ( \
+             SELECT to_timestamp(t.ends) FROM unnest($2::integer[], $3::bigint[]) AS t(leaf, ends) \
+             WHERE t.leaf = c.leaf_index) \
+         WHERE c.conversation_id = $1 AND c.left_seq IS NULL",
+    )
+    .bind(conversation)
+    .bind(&expiring_leaves)
+    .bind(&ends)
     .execute(conn)
     .await?;
     Ok(())
@@ -807,7 +831,7 @@ pub async fn submit_commit(
         members(&mut tx, conversation).await?
     };
 
-    let (old_epoch, new_epoch, leaves, reissued, still_pending, welcomed, packages) =
+    let (old_epoch, new_epoch, (leaves, expiring), reissued, still_pending, welcomed, packages) =
         match (first, current) {
             (Some(identity), _) => {
                 // A new group adds leaves: between friends only.
@@ -825,6 +849,7 @@ pub async fn submit_commit(
                 )
                 .map_err(|error| commit_refused(error, 0))?;
                 let leaves = public.leaves();
+                let expiring = public.key_package_leaves();
                 let added = public
                     .leaf_keys()
                     .into_iter()
@@ -848,7 +873,7 @@ pub async fn submit_commit(
                 (
                     0,
                     1,
-                    leaves,
+                    (leaves, expiring),
                     Vec::new(),
                     Vec::new(),
                     devices,
@@ -908,7 +933,7 @@ pub async fn submit_commit(
                         &ServerSigner::new(&state.secrets.external_sender),
                     )
                     .map_err(|error| commit_refused(error, epoch))?;
-                let leaves = loaded.state.leaves();
+                let leaves = (loaded.state.leaves(), loaded.state.key_package_leaves());
                 let still_pending = loaded
                     .state
                     .pending_removals()
@@ -974,7 +999,7 @@ pub async fn submit_commit(
         ));
     }
     settle_removals(&mut tx, conversation, &still_pending, &moved).await?;
-    sync_leaves(&mut tx, conversation, &leaves, commit.seq).await?;
+    sync_leaves(&mut tx, conversation, &leaves, &expiring, commit.seq).await?;
     let welcomes: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "INSERT INTO welcomes (conversation_id, recipient_device_id, payload, expires_at) \
          SELECT $1, device, $3, now() + make_interval(days => $4) FROM unnest($2::uuid[]) AS device \

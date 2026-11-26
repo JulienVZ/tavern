@@ -133,6 +133,15 @@ pub enum MlsError {
     /// participants.
     #[error("not the expected group")]
     UnexpectedGroup,
+    /// A leaf of the group's tree, still as its KeyPackage made it, has
+    /// outlived the package's lifetime: OpenMLS refuses to join such a group,
+    /// by Welcome or by external commit. Not an alarm, and not this
+    /// device's fault: the group can be joined again once a member commits
+    /// the server's `Remove` of that leaf, which the server asks for 7 days
+    /// before its end (section 3). The device shows it and waits for
+    /// `JoinConversation`, never trying again in a loop.
+    #[error("a leaf of the group has outlived its KeyPackage")]
+    Expired,
     /// OpenMLS refused or failed. Its errors carry no secret.
     #[error("MLS: {0}")]
     Library(String),
@@ -187,6 +196,21 @@ pub enum Refusal {
 
 pub(crate) fn library(error: impl std::fmt::Display) -> MlsError {
     MlsError::Library(error.to_string())
+}
+
+/// OpenMLS's refusal of a tree in which a leaf outlived its KeyPackage
+/// ([`MlsError::Expired`]), or another of its errors.
+pub(crate) fn tree_error<S: std::fmt::Display>(
+    error: openmls::prelude::CreationFromExternalError<S>,
+) -> MlsError {
+    use openmls::prelude::CreationFromExternalError;
+    use openmls::treesync::errors::LeafNodeValidationError;
+    match error {
+        CreationFromExternalError::LeafNodeValidation(LeafNodeValidationError::Lifetime(_)) => {
+            MlsError::Expired
+        }
+        other => library(other),
+    }
 }
 
 /// Classifies OpenMLS's refusal of an incoming message.
@@ -434,6 +458,12 @@ pub(crate) fn create_config(
 ) -> Result<MlsGroupCreateConfig, MlsError> {
     Ok(MlsGroupCreateConfig::builder()
         .ciphersuite(CIPHERSUITE)
+        // The creator's leaf is made as a KeyPackage's would be, with a
+        // lifetime (OpenMLS's default is 84 days): the same as this
+        // device's packages, and replaced by its first update (section 3).
+        .lifetime(openmls::prelude::Lifetime::new(
+            key_package::LIFETIME_SECONDS,
+        ))
         .capabilities(capabilities())
         .padding_size(PADDING_SIZE)
         .max_past_epochs(MAX_PAST_EPOCHS)

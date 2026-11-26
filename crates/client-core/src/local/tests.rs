@@ -663,12 +663,13 @@ async fn an_upgraded_store_runs_mls_operations() {
     }
 }
 
-/// Review of task 10a, point 11: a reader in another connection keeps the
-/// journal from being emptied: `erase_journal` tries again, then says so
-/// (`Busy`) rather than reporting it emptied; once the reader is gone, the
-/// next call empties it.
+/// Review of task 10a, point 11, and problem F of its check: a reader in
+/// another connection keeps the journal from being emptied. `erase_journal`
+/// waits for it briefly, never holding the store for seconds, says so
+/// (`Busy`) and remembers it; the store closing, the reader gone, empties
+/// it, as the next upkeep would.
 #[tokio::test]
-async fn an_incomplete_checkpoint_is_reported() {
+async fn an_incomplete_checkpoint_is_reported_and_completed_later() {
     let dir = tempfile::tempdir().unwrap();
     let path = store_path(&dir);
     let store = LocalStore::open_unencrypted(&path, binding(), NOW_MS).unwrap();
@@ -693,14 +694,66 @@ async fn an_incomplete_checkpoint_is_reported() {
         })
         .await
         .unwrap();
+    let started = std::time::Instant::now();
     assert!(matches!(
         store.erase_journal().await,
         Err(LocalStoreError::Busy)
     ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(store.journal_to_erase());
+    // Meanwhile the store works.
+    assert_eq!(pragma(&store, "journal_mode").await, "wal");
+
+    // The next upkeep, the reader gone.
+    reader.execute_batch("COMMIT;").unwrap();
+    store.erase_journal().await.unwrap();
+    assert!(!store.journal_to_erase());
+    let wal = path.with_file_name(format!("{DATABASE_FILE}-wal"));
+    let wal_len = || std::fs::metadata(&wal).map_or(0, |metadata| metadata.len());
+    assert_eq!(wal_len(), 0, "the journal is emptied");
+
+    // Or the closing of the store.
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM probe;")
+        .unwrap();
+    store
+        .run(|connection| {
+            connection
+                .execute_batch("INSERT INTO probe VALUES (3);")
+                .map_err(|error| super::database(&error))
+        })
+        .await
+        .unwrap();
+    assert!(store.erase_journal().await.is_err());
     reader.execute_batch("COMMIT;").unwrap();
     drop(reader);
-    store.erase_journal().await.unwrap();
-    let wal = path.with_file_name(format!("{DATABASE_FILE}-wal"));
-    let wal_len = std::fs::metadata(&wal).map_or(0, |metadata| metadata.len());
-    assert_eq!(wal_len, 0, "the journal is emptied");
+    store.close();
+    assert_eq!(wal_len(), 0, "emptied at closing");
+}
+
+/// One window per profile (decided 2026-11-26): a second hold of the same
+/// profile is refused while the first lasts, and taken once it is
+/// released; another profile is independent.
+#[test]
+fn a_profile_is_held_by_one_window_at_a_time() {
+    use super::ProfileLock;
+    let dir = tempfile::tempdir().unwrap();
+    let first = ProfileLock::acquire(dir.path(), Some("bob")).unwrap();
+    assert!(matches!(
+        ProfileLock::acquire(dir.path(), Some("bob")),
+        Err(LocalStoreError::ProfileInUse)
+    ));
+    let other = ProfileLock::acquire(dir.path(), Some("alice-2")).unwrap();
+    let default = ProfileLock::acquire(dir.path(), None).unwrap();
+    assert!(matches!(
+        ProfileLock::acquire(dir.path(), None),
+        Err(LocalStoreError::ProfileInUse)
+    ));
+    drop(first);
+    let again = ProfileLock::acquire(dir.path(), Some("bob")).unwrap();
+    drop((again, other, default));
 }

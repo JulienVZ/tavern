@@ -764,11 +764,6 @@ impl std::fmt::Debug for Client {
     }
 }
 
-/// How far this device's clock may be from the instance's before the
-/// KeyPackages it builds are refused (OpenMLS starts their lifetime an hour
-/// in the past).
-const CLOCK_TOLERANCE_MS: u64 = 3600 * 1000;
-
 impl Client {
     fn auth(&self) -> Auth<'_> {
         Auth::Session(&self.session_token)
@@ -846,14 +841,16 @@ impl Client {
     }
 
     async fn keep_key_packages_up(&self, replace_last_resort: bool) -> Result<(), ClientError> {
-        if let Some(refused_at) = key_packages::refused_at(&self.local).await? {
-            match self.clock_skew_ms() {
-                Some(skew) if skew.unsigned_abs() > CLOCK_TOLERANCE_MS => {
-                    if now_ms().saturating_sub(refused_at) < key_packages::REFUSAL_BACKOFF_MS {
-                        return Err(ClientError::ClockSkew { offset_ms: skew });
-                    }
-                }
-                _ => key_packages::set_refused_at(&self.local, None).await?,
+        let refused_at = key_packages::refused_at(&self.local).await?;
+        match key_packages::clock_gate(refused_at, self.clock_skew_ms(), now_ms()) {
+            key_packages::ClockGate::Go => {}
+            key_packages::ClockGate::ClockRight => {
+                key_packages::set_refused_at(&self.local, None).await?;
+            }
+            // Measured at the next connection, whose upkeep follows.
+            key_packages::ClockGate::NotMeasured => return Ok(()),
+            key_packages::ClockGate::Skewed(offset_ms) => {
+                return Err(ClientError::ClockSkew { offset_ms });
             }
         }
         let certificate = self.certificate().await?;
@@ -886,7 +883,7 @@ impl Client {
             Ok(_) => Ok(()),
             Err(error) => match self.clock_skew_ms() {
                 Some(skew)
-                    if skew.unsigned_abs() > CLOCK_TOLERANCE_MS
+                    if skew.unsigned_abs() > key_packages::CLOCK_TOLERANCE_MS
                         && error.api_code() == Some(ErrorCode::InvalidKeyPackage) =>
                 {
                     key_packages::set_refused_at(&self.local, Some(now_ms())).await?;

@@ -4175,3 +4175,259 @@ fn a_forgotten_key_package_cannot_be_joined_with() {
     // Forgetting what is not there changes nothing.
     key_package::forget(&bob3.provider, &reference).unwrap();
 }
+
+/// A one-time KeyPackage of `device` valid `seconds` from now, in real
+/// time (OpenMLS checks lifetimes against the system clock).
+fn short_lived(device: &Device, seconds: u64) -> KeyPackage {
+    key_package::build_with_lifetime(
+        &device.provider,
+        &device.signer(),
+        device.credential(),
+        seconds,
+    )
+    .unwrap()
+}
+
+/// How long the short-lived packages below live, and how long the tests
+/// wait for them to be over.
+const SHORT_LIFETIME: u64 = 2;
+const PAST_IT: std::time::Duration = std::time::Duration::from_secs(SHORT_LIFETIME + 1);
+
+/// Section 3, in real time: a Welcome processed once its KeyPackage's
+/// lifetime is over is refused, as `Expired`, whatever private parts the
+/// device still holds. Keeping them past the lifetime would serve nothing.
+#[test]
+fn a_welcome_processed_after_its_package_expired_is_refused() {
+    let (alice, bob) = (Account::new(1), Account::new(2));
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let joiner = bob.device(0xb1);
+    let short = short_lived(&joiner, SHORT_LIFETIME);
+    let (_, commit) = Group::create(
+        &creator.provider,
+        &creator.signer(),
+        creator.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[claim(&joiner, &short, &pins)],
+        &pins,
+    )
+    .unwrap();
+    std::thread::sleep(PAST_IT);
+    let joined = Group::join(
+        &joiner.provider,
+        &commit.welcome.unwrap(),
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    );
+    assert!(
+        matches!(joined, Err(MlsError::Expired)),
+        "{:?}",
+        joined.err()
+    );
+}
+
+/// Section 3, in real time: a leaf added from a package and never updated
+/// blocks every join once its lifetime is over, by Welcome and by external
+/// commit, although members still commit; the server's `Remove` of that
+/// leaf, committed by a member, unblocks the group.
+#[test]
+fn an_expired_leaf_blocks_joins_until_its_removal_is_committed() {
+    let (alice, bob) = (Account::new(1), Account::new(2));
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let absent = bob.device(0xb1);
+    let short = short_lived(&absent, SHORT_LIFETIME);
+    let (mut group, _) = Group::create(
+        &creator.provider,
+        &creator.signer(),
+        creator.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[claim(&absent, &short, &pins)],
+        &pins,
+    )
+    .unwrap();
+    group.merge_pending_commit(&creator.provider).unwrap();
+    std::thread::sleep(PAST_IT);
+
+    // A member still commits: OpenMLS checks the new package only.
+    let second = bob.device(0xb2);
+    let added = group
+        .add(
+            &creator.provider,
+            &creator.signer(),
+            &[second.claimed(&pins)],
+            &pins,
+        )
+        .unwrap();
+    group.merge_pending_commit(&creator.provider).unwrap();
+    // Nobody joins any more.
+    let joined = Group::join(
+        &second.provider,
+        &added.welcome.unwrap(),
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    );
+    assert!(
+        matches!(joined, Err(MlsError::Expired)),
+        "{:?}",
+        joined.err()
+    );
+    let third = bob.device(0xb3);
+    let external = Group::join_by_external_commit(
+        &third.provider,
+        &third.signer(),
+        third.credential(),
+        &added.group_info,
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    );
+    assert!(
+        matches!(external, Err(MlsError::Expired)),
+        "{:?}",
+        external.err()
+    );
+
+    // The server's removal of the expired leaf, committed by Alice.
+    let removed = group.leaf_of(&absent.user_id, &absent.device_id).unwrap();
+    let proposal = ExternalProposal::new_remove::<TestProvider>(
+        removed,
+        group.inner_mut().group_id().clone(),
+        group.inner_mut().epoch(),
+        &ServerSigner::new(&server),
+        SenderExtensionIndex::new(0),
+    )
+    .unwrap()
+    .tls_serialize_detached()
+    .unwrap();
+    assert_eq!(
+        group.process(&creator.provider, &proposal, &pins).unwrap(),
+        Incoming::Proposal
+    );
+    let removal = group
+        .commit_pending_proposals(&creator.provider, &creator.signer(), &pins)
+        .unwrap()
+        .expect("the removal is pending");
+    group.merge_pending_commit(&creator.provider).unwrap();
+
+    // Joins work again, by Welcome and by external commit.
+    let fourth = bob.device(0xb4);
+    let added = group
+        .add(
+            &creator.provider,
+            &creator.signer(),
+            &[fourth.claimed(&pins)],
+            &pins,
+        )
+        .unwrap();
+    group.merge_pending_commit(&creator.provider).unwrap();
+    Group::join(
+        &fourth.provider,
+        &added.welcome.unwrap(),
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    Group::join_by_external_commit(
+        &third.provider,
+        &third.signer(),
+        third.credential(),
+        &added.group_info,
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    drop(removal);
+}
+
+/// Section 3: a device that joins by Welcome holds the leaf its KeyPackage
+/// made, with that package's lifetime, until its first update; so does the
+/// creator, whose first commit has no path. The server's public state lists
+/// such leaves with the end of their lifetime (90 days).
+#[test]
+fn a_leaf_from_a_key_package_is_known_until_its_first_update() {
+    let (alice, bob) = (Account::new(1), Account::new(2));
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let joiner = bob.device(0xb1);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (mut created, commit) = Group::create(
+        &creator.provider,
+        &creator.signer(),
+        creator.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[joiner.claimed(&pins)],
+        &pins,
+    )
+    .unwrap();
+    created.merge_pending_commit(&creator.provider).unwrap();
+    assert!(
+        created.own_leaf_from_key_package(),
+        "the creator's leaf too"
+    );
+
+    let (state, _) = PublicState::create(
+        &commit.group_info,
+        &expected(),
+        creator.leaf(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    let mut leaves: Vec<u32> = [creator.leaf(), joiner.leaf()]
+        .into_iter()
+        .map(|leaf| state.leaf_of(leaf).unwrap().u32())
+        .collect();
+    leaves.sort_unstable();
+    let listed = state.key_package_leaves();
+    assert_eq!(
+        listed.iter().map(|(leaf, _)| *leaf).collect::<Vec<_>>(),
+        leaves
+    );
+    let lifetime =
+        before + key_package::LIFETIME_SECONDS..=before + key_package::LIFETIME_SECONDS + 5;
+    assert!(
+        listed.iter().all(|(_, end)| lifetime.contains(end)),
+        "{listed:?}"
+    );
+    created
+        .self_update(&creator.provider, &creator.signer(), &pins)
+        .unwrap();
+    created.merge_pending_commit(&creator.provider).unwrap();
+    assert!(
+        !created.own_leaf_from_key_package(),
+        "replaced by the update"
+    );
+
+    let mut joined = Group::join(
+        &joiner.provider,
+        &commit.welcome.unwrap(),
+        &expected(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap()
+    .group;
+    assert!(joined.own_leaf_from_key_package());
+    joined
+        .self_update(&joiner.provider, &joiner.signer(), &pins)
+        .unwrap();
+    joined.merge_pending_commit(&joiner.provider).unwrap();
+    assert!(
+        !joined.own_leaf_from_key_package(),
+        "replaced by the update"
+    );
+}

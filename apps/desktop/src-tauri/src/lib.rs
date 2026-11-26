@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tavern_client_core::local::{LocalStoreError, ProfileLock};
 use tavern_client_core::password::{self, PasswordStrength};
 use tavern_client_core::qr::{self, QrMatrix};
 use tavern_client_core::{
@@ -54,6 +55,9 @@ struct Shell {
     /// Separates several accounts on one computer (`TAVERN_PROFILE`), for
     /// development: two clients can then run side by side.
     profile: Option<String>,
+    /// This window's hold of the profile, for as long as it runs; `Err`
+    /// when another window has it, and every account operation is refused.
+    profile_lock: std::result::Result<ProfileLock, LocalStoreError>,
     session: Mutex<Session>,
 }
 
@@ -318,6 +322,14 @@ async fn probe_instance(
     shell: State<'_, Shell>,
     url: String,
 ) -> Result<InstanceProbe> {
+    // One window per profile: the first command of every start.
+    if let Err(error) = &shell.profile_lock {
+        return Err(ClientError::LocalStore(match error {
+            LocalStoreError::ProfileInUse => LocalStoreError::ProfileInUse,
+            _ => LocalStoreError::Database("the profile cannot be locked".to_owned()),
+        })
+        .into());
+    }
     let instance_url = InstanceUrl::parse(&url)?;
     let health = fetch_health(&instance_url).await?;
     let version = fetch_version(&instance_url).await?;
@@ -699,9 +711,11 @@ pub fn run() -> std::result::Result<(), tauri::Error> {
             // Local, not roaming, on Windows: the store is useless on any other
             // computer, its key being this device's.
             let local_data = app.path().app_local_data_dir()?;
+            let profile_lock = ProfileLock::acquire(&local_data, profile.as_deref());
             app.manage(Shell {
                 store: Arc::new(KeychainStore::new(&identifier)),
                 local_data,
+                profile_lock,
                 profile,
                 session: Mutex::new(Session::default()),
             });

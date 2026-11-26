@@ -573,25 +573,34 @@ async fn run(
                 let _ = reply.send(Err(RequestError::NotSent));
             }
         }
-        match ended {
-            Ended::Stopped => return,
-            Ended::Session(reason) => {
-                let _ = events.send(GatewayEvent::SessionEnded(reason)).await;
-                return;
-            }
-            Ended::Dropped => {
-                if connected {
-                    backoff = BACKOFF_MIN;
-                    if events.send(GatewayEvent::Disconnected).await.is_err() {
-                        return;
-                    }
-                }
-            }
+        if connected {
+            backoff = BACKOFF_MIN;
         }
         // Exponential backoff with jitter, so that the clients of an instance
         // do not all reconnect at the same instant after a restart.
         let jitter = u64::from(token::random_bytes::<1>()[0]) * 4;
-        tokio::time::sleep(backoff + Duration::from_millis(jitter)).await;
+        let reconnect_at = tokio::time::Instant::now() + backoff + Duration::from_millis(jitter);
+        match ended {
+            Ended::Stopped => return,
+            // The task ends: nothing to keep alive while it waits.
+            Ended::Session(reason) => {
+                let _ = events.send(GatewayEvent::SessionEnded(reason)).await;
+                return;
+            }
+            // Told while it waits to reconnect, never longer: an
+            // application without room learns it from the next `Connected`,
+            // which is never lost and tells everything again.
+            Ended::Dropped if connected => {
+                if let Ok(Err(_)) =
+                    tokio::time::timeout_at(reconnect_at, events.send(GatewayEvent::Disconnected))
+                        .await
+                {
+                    return;
+                }
+            }
+            Ended::Dropped => {}
+        }
+        tokio::time::sleep_until(reconnect_at).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
@@ -692,7 +701,6 @@ async fn connection(
         Err(ended) => return ended,
     };
 
-    *connected = true;
     up.store(true, Ordering::Release);
     let new_devices = ready
         .new_devices
@@ -709,18 +717,24 @@ async fn connection(
         .iter()
         .filter_map(SecurityNotice::from_proto)
         .collect();
-    if events
-        .send(GatewayEvent::Connected {
+    // Never awaited either: if the application has no room for it, the
+    // connection closes, and the next one, with its backoff, tells it all
+    // again (`Ready`).
+    let mut missed = false;
+    match deliver(
+        events,
+        GatewayEvent::Connected {
             new_devices,
             security_notices,
             instance_generation: ready.instance_generation,
             key_packages_remaining: ready.key_packages_remaining,
             server_time_ms: ready.server_time_ms,
-        })
-        .await
-        .is_err()
-    {
-        return Ended::Stopped;
+        },
+        &mut missed,
+    ) {
+        Delivered::Yes => *connected = true,
+        Delivered::Dropped | Delivered::Overflow => return Ended::Dropped,
+        Delivered::Gone => return Ended::Stopped,
     }
 
     let interval = ready
@@ -736,9 +750,8 @@ async fn connection(
     // Requests waiting for their answer. Dropped with the connection: their
     // callers get `Disconnected`.
     let mut pending: HashMap<u64, Reply> = HashMap::new();
-    // Events dropped because the application did not keep up: it is told
-    // with `EventsMissed` as soon as there is room.
-    let mut missed = false;
+    // `missed`: notifications dropped because the application did not keep
+    // up; it is told with `EventsMissed` as soon as there is room.
 
     loop {
         tokio::select! {
@@ -858,6 +871,14 @@ async fn connection(
                 if let Some(event) = event {
                     match deliver(events, event, &mut missed) {
                         Delivered::Yes | Delivered::Dropped => {}
+                        // An event that cannot be read again otherwise: the
+                        // connection closes; the next one's `Ready` gives
+                        // it again, and the engine reads every sequence
+                        // again, as after any reconnection.
+                        Delivered::Overflow => {
+                            tracing::warn!("the application did not keep up: reconnecting");
+                            return Ended::Dropped;
+                        }
                         Delivered::Gone => return Ended::Stopped,
                     }
                 }
@@ -869,37 +890,56 @@ async fn connection(
 /// What became of an event.
 enum Delivered {
     Yes,
-    /// The queue was full: dropped, and `EventsMissed` owed.
+    /// The queue was full: a notification of a sequence, dropped, and
+    /// `EventsMissed` owed.
     Dropped,
+    /// The queue was full, for an event that cannot be dropped: the
+    /// connection must close.
+    Overflow,
     /// The application dropped its receiver.
     Gone,
 }
 
+/// Whether an event may be dropped when the application does not keep up:
+/// only the notifications of a conversation's sequence, which
+/// `FetchMessages` reads again. A closed list: every other kind, and any
+/// kind added later, is never dropped (problem A of the check of the review
+/// of task 10a).
+fn droppable(event: &GatewayEvent) -> bool {
+    matches!(event, GatewayEvent::Sequenced(_))
+}
+
 /// Hands an event to the application without ever waiting for it: the
 /// connection's loop keeps reading answers and sending heartbeats whatever
-/// the application does. Events are notifications (`protocol.md`, section
-/// 3): when the queue is full, the event is dropped, and the application is
-/// told with [`GatewayEvent::EventsMissed`] first thing once there is room,
-/// so that it reads the sequences again.
+/// the application does. When the queue is full, a notification of a
+/// sequence is dropped, and the application is told with
+/// [`GatewayEvent::EventsMissed`] first thing once there is room, so that it
+/// reads the sequences again; any other event closes the connection
+/// ([`Delivered::Overflow`]), whose next `Ready` gives it again.
 fn deliver(
     events: &mpsc::Sender<GatewayEvent>,
     event: GatewayEvent,
     missed: &mut bool,
 ) -> Delivered {
     use mpsc::error::TrySendError;
+    let full = |event: &GatewayEvent, missed: &mut bool| {
+        if droppable(event) {
+            *missed = true;
+            Delivered::Dropped
+        } else {
+            Delivered::Overflow
+        }
+    };
     if *missed {
         match events.try_send(GatewayEvent::EventsMissed) {
             Ok(()) => *missed = false,
-            Err(TrySendError::Full(_)) => return Delivered::Dropped,
+            Err(TrySendError::Full(_)) => return full(&event, missed),
             Err(TrySendError::Closed(_)) => return Delivered::Gone,
         }
     }
     match events.try_send(event) {
         Ok(()) => Delivered::Yes,
-        Err(TrySendError::Full(_)) => {
-            *missed = true;
-            Delivered::Dropped
-        }
+        Err(TrySendError::Full(event)) => full(&event, missed),
         Err(TrySendError::Closed(_)) => Delivered::Gone,
     }
 }
@@ -987,13 +1027,31 @@ mod tests {
     /// A fake instance on the loopback: answers `Hello` with `Ready`
     /// (heartbeats every second), then follows `script`. Returns the
     /// gateway's URL, and the frames the client sent.
+    async fn fake_instance(
+        script: Script,
+    ) -> (Url, Arc<std::sync::Mutex<Vec<proto::ClientFrame>>>) {
+        let (url, received, _) =
+            fake_instance_with(Box::new(|_| proto::Ready::default()), script).await;
+        (url, received)
+    }
+
+    /// The `Ready` of each connection, by its number from 0.
+    type Readies = Box<dyn Fn(usize) -> proto::Ready + Send + Sync>;
+
+    /// [`fake_instance`], accepting connection after connection, each with
+    /// its `Ready` from `readies`, and counting them.
     #[expect(
         clippy::result_large_err,
         reason = "the handshake callback's type is tungstenite's"
     )]
-    async fn fake_instance(
-        mut script: Script,
-    ) -> (Url, Arc<std::sync::Mutex<Vec<proto::ClientFrame>>>) {
+    async fn fake_instance_with(
+        readies: Readies,
+        script: Script,
+    ) -> (
+        Url,
+        Arc<std::sync::Mutex<Vec<proto::ClientFrame>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = Url::parse(&format!(
@@ -1003,58 +1061,73 @@ mod tests {
         .unwrap();
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&received);
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&connections);
+        let script = Arc::new(std::sync::Mutex::new(script));
+        let readies = Arc::new(readies);
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_hdr_async(
-                stream,
-                |_: &Request, mut response: Response| {
-                    response.headers_mut().insert(
-                        "sec-websocket-protocol",
-                        GATEWAY_SUBPROTOCOL.parse().unwrap(),
-                    );
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
-            let send = |frame: proto::ServerFrame| Message::Binary(frame.encode_to_vec().into());
-            let Some(Ok(Message::Binary(hello))) = socket.next().await else {
-                return;
-            };
-            let hello = proto::ClientFrame::decode(hello.as_ref()).unwrap();
-            let ready = proto::Ready {
-                limits: Some(proto::Limits {
-                    heartbeat_interval_ms: 1_000,
-                    ..proto::Limits::default()
-                }),
-                ..proto::Ready::default()
-            };
-            socket
-                .send(send(server_frame(
-                    hello.request_id,
-                    ServerPayload::Ready(ready),
-                )))
-                .await
-                .unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                let Message::Binary(bytes) = message else {
-                    continue;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
                 };
-                let frame = proto::ClientFrame::decode(bytes.as_ref()).unwrap();
-                log.lock().unwrap().push(frame.clone());
-                match script(frame) {
-                    Some(frames) => {
-                        for frame in frames {
-                            if socket.send(send(frame)).await.is_err() {
-                                return;
+                let number = count.fetch_add(1, Ordering::SeqCst);
+                let (log, script, readies) =
+                    (Arc::clone(&log), Arc::clone(&script), Arc::clone(&readies));
+                tokio::spawn(async move {
+                    let mut socket = tokio_tungstenite::accept_hdr_async(
+                        stream,
+                        |_: &Request, mut response: Response| {
+                            response.headers_mut().insert(
+                                "sec-websocket-protocol",
+                                GATEWAY_SUBPROTOCOL.parse().unwrap(),
+                            );
+                            Ok(response)
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let send =
+                        |frame: proto::ServerFrame| Message::Binary(frame.encode_to_vec().into());
+                    let Some(Ok(Message::Binary(hello))) = socket.next().await else {
+                        return;
+                    };
+                    let hello = proto::ClientFrame::decode(hello.as_ref()).unwrap();
+                    let ready = proto::Ready {
+                        limits: Some(proto::Limits {
+                            heartbeat_interval_ms: 1_000,
+                            ..proto::Limits::default()
+                        }),
+                        ..readies(number)
+                    };
+                    socket
+                        .send(send(server_frame(
+                            hello.request_id,
+                            ServerPayload::Ready(ready),
+                        )))
+                        .await
+                        .unwrap();
+                    while let Some(Ok(message)) = socket.next().await {
+                        let Message::Binary(bytes) = message else {
+                            continue;
+                        };
+                        let frame = proto::ClientFrame::decode(bytes.as_ref()).unwrap();
+                        log.lock().unwrap().push(frame.clone());
+                        let answer = (script.lock().unwrap())(frame);
+                        match answer {
+                            Some(frames) => {
+                                for frame in frames {
+                                    if socket.send(send(frame)).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
+                            None => return,
                         }
                     }
-                    None => return,
-                }
+                });
             }
         });
-        (url, received)
+        (url, received, connections)
     }
 
     /// Connects a gateway to `url`; requests wait `timeout` at most.
@@ -1190,41 +1263,45 @@ mod tests {
         );
     }
 
-    /// Review of task 10a, point 4: a burst of events the application does
-    /// not read blocks neither the answers nor the heartbeats; the events
-    /// that did not fit are dropped, and the application is told
+    /// Review of task 10a, point 4, and problem A of its check: a burst of
+    /// notifications of sequences the application does not read blocks
+    /// neither the answers nor the heartbeats, and closes no connection;
+    /// those that did not fit are dropped, and the application is told
     /// (`EventsMissed`).
     #[tokio::test]
     async fn a_burst_of_events_never_blocks_the_connection() {
-        let (url, received) = fake_instance(Box::new(|frame| {
-            Some(match frame.payload {
-                Some(ClientPayload::FetchMessages(_)) => {
-                    let mut frames: Vec<_> = (1..=300)
-                        .map(|seq| {
-                            server_frame(
-                                0,
-                                ServerPayload::CommitEvent(proto::CommitEvent {
-                                    message: Some(proto::StoredMessage {
-                                        seq,
-                                        ..proto::StoredMessage::default()
+        let (url, received, connections) = fake_instance_with(
+            Box::new(|_| proto::Ready::default()),
+            Box::new(|frame| {
+                Some(match frame.payload {
+                    Some(ClientPayload::FetchMessages(_)) => {
+                        let mut frames: Vec<_> = (1..=300)
+                            .map(|seq| {
+                                server_frame(
+                                    0,
+                                    ServerPayload::CommitEvent(proto::CommitEvent {
+                                        message: Some(proto::StoredMessage {
+                                            seq,
+                                            ..proto::StoredMessage::default()
+                                        }),
                                     }),
-                                }),
-                            )
-                        })
-                        .collect();
-                    frames.push(server_frame(
+                                )
+                            })
+                            .collect();
+                        frames.push(server_frame(
+                            frame.request_id,
+                            ServerPayload::MessageBatch(proto::MessageBatch::default()),
+                        ));
+                        frames
+                    }
+                    Some(ClientPayload::Heartbeat(_)) => vec![server_frame(
                         frame.request_id,
-                        ServerPayload::MessageBatch(proto::MessageBatch::default()),
-                    ));
-                    frames
-                }
-                Some(ClientPayload::Heartbeat(_)) => vec![server_frame(
-                    frame.request_id,
-                    ServerPayload::HeartbeatAck(proto::HeartbeatAck::default()),
-                )],
-                _ => Vec::new(),
-            })
-        }))
+                        ServerPayload::HeartbeatAck(proto::HeartbeatAck::default()),
+                    )],
+                    _ => Vec::new(),
+                })
+            }),
+        )
         .await;
         let (gateway, mut events) = connected(url, Duration::from_secs(5)).await;
         // Nobody reads the events meanwhile.
@@ -1265,6 +1342,111 @@ mod tests {
         })
         .await;
         assert!(told.is_ok(), "never told of the missed events");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "no reconnection");
+    }
+
+    /// Problem A of the check of the review of task 10a: an event that no
+    /// request reads again (here `DeviceAdded`), which finds the queue full,
+    /// is never dropped: the connection closes and opens again, with its
+    /// backoff, and the next `Ready` gives the device again.
+    #[tokio::test]
+    async fn an_event_that_cannot_be_dropped_reconnects_instead() {
+        const DEVICE: [u8; 16] = [7; 16];
+        let (url, _, connections) = fake_instance_with(
+            Box::new(|number| proto::Ready {
+                // The instance lists the device not seen yet at every
+                // connection after the first.
+                new_devices: if number == 0 {
+                    Vec::new()
+                } else {
+                    vec![proto::DeviceSummary {
+                        device_id: DEVICE.to_vec(),
+                        created_at_ms: 1,
+                        ..proto::DeviceSummary::default()
+                    }]
+                },
+                ..proto::Ready::default()
+            }),
+            Box::new(|frame| {
+                Some(match frame.payload {
+                    Some(ClientPayload::FetchMessages(_)) => {
+                        let mut frames: Vec<_> = (1..=u64::try_from(EVENT_QUEUE).unwrap())
+                            .map(|seq| {
+                                server_frame(
+                                    0,
+                                    ServerPayload::MessageEvent(proto::MessageEvent {
+                                        message: Some(proto::StoredMessage {
+                                            seq,
+                                            ..proto::StoredMessage::default()
+                                        }),
+                                    }),
+                                )
+                            })
+                            .collect();
+                        frames.push(server_frame(
+                            0,
+                            ServerPayload::DeviceListChanged(proto::DeviceListChanged {
+                                device_id: DEVICE.to_vec(),
+                                added: true,
+                            }),
+                        ));
+                        frames
+                    }
+                    _ => Vec::new(),
+                })
+            }),
+        )
+        .await;
+        let (gateway, mut events) = connected(url, Duration::from_secs(5)).await;
+        // Nobody reads: the queue fills with notifications, then the device.
+        let _ = gateway
+            .fetch_messages(proto::FetchMessages::default())
+            .await;
+        let reconnected = tokio::time::timeout(Duration::from_secs(5), async {
+            while connections.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(reconnected.is_ok(), "the connection never closed");
+        // The application reads again: the device comes with a `Connected`.
+        let told = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Some(GatewayEvent::Connected { new_devices, .. })
+                        if new_devices
+                            .iter()
+                            .any(|device| device.device_id == Uuid::from_bytes(DEVICE)) =>
+                    {
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("the gateway stopped"),
+                }
+            }
+        })
+        .await;
+        assert!(told.is_ok(), "the new device was never told");
+    }
+
+    /// Problem A: the events that may be dropped are a closed list.
+    #[test]
+    fn only_notifications_of_sequences_may_be_dropped() {
+        assert!(droppable(&GatewayEvent::Sequenced(
+            proto::StoredMessage::default()
+        )));
+        for event in [
+            GatewayEvent::DeviceAdded(Uuid::nil()),
+            GatewayEvent::KeyPackagesLow { remaining: 1 },
+            GatewayEvent::JoinConversation {
+                conversation_id: Uuid::nil(),
+            },
+            GatewayEvent::Welcome(proto::WelcomeEvent::default()),
+            GatewayEvent::EventsMissed,
+            GatewayEvent::Disconnected,
+        ] {
+            assert!(!droppable(&event), "{event:?}");
+        }
     }
 
     /// An answer is the request's payload, or the instance's refusal with

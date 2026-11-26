@@ -61,6 +61,7 @@ describe("error codes produced by the shell", () => {
     "local_store_too_new",
     "untrusted_key_material",
     "clock_skew",
+    "profile_in_use",
     "account_too_old",
     "internal",
   ];

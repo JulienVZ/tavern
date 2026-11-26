@@ -838,3 +838,137 @@ async fn a_trigger_is_dropped_with_its_guard() {
     .unwrap();
     assert_eq!(left, 0);
 }
+
+/// The end of the lifetime of each current leaf of `dm`'s group, in days
+/// from now, by device (`None`: updated since its KeyPackage).
+async fn leaf_ends(app: &TestApp, dm: &Dm) -> Vec<(Uuid, Option<f64>)> {
+    sqlx::query_as(
+        "SELECT device_id, extract(epoch FROM leaf_expires_at - now())::float8 / 86400 \
+         FROM conversation_devices WHERE conversation_id = $1 AND left_seq IS NULL \
+         ORDER BY device_id",
+    )
+    .bind(dm.conversation)
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap()
+}
+
+/// Makes the leaf of `device` end in `days` (the time simulated).
+async fn leaf_ends_in(app: &TestApp, dm: &Dm, device: &Device, days: i32) {
+    sqlx::query(
+        "UPDATE conversation_devices SET leaf_expires_at = now() + make_interval(days => $3) \
+         WHERE conversation_id = $1 AND device_id = $2",
+    )
+    .bind(dm.conversation)
+    .bind(device.device_id)
+    .bind(days)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+}
+
+/// Section 3: the server knows, from the tree, the end of each leaf still
+/// as its KeyPackage made it (the creator's as well as the joiner's, 90
+/// days), forgets it once the leaf is updated, and asks to remove such a
+/// leaf 7 days before its end, by the path of every removal: the device is
+/// cut off, a commit that leaves the removal out is refused
+/// (`REMOVAL_PENDING`), the one that carries it is taken, and the group
+/// takes new devices again; the device removed, active, is told to join.
+/// A leaf updated never gets this removal, whatever its age.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_leaf_never_updated_is_removed_seven_days_before_its_end() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, bob, mut bob1, dm) = group_of_two(&app).await;
+    let ends = leaf_ends(&app, &dm).await;
+    assert_eq!(ends.len(), 2);
+    for (_, end) in &ends {
+        let end = end.expect("both leaves are their KeyPackages'");
+        assert!((89.9..=90.1).contains(&end), "{end}");
+    }
+
+    // Alice's device updates: its leaf has no end any more.
+    let commit = alice1.self_update(&dm);
+    let id = alice1.submit(&dm, 1, commit, false).await;
+    commit_ack(&alice1.answer(id).await);
+    alice1.merge();
+    let ServerPayload::CommitEvent(event) = bob1.event().await else {
+        panic!("expected Alice's update");
+    };
+    assert!(matches!(
+        bob1.process(&dm, &event.message.unwrap().mls_message),
+        Incoming::Commit { .. }
+    ));
+    let ends = leaf_ends(&app, &dm).await;
+    let end_of = |device: &Device| {
+        ends.iter()
+            .find(|(id, _)| *id == device.device_id)
+            .unwrap()
+            .1
+    };
+    assert_eq!(end_of(&alice1.device), None);
+    assert!(end_of(&bob1.device).is_some());
+
+    // Eight days left: nothing yet.
+    leaf_ends_in(&app, &dm, &bob1.device, 8).await;
+    assert_eq!(removals::sweep(&app.state).await.unwrap(), 0);
+    // Seven: the removal, once, whatever asks again.
+    leaf_ends_in(&app, &dm, &bob1.device, 7).await;
+    assert_eq!(removals::sweep(&app.state).await.unwrap(), 1);
+    assert_eq!(removals::sweep(&app.state).await.unwrap(), 0);
+    assert_eq!(
+        pending_removals(&app, dm.conversation).await,
+        [(bob1.device.device_id, 3)]
+    );
+    assert_eq!(removal_event(&mut bob1).await.seq, 3);
+    let proposal = removal_event(&mut alice1).await;
+    // A commit without the removal (built before Alice's device read it) is
+    // refused; the one with it is taken.
+    let update = alice1.self_update(&dm);
+    let id = alice1.submit(&dm, 2, update, false).await;
+    assert_eq!(
+        code(&alice1.answer(id).await),
+        proto::ErrorCode::RemovalPending
+    );
+    alice1.discard();
+    assert!(matches!(
+        alice1.process(&dm, &proposal.mls_message),
+        Incoming::Proposal
+    ));
+    let commit = alice1.commit_pending(&dm);
+    let id = alice1.submit(&dm, 2, commit, false).await;
+    commit_ack(&alice1.answer(id).await);
+    alice1.merge();
+    assert!(pending_removals(&app, dm.conversation).await.is_empty());
+    assert_eq!(
+        leaf_ends(&app, &dm).await,
+        [(alice1.device.device_id, None)]
+    );
+    // Bob's device, active, is told to join again (by external commit).
+    bob1.nothing_waiting().await;
+    assert_eq!(bob1.told_to_join, [dm.conversation]);
+
+    // A new device joins.
+    let mut bob2 = Member::connect(&app, app.enrol(&bob).await).await;
+    upload(&app, &bob2.device, 1).await;
+    let claimed: Vec<_> = claim(&app, &alice1.device, &bob, &dm.keys)
+        .await
+        .into_iter()
+        .filter(|package| {
+            package.device()
+                == Some(VerifiedLeaf {
+                    user_id: *bob.user_id.as_bytes(),
+                    device_id: *bob2.device.device_id.as_bytes(),
+                })
+        })
+        .collect();
+    assert_eq!(claimed.len(), 1);
+    let added = alice1.add_devices(&dm, &claimed);
+    let id = alice1.submit(&dm, 3, added, false).await;
+    commit_ack(&alice1.answer(id).await);
+    alice1.merge();
+    bob2.join(&dm).await;
+
+    // Alice's leaf, updated, has no end: never this removal.
+    assert_eq!(removals::sweep(&app.state).await.unwrap(), 0);
+}

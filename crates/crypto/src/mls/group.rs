@@ -30,7 +30,7 @@ use super::key_package::ClaimedKeyPackage;
 use super::policy::{self, Alarm, PolicyError};
 use super::{
     CIPHERSUITE, DeviceSigner, MlsError, commit_processing_error, create_config, join_config,
-    library, padding, processing_error, required_capabilities, server_external_sender,
+    library, padding, processing_error, required_capabilities, server_external_sender, tree_error,
 };
 use crate::identity::{ID_LEN, PUBLIC_KEY_LEN};
 
@@ -405,6 +405,12 @@ impl Group {
                 // use, or never ours), or for a group it is already in.
                 openmls::prelude::WelcomeError::NoMatchingKeyPackage
                 | openmls::prelude::WelcomeError::GroupAlreadyExists => MlsError::UnexpectedGroup,
+                // A leaf of the tree outlived its KeyPackage (this
+                // device's own, or another's never updated).
+                openmls::prelude::WelcomeError::PublicGroupError(error) => tree_error(error),
+                openmls::prelude::WelcomeError::LeafNodeValidation(
+                    openmls::treesync::errors::LeafNodeValidationError::Lifetime(_),
+                ) => MlsError::Expired,
                 other => library(other),
             })?;
         check_group_context(staged.group_context(), expected, external_sender)?;
@@ -457,7 +463,12 @@ impl Group {
         let (inner, bundle) = MlsGroup::external_commit_builder()
             .with_config(join_config())
             .build_group(provider, group_info, credential)
-            .map_err(library)?
+            .map_err(|error| match error {
+                openmls::prelude::ExternalCommitBuilderError::PublicGroupError(error) => {
+                    tree_error(error)
+                }
+                other => library(other),
+            })?
             .load_psks(provider.storage())
             .map_err(library)?
             .create_group_info(true)
@@ -528,6 +539,20 @@ impl Group {
     /// The current epoch.
     pub fn epoch(&self) -> u64 {
         self.inner.epoch().as_u64()
+    }
+
+    /// Whether this device's leaf is still the one its KeyPackage made,
+    /// with that package's lifetime: true after a join by Welcome until this
+    /// device's first update. The upkeep that follows a join commits that
+    /// update at once, so that no leaf of the group outlives its package
+    /// (section 3).
+    pub fn own_leaf_from_key_package(&self) -> bool {
+        self.inner.own_leaf_node().is_some_and(|leaf| {
+            matches!(
+                leaf.leaf_node_source(),
+                openmls::treesync::LeafNodeSource::KeyPackage(_)
+            )
+        })
     }
 
     /// The devices in the group, as named by their certificates (verified

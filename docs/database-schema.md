@@ -301,6 +301,7 @@ CREATE TABLE conversation_devices (
     joined_seq      bigint NOT NULL,                         -- META  the commit that added it
     left_seq        bigint,                                  -- META  the commit that removed it
     acked_seq       bigint NOT NULL,                         -- META  delivery cursor
+    leaf_expires_at timestamptz,                             -- META  end of the lifetime of a leaf never updated (migration 0016)
     PRIMARY KEY (conversation_id, device_id),
     CHECK (leaf_index >= 0),
     CHECK (acked_seq >= joined_seq),

@@ -274,6 +274,8 @@ const en = {
     "This account's data on this computer was written by a newer version of Tavern. Update Tavern, then try again.",
   "error.untrusted_key_material":
     "The instance returned keys that do not match this account. Do not continue; contact the administrator.",
+  "error.profile_in_use":
+    "Tavern is already open with this profile in another window. Use that window, or close it first.",
   "error.clock_skew":
     "This computer's clock is wrong by more than an hour. Set the date and time right, then try again.",
   "error.account_too_old":
@@ -562,6 +564,8 @@ const fr: Catalogue = {
     "Les données de ce compte sur cet ordinateur ont été écrites par une version plus récente de Tavern. Mettez Tavern à jour, puis réessayez.",
   "error.untrusted_key_material":
     "L'instance a renvoyé des clés qui ne correspondent pas à ce compte. Ne continuez pas ; contactez l'administrateur.",
+  "error.profile_in_use":
+    "Tavern est déjà ouvert avec ce profil dans une autre fenêtre. Utilisez cette fenêtre, ou fermez-la d'abord.",
   "error.clock_skew":
     "L'horloge de cet ordinateur a plus d'une heure d'écart. Réglez la date et l'heure, puis réessayez.",
   "error.account_too_old":

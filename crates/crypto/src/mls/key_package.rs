@@ -56,6 +56,23 @@ pub fn build<P: OpenMlsProvider>(
     Ok(bundle.key_package().clone())
 }
 
+/// A one-time KeyPackage valid `seconds` from now, in real time: to test
+/// what OpenMLS does once a lifetime is over.
+#[cfg(test)]
+pub(crate) fn build_with_lifetime<P: OpenMlsProvider>(
+    provider: &P,
+    signer: &DeviceSigner<'_>,
+    credential: CredentialWithKey,
+    seconds: u64,
+) -> Result<KeyPackage, MlsError> {
+    let bundle = KeyPackage::builder()
+        .key_package_lifetime(Lifetime::new(seconds))
+        .leaf_node_capabilities(capabilities())
+        .build(CIPHERSUITE, provider, signer, credential)
+        .map_err(library)?;
+    Ok(bundle.key_package().clone())
+}
+
 /// The bytes to upload.
 pub fn to_bytes(key_package: &KeyPackage) -> Result<Vec<u8>, MlsError> {
     key_package.tls_serialize_detached().map_err(library)

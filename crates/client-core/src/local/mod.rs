@@ -34,6 +34,7 @@ mod migrations;
 pub mod mls;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -56,11 +57,25 @@ const PAGE_CACHE_KIB: i64 = 2048;
 /// How long a write waits for another connection (another window of the
 /// same profile) to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-/// How many times, and how far apart, a checkpoint of the journal is tried
-/// when a reader keeps it from completing. Each try already waits for the
-/// readers up to [`BUSY_TIMEOUT`].
-const JOURNAL_ATTEMPTS: u32 = 2;
-const JOURNAL_RETRY: Duration = Duration::from_millis(100);
+/// How long a checkpoint of the journal waits for a reader, at most.
+const CHECKPOINT_WAIT: Duration = Duration::from_millis(50);
+
+/// Empties the journal into the file and truncates it, waiting for a reader
+/// [`CHECKPOINT_WAIT`] at most: whether it is done.
+fn checkpoint(connection: &Connection) -> Result<bool, LocalStoreError> {
+    connection
+        .busy_timeout(CHECKPOINT_WAIT)
+        .map_err(|error| database(&error))?;
+    let busy = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| database(&error));
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| database(&error))?;
+    Ok(busy? == 0)
+}
 /// The files SQLite may create next to a database.
 const COMPANION_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
@@ -98,6 +113,48 @@ pub enum LocalStoreError {
     /// The files of the store could not be created, moved or removed.
     #[error("the files of the local store cannot be accessed: {0}")]
     Io(#[from] std::io::Error),
+    /// Another window of this application has this profile open: one
+    /// window per profile ([`ProfileLock`]).
+    #[error("this profile is already open in another window of Tavern")]
+    ProfileInUse,
+}
+
+/// The exclusive hold of one profile's local data by one window of the
+/// application, for as long as it runs: a second window on the same
+/// profile is refused (decided 2026-11-26), so that a store has one writer
+/// and one reader, and its journal is always emptied at once. Released when
+/// dropped, and by the system when the process ends, however it ends.
+#[derive(Debug)]
+pub struct ProfileLock {
+    _file: std::fs::File,
+}
+
+impl ProfileLock {
+    /// Takes the lock of `profile` (`None`: the default one) in the
+    /// application's local data directory, without waiting:
+    /// [`LocalStoreError::ProfileInUse`] if another window holds it.
+    pub fn acquire(local_data: &Path, profile: Option<&str>) -> Result<Self, LocalStoreError> {
+        let directory = local_data.join("profiles");
+        std::fs::create_dir_all(&directory)?;
+        // Any profile name, as a file name: its bytes in hexadecimal.
+        let name = profile.map_or_else(
+            || "default".to_owned(),
+            |profile| {
+                let hex: String = profile.bytes().map(|byte| format!("{byte:02x}")).collect();
+                format!("profile-{hex}")
+            },
+        );
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(directory.join(format!("{name}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(LocalStoreError::ProfileInUse),
+            Err(std::fs::TryLockError::Error(error)) => Err(LocalStoreError::Io(error)),
+        }
+    }
 }
 
 /// Keeps the SQLite error code and drops the rest: some rusqlite errors carry
@@ -140,6 +197,9 @@ pub struct LocalStore {
 struct Inner {
     path: PathBuf,
     connection: Mutex<Option<Connection>>,
+    /// The journal may still hold what was deleted: its last checkpoint
+    /// was incomplete. Tried again at the next upkeep and at closing.
+    journal_to_erase: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for LocalStore {
@@ -172,6 +232,7 @@ impl LocalStore {
         }
         Ok(Self {
             inner: Arc::new(Inner {
+                journal_to_erase: std::sync::atomic::AtomicBool::new(false),
                 path: path.to_owned(),
                 connection: Mutex::new(Some(connection)),
             }),
@@ -193,6 +254,7 @@ impl LocalStore {
         migrations::bring_up_to_date(&mut connection, binding, now_ms)?;
         Ok(Self {
             inner: Arc::new(Inner {
+                journal_to_erase: std::sync::atomic::AtomicBool::new(false),
                 path: path.to_owned(),
                 connection: Mutex::new(Some(connection)),
             }),
@@ -219,6 +281,14 @@ impl LocalStore {
     /// [`LocalStoreError::Closed`]. Closing twice does nothing.
     pub fn close(&self) {
         let connection = self.lock().take();
+        // What was deleted leaves the journal before the store closes, if a
+        // checkpoint was left incomplete.
+        if let Some(connection) = &connection
+            && self.inner.journal_to_erase.load(Ordering::Acquire)
+            && matches!(checkpoint(connection), Ok(true))
+        {
+            self.inner.journal_to_erase.store(false, Ordering::Release);
+        }
         if let Some(Err((connection, error))) = connection.map(Connection::close) {
             tracing::warn!(error = %database(&error), "local store did not close cleanly");
             // Dropping it closes it anyway, without reporting.
@@ -263,29 +333,28 @@ impl LocalStore {
     /// With `secure_delete`, what was deleted is then overwritten in the
     /// file, and no longer held by earlier frames of the log: the secrets
     /// OpenMLS deleted, the text of deleted messages. Called after each
-    /// batch that deletes them, on its error paths too. A reader in another
-    /// window of the same profile may keep the log from being emptied: the
-    /// checkpoint waits for it, is tried again, then [`LocalStoreError::Busy`]
-    /// says it is incomplete (the next call completes it).
+    /// batch that deletes them, on its error paths too. A reader (none
+    /// is expected: one window per profile, [`ProfileLock`]) may keep the
+    /// log from being emptied: the checkpoint waits for it [`CHECKPOINT_WAIT`]
+    /// at most, never holding the store longer, then
+    /// [`LocalStoreError::Busy`] says it is incomplete, and it is tried
+    /// again at the next call (the next upkeep) and when the store closes.
     pub async fn erase_journal(&self) -> Result<(), LocalStoreError> {
-        for attempt in 0..JOURNAL_ATTEMPTS {
-            let busy = self
-                .run(|connection| {
-                    connection
-                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                            row.get::<_, i64>(0)
-                        })
-                        .map_err(|error| database(&error))
-                })
-                .await?;
-            if busy == 0 {
-                return Ok(());
-            }
-            if attempt + 1 < JOURNAL_ATTEMPTS {
-                tokio::time::sleep(JOURNAL_RETRY).await;
-            }
+        let emptied = self.run(|connection| checkpoint(connection)).await?;
+        self.inner
+            .journal_to_erase
+            .store(!emptied, Ordering::Release);
+        if emptied {
+            Ok(())
+        } else {
+            Err(LocalStoreError::Busy)
         }
-        Err(LocalStoreError::Busy)
+    }
+
+    /// Whether the journal may still hold what was deleted (its last
+    /// checkpoint incomplete).
+    pub fn journal_to_erase(&self) -> bool {
+        self.inner.journal_to_erase.load(Ordering::Acquire)
     }
 
     /// Deletes the text of a message, which `secure_delete` overwrites in

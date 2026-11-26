@@ -13,18 +13,26 @@
 //! [`tavern_crypto::mls::Group::join`] deletes it, so a used last resort
 //! is a last resort no longer held.
 //!
+//! Lifetimes (decided 2026-11-26, after the check of the review of task
+//! 10a): a package lives 90 days, and OpenMLS refuses a Welcome, or any
+//! join of a group, once a leaf made from a package is past that lifetime
+//! (whatever private parts the device still holds). So the instance serves
+//! a package only while it lives the retention and 7 days more (37 days by
+//! default): a package leaves the stock at 53 days of age ([`STOCK_AGE_MS`];
+//! the instance no longer counts it, and the device replaces it), the last
+//! resort is replaced at 30 days, well before, and the private parts are
+//! forgotten at the end of the lifetime.
+//!
 //! A package is recorded with its public bytes until the instance confirms
 //! the upload: an upload whose answer was lost sends the same packages
-//! again, never new ones in their place, since the instance may serve them.
-//! What the device no longer needs is forgotten, its private parts deleted
-//! from the store ([`forget_due`]):
+//! again, never new ones in their place, since the instance may serve them;
+//! at most 20 one-time packages wait so ([`MAX_UNCONFIRMED`]). What the
+//! device no longer needs is forgotten, its private parts deleted from the
+//! store ([`forget_due`]):
 //!
-//! - a one-time package, once its lifetime (90 days) and the longest
-//!   retention (30 days) are over: a claim made just before its end of
-//!   life may bring a Welcome that waits on the instance up to the
-//!   retention (decided 2026-11-25, after the review of task 10a);
-//! - a replaced last-resort package, 30 days after its replacement, for the
-//!   same reason (decided 2026-11-25);
+//! - a one-time package, once its lifetime (90 days) is over;
+//! - a replaced last-resort package, 30 days after its replacement: a claim
+//!   just before it may bring a Welcome that waits the retention;
 //! - a package the instance refused the first time it was sent. A package
 //!   sent before and refused when sent again (its first answer lost) may be
 //!   on the instance: it is not sent again, and kept as long as it may be
@@ -46,28 +54,84 @@ const DAY_MS: u64 = 24 * 3600 * 1000;
 /// The longest retention of an instance (`TAVERN_MESSAGE_RETENTION_DAYS`):
 /// how long a Welcome may wait for this device.
 pub const MAX_RETENTION_MS: u64 = 30 * DAY_MS;
+/// How long before its end the instance stops serving a package, at most:
+/// the longest retention and the 7 days before its end at which the
+/// instance removes a leaf never updated.
+pub const SERVING_MARGIN_MS: u64 = MAX_RETENTION_MS + 7 * DAY_MS;
+/// The age at which a package leaves the stock (53 days): the instance no
+/// longer serves it, nor counts it, and it is never sent again.
+pub const STOCK_AGE_MS: u64 = LIFETIME_SECONDS * 1000 - SERVING_MARGIN_MS;
 /// How long the private parts of a replaced last-resort package are kept.
 pub const LAST_RESORT_GRACE_MS: u64 = MAX_RETENTION_MS;
-/// How long the private parts of a one-time package are kept: its lifetime,
-/// then the longest wait of a Welcome made just before its end.
-pub const ONE_TIME_KEPT_MS: u64 = LIFETIME_SECONDS * 1000 + MAX_RETENTION_MS;
+/// How long the private parts of a one-time package are kept: its lifetime.
+/// After it, OpenMLS refuses the Welcome made with it.
+pub const ONE_TIME_KEPT_MS: u64 = LIFETIME_SECONDS * 1000;
 /// Age at which the last-resort package is replaced.
 const LAST_RESORT_ROTATION_MS: u64 = LAST_RESORT_ROTATION_DAYS * DAY_MS;
+/// The one-time packages that may wait for the confirmation of their
+/// upload: no new one is built while they are this many.
+pub const MAX_UNCONFIRMED: usize = ONE_TIME_COUNT;
+
+// The last resort is replaced before it leaves the stock, and its grace
+// period ends within its lifetime.
+const _: () = assert!(LAST_RESORT_ROTATION_MS < STOCK_AGE_MS);
+const _: () = assert!(LAST_RESORT_ROTATION_MS + LAST_RESORT_GRACE_MS <= ONE_TIME_KEPT_MS);
 /// After a refusal caused by this device's clock, how long before building
 /// packages again.
 pub const REFUSAL_BACKOFF_MS: u64 = DAY_MS;
+/// How far this device's clock may be from the instance's before the
+/// KeyPackages it builds are refused (OpenMLS starts their lifetime an hour
+/// in the past).
+pub const CLOCK_TOLERANCE_MS: u64 = 3600 * 1000;
+
+/// Whether to build packages, given the last refusal caused by this
+/// device's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockGate {
+    /// No such refusal: go on.
+    Go,
+    /// The clock is right again: forget the refusal, and go on.
+    ClockRight,
+    /// A refusal, and the clock not measured yet (the gateway has not
+    /// connected since the client started): wait for the measure, keeping
+    /// the refusal. Nothing is built meanwhile.
+    NotMeasured,
+    /// Still off, within the day after the refusal: build nothing.
+    Skewed(i64),
+}
+
+/// Decides, from the time of the last refusal caused by the clock (kept in
+/// the store, across restarts), the clock's offset as last measured at a
+/// connection (`None` before), and now. A refusal is forgotten only once
+/// the clock is measured right (problem D of the check of the review of
+/// task 10a).
+pub(crate) fn clock_gate(refused_at: Option<u64>, skew_ms: Option<i64>, now_ms: u64) -> ClockGate {
+    match (refused_at, skew_ms) {
+        (None, _) => ClockGate::Go,
+        (Some(_), None) => ClockGate::NotMeasured,
+        (Some(_), Some(skew)) if skew.unsigned_abs() <= CLOCK_TOLERANCE_MS => ClockGate::ClockRight,
+        (Some(at), Some(skew)) if now_ms.saturating_sub(at) < REFUSAL_BACKOFF_MS => {
+            ClockGate::Skewed(skew)
+        }
+        // A day later, still off: try once more (a refusal starts another
+        // day).
+        (Some(_), Some(_)) => ClockGate::Go,
+    }
+}
+
 /// How often the KeyPackages are kept up, whatever the connection.
 pub const UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Runs `run` now, then every `every`, until aborted: the upkeep's clock,
-/// independent of the connection.
+/// Runs `run` every `every`, the first time `every` from now, until
+/// aborted: the upkeep's clock, independent of the connection (the
+/// connection runs it besides, as it comes up).
 pub(crate) fn spawn_every<F, Fut>(every: std::time::Duration, run: F) -> tokio::task::JoinHandle<()>
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(every);
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
@@ -214,6 +278,32 @@ pub(crate) async fn prepare(
         .transaction(move |transaction| {
             let provider = Provider::new(SqlStorage::new(transaction));
             forget_unneeded(transaction, &provider, now_ms)?;
+            // Out of the stock and not confirmed: never sent again. A package
+            // never sent is on no instance: forgotten; one sent may be:
+            // kept, with its private parts, until its end.
+            let too_old: Vec<(Vec<u8>, bool)> = transaction
+                .prepare(
+                    "SELECT reference, sent FROM key_packages \
+                     WHERE package IS NOT NULL AND created_at_ms <= ?1 - ?2",
+                )?
+                .query_map((ms(now_ms), ms(STOCK_AGE_MS)), |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (reference, sent) in too_old {
+                if sent {
+                    transaction.execute(
+                        "UPDATE key_packages SET package = NULL WHERE reference = ?1",
+                        [&reference],
+                    )?;
+                } else {
+                    key_package::forget(&provider, &reference)?;
+                    transaction.execute(
+                        "DELETE FROM key_packages WHERE reference = ?1",
+                        [&reference],
+                    )?;
+                }
+            }
 
             let mut upload = ToUpload::default();
             let pending: Vec<(Vec<u8>, bool, Vec<u8>)> = transaction
@@ -251,12 +341,14 @@ pub(crate) async fn prepare(
                     }));
 
             // What the instance holds is `remaining`, whether or not it took
-            // the packages not confirmed: never fewer than 20 after this
-            // upload, at worst as many more as were not confirmed (the
-            // instance keeps up to 200).
+            // the packages not confirmed: those are sent again, and new ones
+            // fill what the count lacks, as long as no more than 20 wait for
+            // a confirmation. At worst 20 more than needed reach the
+            // instance, if it did take the ones not confirmed.
             let missing =
                 ONE_TIME_COUNT.saturating_sub(usize::try_from(remaining).unwrap_or(usize::MAX));
-            for _ in 0..missing {
+            let room = MAX_UNCONFIRMED.saturating_sub(upload.one_time.len());
+            for _ in 0..missing.min(room) {
                 let built = build_one(
                     transaction,
                     &provider,
@@ -479,7 +571,8 @@ mod tests {
         pub(crate) store: LocalStore,
         seed: [u8; 32],
         certificate: Vec<u8>,
-        _dir: tempfile::TempDir,
+        binding: Binding,
+        dir: tempfile::TempDir,
     }
 
     impl Setup {
@@ -505,8 +598,24 @@ mod tests {
                 store,
                 seed: *key.seed().expose(),
                 certificate,
-                _dir: dir,
+                binding: Binding {
+                    user_id: user,
+                    device_id: device,
+                },
+                dir,
             }
+        }
+
+        /// Closes the store and opens it again, as a restart.
+        fn reopen(&mut self) {
+            self.store.close();
+            self.store = LocalStore::open(
+                &self.dir.path().join(DATABASE_FILE),
+                &Secret::from_slice(&[3; 32]).unwrap(),
+                self.binding,
+                NOW_MS,
+            )
+            .unwrap();
         }
 
         async fn prepare(&self, remaining: u32, replace: bool, now_ms: u64) -> ToUpload {
@@ -569,25 +678,79 @@ mod tests {
         assert!(more.last_resort.is_none());
     }
 
-    /// Review of task 10a, point 9: packages whose upload was not confirmed
-    /// are not counted twice. If the instance in fact stored them, its count
-    /// has them: the device builds what is missing from that count, and the
-    /// packages sent again change nothing. If it did not, the instance gets
-    /// them and 20 more. Never below 20.
+    /// Review of task 10a, point 9, and problem C of its check: packages
+    /// whose upload was not confirmed are not counted twice, and at most 20
+    /// wait for a confirmation. While they are 20, they are sent again as
+    /// they are, nothing new beside them, whatever the instance's count and
+    /// however many uploads end without an answer; once confirmed, what the
+    /// count lacks is built.
     #[tokio::test]
-    async fn packages_not_confirmed_are_not_counted_twice() {
+    async fn at_most_twenty_packages_wait_for_a_confirmation() {
         let setup = Setup::new();
         let first = setup.prepare(0, false, NOW_MS).await;
-        setup.settle(&first, Outcome::Unknown, NOW_MS).await;
-        // The instance did store them, and served five since.
+        assert_eq!(first.one_time.len(), ONE_TIME_COUNT);
+        for hour in 1..=5 {
+            setup.settle(&first, Outcome::Unknown, NOW_MS).await;
+            // The instance did not store them, or did and served five.
+            for remaining in [0, 15] {
+                let again = setup
+                    .prepare(remaining, false, NOW_MS + hour * 3_600_000)
+                    .await;
+                assert_eq!(again, first, "hour {hour}, {remaining} left");
+            }
+        }
+        setup.settle(&first, Outcome::Taken, NOW_MS).await;
         let next = setup.prepare(15, false, NOW_MS).await;
-        assert_eq!(next.one_time.len(), ONE_TIME_COUNT + 5);
-        // It did not: they are sent again with 20 new ones.
+        assert_eq!(next.one_time.len(), 5);
+        // Five not confirmed: room for fifteen more beside them.
+        setup.settle(&next, Outcome::Unknown, NOW_MS).await;
+        let then = setup.prepare(0, false, NOW_MS).await;
+        assert_eq!(then.one_time.len(), ONE_TIME_COUNT);
+        assert!(
+            next.one_time
+                .iter()
+                .all(|entry| then.one_time.contains(entry))
+        );
+    }
+
+    /// Point 1 of the check of the review of task 10a: the lifetimes. A
+    /// package leaves the stock at 53 days (the instance serves it while it
+    /// lives 37 more); the last resort is replaced at 30, before; private
+    /// parts are forgotten at 90.
+    #[test]
+    fn the_lifetimes_fit_together() {
+        assert_eq!(STOCK_AGE_MS, 53 * DAY_MS);
+        assert_eq!(LAST_RESORT_ROTATION_MS, 30 * DAY_MS);
+        assert_eq!(ONE_TIME_KEPT_MS, 90 * DAY_MS);
+        assert_eq!(LAST_RESORT_GRACE_MS, 30 * DAY_MS);
+    }
+
+    /// A package not confirmed that leaves the stock is not sent again: one
+    /// sent before keeps its private parts until its end, one never sent is
+    /// forgotten.
+    #[tokio::test]
+    async fn a_package_out_of_the_stock_is_never_sent_again() {
         let setup = Setup::new();
-        let first = setup.prepare(0, false, NOW_MS).await;
-        setup.settle(&first, Outcome::Unknown, NOW_MS).await;
-        let next = setup.prepare(0, false, NOW_MS).await;
-        assert_eq!(next.one_time.len(), 2 * ONE_TIME_COUNT);
+        let sent = setup.prepare(0, false, NOW_MS).await;
+        setup.settle(&sent, Outcome::Unknown, NOW_MS).await;
+        let later = NOW_MS + STOCK_AGE_MS;
+        let next = setup.prepare(0, false, later).await;
+        assert!(
+            next.one_time
+                .iter()
+                .all(|entry| !sent.one_time.contains(entry))
+        );
+        assert_eq!(next.one_time.len(), ONE_TIME_COUNT);
+        for entry in &sent.one_time {
+            assert!(setup.held(&reference(entry)).await, "sent once: kept");
+        }
+        // Never sent (its upload failed before it left): forgotten.
+        let never_sent = next.one_time.clone();
+        let after = setup.prepare(0, false, later + STOCK_AGE_MS).await;
+        for entry in &never_sent {
+            assert!(!setup.held(&reference(entry)).await);
+            assert!(!after.one_time.contains(entry));
+        }
     }
 
     /// Section 3: the last-resort package is replaced after 30 days, or when
@@ -649,27 +812,27 @@ mod tests {
         assert_ne!(new, used);
     }
 
-    /// Review of task 10a, point 1: a one-time package keeps its private
-    /// parts through its lifetime and the longest retention (90 + 30 days),
-    /// then they are deleted without the instance.
+    /// Point 1 of the check of the review of task 10a: a one-time package
+    /// keeps its private parts through its lifetime (90 days), then they are
+    /// deleted without the instance: past it, OpenMLS refuses its Welcome.
     #[tokio::test]
-    async fn a_one_time_package_is_kept_through_its_lifetime_and_the_retention() {
+    async fn a_one_time_package_is_kept_through_its_lifetime() {
         let setup = Setup::new();
         let first = setup.prepare(0, false, NOW_MS).await;
         setup.settle(&first, Outcome::Taken, NOW_MS).await;
         let one = reference(&first.one_time[0]);
         assert!(
-            !forget_due(&setup.store, NOW_MS + 119 * DAY_MS)
+            !forget_due(&setup.store, NOW_MS + 89 * DAY_MS)
                 .await
                 .unwrap()
         );
-        assert!(setup.held(&one).await, "day 119");
+        assert!(setup.held(&one).await, "day 89");
         assert!(
-            forget_due(&setup.store, NOW_MS + 120 * DAY_MS)
+            forget_due(&setup.store, NOW_MS + 90 * DAY_MS)
                 .await
                 .unwrap()
         );
-        assert!(!setup.held(&one).await, "day 120");
+        assert!(!setup.held(&one).await, "day 90");
     }
 
     /// Review of task 10a, point 8: a package refused the first time it is
@@ -725,16 +888,16 @@ mod tests {
             }
         });
         tokio::task::yield_now().await;
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "at once");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the connection runs it at once"
+        );
         for _ in 0..24 {
             tokio::time::advance(UPKEEP_INTERVAL).await;
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            runs.load(Ordering::SeqCst),
-            25,
-            "then every hour, for a day"
-        );
+        assert_eq!(runs.load(Ordering::SeqCst), 24, "every hour, for a day");
         handle.abort();
     }
 
@@ -811,6 +974,38 @@ mod tests {
         for failure in [ClientError::ServerError, ClientError::Interrupted] {
             assert_eq!(Outcome::of(&Err::<(), _>(failure)), Outcome::Unknown);
         }
+    }
+
+    /// Problem D of the check of the review of task 10a: a refusal caused by
+    /// the clock survives a restart, and is forgotten only once the clock is
+    /// measured right; before the first measure, nothing is built.
+    #[tokio::test]
+    async fn a_refusal_caused_by_the_clock_waits_for_a_measure_after_a_restart() {
+        let mut setup = Setup::new();
+        set_refused_at(&setup.store, Some(NOW_MS)).await.unwrap();
+        setup.reopen();
+        let refused = refused_at(&setup.store).await.unwrap();
+        assert_eq!(refused, Some(NOW_MS), "kept across the restart");
+        let hour = 3_600_000;
+        assert_eq!(
+            clock_gate(refused, None, NOW_MS + hour),
+            ClockGate::NotMeasured
+        );
+        let off = i64::try_from(2 * CLOCK_TOLERANCE_MS).unwrap();
+        assert_eq!(
+            clock_gate(refused, Some(off), NOW_MS + hour),
+            ClockGate::Skewed(off)
+        );
+        assert_eq!(
+            clock_gate(refused, Some(-off), NOW_MS + REFUSAL_BACKOFF_MS),
+            ClockGate::Go,
+            "a day later, one more try"
+        );
+        assert_eq!(
+            clock_gate(refused, Some(1_000), NOW_MS + hour),
+            ClockGate::ClockRight
+        );
+        assert_eq!(clock_gate(None, None, NOW_MS), ClockGate::Go);
     }
 
     /// The time of a refusal caused by the clock is kept, and cleared.

@@ -643,12 +643,17 @@ async fn claims_are_limited_per_requesting_user() {
     );
 }
 
-/// A package expired, or expiring within the hour, is neither served nor
-/// counted; the device's expired packages go at its next upload.
+/// ADR 0019, section 3: a package that does not live the retention and 7
+/// days more (37 days by default) is neither served nor counted, a one-time
+/// package or the last resort: the Welcome made with it may wait the
+/// retention, and its leaf must outlive the server's removal of a leaf
+/// never updated, 7 days before its end. Expired packages go at the next
+/// upload. The time is simulated by moving the packages' end.
 #[tokio::test]
 #[ignore = "needs PostgreSQL, see the module documentation"]
-async fn packages_about_to_expire_are_not_served() {
+async fn packages_that_do_not_live_long_enough_are_not_served() {
     let app = TestApp::spawn().await;
+    assert_eq!(app.state.settings.message_retention_days, 30);
     let (account, claimer) = app.account_with_device("kp", false).await;
     let laptop = app.enrol(&account).await;
     let last_resort = laptop.key_package(true);
@@ -659,22 +664,28 @@ async fn packages_about_to_expire_are_not_served() {
         Some(last_resort.clone()),
     )
     .await;
-    let expire_one_time = |minutes: i32| {
+    let ends_in = |hours: i32, last_resort: bool| {
         sqlx::query(
-            "UPDATE key_packages SET expires_at = now() + make_interval(mins => $2) \
-             WHERE device_id = $1 AND NOT last_resort",
+            "UPDATE key_packages SET expires_at = now() + make_interval(hours => $2) \
+             WHERE device_id = $1 AND last_resort = $3",
         )
         .bind(laptop.device_id)
-        .bind(minutes)
+        .bind(hours)
+        .bind(last_resort)
         .execute(&app.state.db)
     };
+    const DAY: i32 = 24;
 
-    expire_one_time(30).await.unwrap();
+    // Just over 37 days: served and counted.
+    ends_in(37 * DAY + 1, false).await.unwrap();
+    assert_eq!(count(&app, &laptop).await, 2);
+    // Just under: neither, and the last resort is served in their place.
+    ends_in(37 * DAY - 1, false).await.unwrap();
     assert_eq!(count(&app, &laptop).await, 0);
     let served = claim(&app, &claimer, account.user_id).await.unwrap();
     assert_eq!(served.key_packages[0].key_package, last_resort);
 
-    expire_one_time(-24 * 60).await.unwrap();
+    ends_in(-DAY, false).await.unwrap();
     let fresh = laptop.key_packages(1);
     assert_eq!(upload(&app, &laptop, fresh.clone(), None).await, 1);
     assert_eq!(
@@ -685,17 +696,34 @@ async fn packages_about_to_expire_are_not_served() {
     let served = claim(&app, &claimer, account.user_id).await.unwrap();
     assert_eq!(served.key_packages[0].key_package, fresh[0]);
 
-    sqlx::query(
-        "UPDATE key_packages SET expires_at = now() + interval '30 minutes' \
-         WHERE device_id = $1 AND last_resort",
-    )
-    .bind(laptop.device_id)
-    .execute(&app.state.db)
-    .await
-    .unwrap();
+    // The last resort under 37 days: nothing to serve.
+    ends_in(37 * DAY - 1, true).await.unwrap();
     assert!(
         claimed_devices(&app, &claimer, account.user_id)
             .await
             .is_empty()
     );
+}
+
+/// The margin follows the instance's retention: with 10 days, a package is
+/// served while it lives 17 days more.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn the_serving_margin_follows_the_retention() {
+    let app = TestApp::spawn_configured(|settings| settings.message_retention_days = 10).await;
+    let (account, _) = app.account_with_device("kp", false).await;
+    let laptop = app.enrol(&account).await;
+    upload(&app, &laptop, laptop.key_packages(1), None).await;
+    for (hours, counted) in [(17 * 24 + 1, 1), (17 * 24 - 1, 0)] {
+        sqlx::query(
+            "UPDATE key_packages SET expires_at = now() + make_interval(hours => $2) \
+             WHERE device_id = $1",
+        )
+        .bind(laptop.device_id)
+        .bind(hours)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+        assert_eq!(count(&app, &laptop).await, counted, "{hours} hours");
+    }
 }

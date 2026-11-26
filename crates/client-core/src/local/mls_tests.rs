@@ -1010,54 +1010,35 @@ async fn a_deleted_group_leaves_nothing_behind() {
     );
 }
 
-/// Review of task 10a, point 1, the reviewer's scenario: a one-time
-/// KeyPackage built on day 0, claimed on day 85; its device is offline from
-/// day 80 to day 100 (its hourly upkeep, which needs no connection, runs
-/// every day), and processes the Welcome on day 100: the private parts are
-/// still there, and the join works.
+/// Point 1 of the check of the review of task 10a: a leaf made from a
+/// KeyPackage (the creator's, and the joiner's) is updated at the first
+/// upkeep after the join, however recent; once updated, only after 7 days.
 #[tokio::test]
-async fn a_welcome_waiting_past_the_lifetime_of_its_package_still_joins() {
-    use tavern_crypto::identity::DeviceKey as Key;
-
-    use crate::key_packages::{self, Outcome};
-    const DAY: u64 = 24 * 3600 * 1000;
+async fn a_leaf_from_a_key_package_is_updated_at_the_first_upkeep() {
+    async fn due(device: &Device, last: Option<u64>, now: u64) -> Result<bool, Failure> {
+        device
+            .mls(move |provider, _, _, _| Ok(leaf_update_due(&load(provider)?, last, now)))
+            .await
+    }
+    use crate::leaves::{LEAF_UPDATE_PERIOD_MS, leaf_update_due};
     let (alice, bob) = (Account::new(1), Account::new(2));
     let dm = Dm::new(&alice, &bob);
-    let alice1 = Device::new(&alice, 1, false);
-    let bob1 = Device::new(&bob, 1, false);
-    let upload = key_packages::prepare(
-        &bob1.store,
-        Key::from_seed(&Secret::from_slice(&bob1.seed).unwrap()),
-        bob1.certificate.clone(),
-        0,
-        false,
-        NOW_MS,
-    )
-    .await
-    .unwrap();
-    key_packages::settle(&bob1.store, &upload, Outcome::Taken, NOW_MS)
-        .await
-        .unwrap();
-    for day in 1..80 {
-        key_packages::forget_due(&bob1.store, NOW_MS + day * DAY)
-            .await
-            .unwrap();
-    }
-    // Day 85: Alice claims it and makes the Welcome.
-    let claimed =
-        key_package::validate_claimed(&upload.one_time[0].1, bob1.leaf(), &dm.keys).unwrap();
-    let welcome = create(&alice1, &dm, vec![claimed]).await;
-    // Days 80 to 100: Bob is offline; his upkeep runs.
-    for day in 80..=100 {
-        key_packages::forget_due(&bob1.store, NOW_MS + day * DAY)
-            .await
-            .unwrap();
-    }
+    let alice1 = Device::new(&alice, 1, true);
+    let bob1 = Device::new(&bob, 1, true);
+    let welcome = create(&alice1, &dm, vec![bob1.claimed(&dm.keys).await]).await;
     join(&bob1, &dm, welcome).await;
-    assert_eq!(epoch(&bob1).await, epoch(&alice1).await);
-    let message = encrypt(&alice1, b"welcome, late").await;
-    assert_eq!(
-        text_of(process(&bob1, &dm, message).await.unwrap()),
-        b"welcome, late"
+    for device in [&alice1, &bob1] {
+        assert!(
+            due(device, Some(NOW_MS), NOW_MS).await.unwrap(),
+            "just joined"
+        );
+    }
+    self_update(&bob1, &dm).await;
+    assert!(!due(&bob1, Some(NOW_MS), NOW_MS).await.unwrap(), "updated");
+    assert!(
+        due(&bob1, Some(NOW_MS), NOW_MS + LEAF_UPDATE_PERIOD_MS)
+            .await
+            .unwrap(),
+        "seven days later"
     );
 }

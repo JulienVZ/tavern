@@ -108,7 +108,7 @@ async fn a_client_counts_claims_and_checks_what_it_is_served() {
     .unwrap();
     sqlx::query(
         "INSERT INTO key_packages (device_id, key_package, reference, leaf_key, expires_at) \
-         VALUES ($1, $2, $3, '', now() + interval '30 days')",
+         VALUES ($1, $2, $3, '', now() + interval '60 days')",
     )
     .bind(phone.device_id())
     .bind(key_package::to_bytes(&package).unwrap())
@@ -155,6 +155,7 @@ async fn kept_up(server: &Server, client: &Client, one_time: i64) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL"]
 async fn a_connected_device_keeps_its_key_packages_up() {
+    use tavern_client_core::GatewayEvent;
     let server = Server::spawn().await;
     let computer = server.new_computer();
     let handle = register(&server, &computer).await;
@@ -166,24 +167,28 @@ async fn a_connected_device_keeps_its_key_packages_up() {
         IdentityPublicKey::from_bytes(me.identity_key.as_slice()).unwrap(),
     );
 
-    let (_gateway, _events) = laptop.connect_gateway().unwrap();
+    let (_gateway, mut events) = laptop.connect_gateway().unwrap();
+    assert!(matches!(
+        tavern_e2e_tests::next_event(&mut events).await,
+        GatewayEvent::Connected { .. }
+    ));
+    // The connection's upkeep: the only one before the hourly one, an hour
+    // after the connection, so `KeyPackagesLow` is the only trigger below.
     kept_up(&server, &laptop, 20).await;
     assert_eq!(laptop.key_package_count().await.unwrap(), 20);
 
-    // The phone claims until fewer than ten are left, and the laptop is
-    // told. Eleven claims, or a few more: the upkeep that started with the
-    // connection (the hourly one runs at once too) may top them up between
-    // two claims.
-    let mut claims = 0;
-    while on_the_instance(&server, &laptop).await.0 >= 10 {
+    // The phone claims eleven: nine left, and the laptop is told.
+    for _ in 0..11 {
         let claimed = phone
             .claim_key_packages(laptop.user_id(), &own)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
-        claims += 1;
-        assert!(claims <= 40, "the packages never ran low");
     }
+    assert_eq!(
+        tavern_e2e_tests::next_event(&mut events).await,
+        GatewayEvent::KeyPackagesLow { remaining: 9 }
+    );
     kept_up(&server, &laptop, 20).await;
 
     // Kept up again at the next connection, and never more than 20.

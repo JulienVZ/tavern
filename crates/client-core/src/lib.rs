@@ -16,6 +16,7 @@ pub mod error;
 pub mod gateway;
 pub mod instance;
 mod key_packages;
+mod leaves;
 pub mod local;
 pub mod password;
 pub mod qr;
