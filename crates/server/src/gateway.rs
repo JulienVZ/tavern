@@ -95,6 +95,12 @@ pub enum Event {
         /// The conversation.
         conversation_id: Uuid,
     },
+    /// No member of a conversation's group can commit any more: an active
+    /// device of a participant recreates it (ADR 0019, sections 3 and 17).
+    RecreateConversation {
+        /// The conversation.
+        conversation_id: Uuid,
+    },
     /// A friend of the receiving user enrolled (`added`) or revoked a device.
     UserDevicesChanged {
         /// The friend.

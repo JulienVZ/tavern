@@ -4431,3 +4431,104 @@ fn a_leaf_from_a_key_package_is_known_until_its_first_update() {
         "replaced by the update"
     );
 }
+
+/// Section 3, the server's side, in real time: the server's public state
+/// holds a leaf never updated whose lifetime is over. A member's commit that
+/// leaves its `Remove` out is refused (`RemovalPending`, checked before the
+/// GroupInfo); the commit that carries it is accepted, its tree without the
+/// leaf, and merged; the server's state then validates commits again.
+#[test]
+fn the_server_takes_the_removal_of_an_expired_leaf_and_nothing_else() {
+    let (alice, bob) = (Account::new(1), Account::new(2));
+    let server = ExternalSenderKey::generate();
+    let pins = Pins::of(&[&alice, &bob]);
+    let creator = alice.device(0xa1);
+    let absent = bob.device(0xb1);
+    let short = short_lived(&absent, SHORT_LIFETIME);
+    let (mut group, commit) = Group::create(
+        &creator.provider,
+        &creator.signer(),
+        creator.credential(),
+        &expected(),
+        &server.public_bytes(),
+        &[claim(&absent, &short, &pins)],
+        &pins,
+    )
+    .unwrap();
+    group.merge_pending_commit(&creator.provider).unwrap();
+    let (mut state, _) = PublicState::create(
+        &commit.group_info,
+        &expected(),
+        creator.leaf(),
+        &pins,
+        &server.public_bytes(),
+    )
+    .unwrap();
+    std::thread::sleep(PAST_IT);
+
+    // The server asks to remove the expired leaf.
+    let leaf = state.leaf_of(absent.leaf()).unwrap();
+    let proposal = state
+        .remove(leaf, &ServerSigner::new(&server))
+        .unwrap()
+        .expect("a new removal");
+    // A commit built before the member read the removal: refused.
+    let without = group
+        .self_update(&creator.provider, &creator.signer(), &pins)
+        .unwrap();
+    let refused = state.validate_commit(
+        &without.commit,
+        &without.group_info,
+        creator.leaf(),
+        &expected(),
+        &pins,
+    );
+    assert!(
+        matches!(refused, Err(MlsError::RemovalPending)),
+        "{:?}",
+        refused.err()
+    );
+    group.discard_pending_commit(&creator.provider).unwrap();
+
+    // The commit that carries it: accepted, and merged.
+    assert_eq!(
+        group.process(&creator.provider, &proposal, &pins).unwrap(),
+        Incoming::Proposal
+    );
+    let with = group
+        .commit_pending_proposals(&creator.provider, &creator.signer(), &pins)
+        .unwrap()
+        .expect("the removal is pending");
+    let validated = state
+        .validate_commit(
+            &with.commit,
+            &with.group_info,
+            creator.leaf(),
+            &expected(),
+            &pins,
+        )
+        .unwrap();
+    state.merge(validated, &ServerSigner::new(&server)).unwrap();
+    group.merge_pending_commit(&creator.provider).unwrap();
+    assert!(state.leaf_of(absent.leaf()).is_none());
+    assert!(
+        state
+            .key_package_leaves()
+            .iter()
+            .all(|(index, _)| *index != leaf.u32())
+    );
+
+    // And the group goes on: an update validates.
+    let update = group
+        .self_update(&creator.provider, &creator.signer(), &pins)
+        .unwrap();
+    state
+        .validate_commit(
+            &update.commit,
+            &update.group_info,
+            creator.leaf(),
+            &expected(),
+            &pins,
+        )
+        .unwrap();
+}

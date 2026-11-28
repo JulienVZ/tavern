@@ -456,14 +456,20 @@ fn server_external_sender(public_key: &[u8; crate::identity::PUBLIC_KEY_LEN]) ->
 pub(crate) fn create_config(
     external_sender: &[u8; crate::identity::PUBLIC_KEY_LEN],
 ) -> Result<MlsGroupCreateConfig, MlsError> {
+    create_config_with_lifetime(external_sender, key_package::LIFETIME_SECONDS)
+}
+
+/// [`create_config`], the creator's leaf valid `lifetime_seconds` from now.
+pub(crate) fn create_config_with_lifetime(
+    external_sender: &[u8; crate::identity::PUBLIC_KEY_LEN],
+    lifetime_seconds: u64,
+) -> Result<MlsGroupCreateConfig, MlsError> {
     Ok(MlsGroupCreateConfig::builder()
         .ciphersuite(CIPHERSUITE)
         // The creator's leaf is made as a KeyPackage's would be, with a
         // lifetime (OpenMLS's default is 84 days): the same as this
         // device's packages, and replaced by its first update (section 3).
-        .lifetime(openmls::prelude::Lifetime::new(
-            key_package::LIFETIME_SECONDS,
-        ))
+        .lifetime(openmls::prelude::Lifetime::new(lifetime_seconds))
         .capabilities(capabilities())
         .padding_size(PADDING_SIZE)
         .max_past_epochs(MAX_PAST_EPOCHS)

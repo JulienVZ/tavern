@@ -588,6 +588,10 @@ async fn on_message(
             delivery::fetch_group_info(state, session, request).await,
             ServerPayload::GroupInfo,
         ),
+        Some(ClientPayload::ReportUnjoinable(request)) => answer(
+            delivery::report_unjoinable(state, session, request).await,
+            |()| ServerPayload::Ack(proto::Ack {}),
+        ),
         Some(ClientPayload::Heartbeat(_)) => ServerPayload::HeartbeatAck(proto::HeartbeatAck {
             server_time_ms: now_ms(),
         }),
@@ -743,6 +747,12 @@ pub fn event_payload(event: Event) -> (ServerPayload, Option<u16>) {
         Event::Welcome(welcome) => (ServerPayload::WelcomeEvent(welcome.as_ref().clone()), None),
         Event::JoinConversation { conversation_id } => (
             ServerPayload::JoinConversation(proto::JoinConversation {
+                conversation_id: conversation_id.as_bytes().to_vec(),
+            }),
+            None,
+        ),
+        Event::RecreateConversation { conversation_id } => (
+            ServerPayload::RecreateConversation(proto::RecreateConversation {
                 conversation_id: conversation_id.as_bytes().to_vec(),
             }),
             None,

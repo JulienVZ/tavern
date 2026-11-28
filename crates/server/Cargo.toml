@@ -39,7 +39,7 @@ tokio-tungstenite.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tavern-crypto.workspace = true
+tavern-crypto = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

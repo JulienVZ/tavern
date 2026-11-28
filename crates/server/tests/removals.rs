@@ -708,6 +708,8 @@ async fn a_removal_stored_without_its_row_gets_its_row() {
     mls::save(&mut tx, loaded).await.unwrap();
     tx.commit().await.unwrap();
 
+    // Due: away (the reason is read again under the lock).
+    away(&app, &bob1.device).await;
     assert!(
         removals::remove_from(&app.state, dm.conversation, bob1.device.device_id)
             .await
@@ -971,4 +973,237 @@ async fn a_leaf_never_updated_is_removed_seven_days_before_its_end() {
 
     // Alice's leaf, updated, has no end: never this removal.
     assert_eq!(removals::sweep(&app.state).await.unwrap(), 0);
+}
+
+/// Whether `dm`'s conversation must be recreated, and because no member can
+/// commit.
+async fn dead(app: &TestApp, dm: &Dm) -> (bool, bool) {
+    sqlx::query_as("SELECT needs_recreation, group_dead FROM conversations WHERE id = $1")
+        .bind(dm.conversation)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap()
+}
+
+/// The same DM, for the group of another generation.
+fn at_generation(dm: &Dm, generation: u32) -> Dm {
+    Dm {
+        conversation: dm.conversation,
+        generation,
+        participants: dm.participants,
+        keys: Keys(dm.keys.0.clone()),
+        external_sender: dm.external_sender,
+    }
+}
+
+/// Sections 3 and 17, the reviewer's case: Alice's only device creates the
+/// DM with Bob's only device, which never processes its Welcome. Alice's
+/// device goes away (removed for its inactivity), then Bob's leaf nears
+/// the end of its lifetime (removed too): no member can commit those
+/// removals. The server declares the group dead, tells the active devices
+/// of both participants to recreate it, and takes nothing else; the first
+/// recreation, at the next generation, is accepted, the next one refused
+/// with a clear error.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_group_without_a_member_that_can_commit_is_recreated_once() {
+    let app = TestApp::spawn_unlimited().await;
+    let (alice, a1) = app.account_with_device("rm", false).await;
+    let bob = app.register("rm", false).await;
+    let dm = dm_between(&app, (&alice, &a1), &bob).await;
+    let b1 = app.enrol(&bob).await;
+    upload(&app, &b1, 3).await;
+    let claimed = claim(&app, &a1, &bob, &dm.keys).await;
+    let mut a1 = Member::connect(&app, a1).await;
+    let mut b1 = Member::connect(&app, b1).await;
+    let commit = a1.create(&dm, &claimed);
+    let id = a1.submit(&dm, 0, commit, false).await;
+    commit_ack(&a1.answer(id).await);
+    a1.merge();
+    // Bob's device never processes its Welcome.
+    assert!(matches!(b1.event().await, ServerPayload::WelcomeEvent(_)));
+
+    away(&app, &a1.device).await;
+    removals::sweep(&app.state).await.unwrap();
+    assert_eq!(
+        dead(&app, &dm).await,
+        (false, false),
+        "Bob's device is a member"
+    );
+    leaf_ends_in(&app, &dm, &b1.device, 6).await;
+    removals::sweep(&app.state).await.unwrap();
+    assert_eq!(pending_removals(&app, dm.conversation).await.len(), 2);
+    assert_eq!(dead(&app, &dm).await, (true, true));
+    // Bob's device, active, is told: after the two removals.
+    for _ in 0..2 {
+        assert!(matches!(b1.event().await, ServerPayload::ProposalEvent(_)));
+    }
+    b1.nothing_waiting().await;
+    assert_eq!(b1.told_to_recreate, [dm.conversation]);
+    assert!(
+        a1.told_to_recreate.is_empty(),
+        "away: it reads it when back"
+    );
+    assert!(listed(&app, &b1.device, &dm).await.needs_recreation);
+    // Nothing else is taken.
+    let answer = b1
+        .request(ClientPayload::FetchGroupInfo(proto::FetchGroupInfo {
+            conversation_id: dm.conversation.as_bytes().to_vec(),
+        }))
+        .await;
+    assert_eq!(code(&answer), proto::ErrorCode::GroupRecreationRequired);
+    // Asked again: nothing new.
+    removals::sweep(&app.state).await.unwrap();
+    b1.nothing_waiting().await;
+    assert_eq!(b1.told_to_recreate, [dm.conversation]);
+
+    // Alice's device is back; Bob's recreates the group at the next
+    // generation, with it: accepted, at once (no hourly limit).
+    back(&app, &a1.device).await;
+    assert!(listed(&app, &a1.device, &dm).await.needs_recreation);
+    upload(&app, &a1.device, 3).await;
+    let next = at_generation(&dm, 1);
+    let from_alice = claim(&app, &b1.device, &alice, &next.keys).await;
+    let recreation = b1.create(&next, &from_alice);
+    let id = b1.submit(&next, 0, recreation, false).await;
+    assert_eq!(commit_ack(&b1.answer(id).await).new_epoch, 1);
+    b1.merge();
+    assert_eq!(dead(&app, &dm).await, (false, false));
+    assert!(!listed(&app, &b1.device, &dm).await.needs_recreation);
+
+    // Alice's device tries too, with its own: refused, clearly.
+    let from_bob = claim(&app, &a1.device, &bob, &next.keys).await;
+    a1.drop_group();
+    let second = a1.create(&next, &from_bob);
+    let id = a1.submit(&next, 0, second, false).await;
+    let (code, message) = error_text(&a1.answer(id).await);
+    assert_eq!(code, proto::ErrorCode::StaleEpoch);
+    assert!(
+        message.contains("another device created this group"),
+        "{message}"
+    );
+}
+
+/// Section 3: a device that cannot join reports it; the server asks for the
+/// removals due in that conversation at once, and declares the group dead
+/// if no member can commit. A device of another user cannot report; a
+/// report about a live group changes nothing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_report_that_a_group_cannot_be_joined_checks_it_at_once() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    let report = |conversation: Uuid| {
+        ClientPayload::ReportUnjoinable(proto::ReportUnjoinable {
+            conversation_id: conversation.as_bytes().to_vec(),
+        })
+    };
+
+    // A live group: nothing.
+    assert!(matches!(
+        bob1.request(report(dm.conversation)).await,
+        ServerPayload::Ack(_)
+    ));
+    assert!(pending_removals(&app, dm.conversation).await.is_empty());
+    // Someone else's conversation.
+    let (_, carol1) = app.account_with_device("rm", false).await;
+    let mut carol1 = Member::connect(&app, carol1).await;
+    assert_eq!(
+        code(&carol1.request(report(dm.conversation)).await),
+        proto::ErrorCode::NotAMember
+    );
+
+    // Alice's device away, Bob's leaf past its end: no sweep yet, the
+    // report does it.
+    away(&app, &alice1.device).await;
+    leaf_ends_in(&app, &dm, &bob1.device, -1).await;
+    assert!(matches!(
+        bob1.request(report(dm.conversation)).await,
+        ServerPayload::Ack(_)
+    ));
+    assert_eq!(pending_removals(&app, dm.conversation).await.len(), 2);
+    assert_eq!(dead(&app, &dm).await, (true, true));
+    // Its own removal, and Alice's if it came first (a device cut off gets
+    // nothing more): in either order, then the request to recreate.
+    let answer = bob1
+        .request(ClientPayload::Heartbeat(proto::Heartbeat {}))
+        .await;
+    assert!(matches!(answer, ServerPayload::HeartbeatAck(_)));
+    let mut told = Vec::new();
+    while let Some(event) = bob1.events.pop_front() {
+        match event {
+            ServerPayload::ProposalEvent(_) => {}
+            ServerPayload::RecreateConversation(recreate) => {
+                told.push(Uuid::from_slice(&recreate.conversation_id).unwrap());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(told, [dm.conversation]);
+    drop(alice1.socket.close(None).await);
+}
+
+/// The review's race: a leaf picked by the sweep, then updated (or its
+/// device back) before its removal is asked for, under the conversation's
+/// lock, keeps its place: the reason is read again under the lock.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_leaf_no_longer_due_under_the_lock_is_not_removed() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    // Picked for its end, then updated.
+    leaf_ends_in(&app, &dm, &bob1.device, 6).await;
+    let update = bob1.self_update(&dm);
+    let id = bob1.submit(&dm, 1, update, false).await;
+    commit_ack(&bob1.answer(id).await);
+    bob1.merge();
+    assert!(
+        !removals::remove_from(&app.state, dm.conversation, bob1.device.device_id)
+            .await
+            .unwrap()
+    );
+    // Picked for its absence, then back (it was never away here).
+    assert!(
+        !removals::remove_from(&app.state, dm.conversation, alice1.device.device_id)
+            .await
+            .unwrap()
+    );
+    assert!(pending_removals(&app, dm.conversation).await.is_empty());
+    let ServerPayload::CommitEvent(_) = alice1.event().await else {
+        panic!("expected Bob's update");
+    };
+    alice1.nothing_waiting().await;
+}
+
+/// Minor 3 of the review of 7b6efd1: a group's creator chooses its own
+/// leaf's lifetime unchecked by OpenMLS; one past now + 120 days is an
+/// invalid commit, never an internal error, and nothing is stored. 100
+/// days is taken.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_leaf_living_too_long_is_an_invalid_commit() {
+    const DAY: u64 = 24 * 3600;
+    let app = TestApp::spawn_unlimited().await;
+    let (alice, a1) = app.account_with_device("rm", false).await;
+    let bob = app.register("rm", false).await;
+    let dm = dm_between(&app, (&alice, &a1), &bob).await;
+    let b1 = app.enrol(&bob).await;
+    upload(&app, &b1, 3).await;
+    let mut a1 = Member::connect(&app, a1).await;
+    for lifetime in [200 * DAY, 10_000_000 * DAY] {
+        let claimed = claim(&app, &a1.device, &bob, &dm.keys).await;
+        let commit = a1.create_with_leaf_lifetime(&dm, &claimed, lifetime);
+        let id = a1.submit(&dm, 0, commit, false).await;
+        assert_eq!(
+            code(&a1.answer(id).await),
+            proto::ErrorCode::InvalidCommit,
+            "{lifetime} s"
+        );
+        a1.drop_group();
+    }
+    assert!(listed(&app, &a1.device, &dm).await.generation.is_none());
+    let claimed = claim(&app, &a1.device, &bob, &dm.keys).await;
+    let commit = a1.create_with_leaf_lifetime(&dm, &claimed, 100 * DAY);
+    let id = a1.submit(&dm, 0, commit, false).await;
+    commit_ack(&a1.answer(id).await);
 }

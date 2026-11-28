@@ -290,6 +290,52 @@ impl Group {
         key_packages: &[ClaimedKeyPackage],
         roster: &impl Roster,
     ) -> Result<(Self, Commit), MlsError> {
+        Self::create_with(
+            provider,
+            signer,
+            credential,
+            expected,
+            key_packages,
+            roster,
+            &create_config(external_sender)?,
+        )
+    }
+
+    /// [`Group::create`], the creator's leaf valid `lifetime_seconds` from
+    /// now instead of the packages' lifetime: for tests of what OpenMLS and
+    /// the server do with lifetimes.
+    #[cfg(any(test, feature = "test-support"))]
+    #[expect(clippy::too_many_arguments, reason = "Group::create and the lifetime")]
+    pub fn create_with_leaf_lifetime<P: OpenMlsProvider>(
+        provider: &P,
+        signer: &DeviceSigner<'_>,
+        credential: CredentialWithKey,
+        expected: &ExpectedGroup<'_>,
+        external_sender: &[u8; PUBLIC_KEY_LEN],
+        key_packages: &[ClaimedKeyPackage],
+        roster: &impl Roster,
+        lifetime_seconds: u64,
+    ) -> Result<(Self, Commit), MlsError> {
+        Self::create_with(
+            provider,
+            signer,
+            credential,
+            expected,
+            key_packages,
+            roster,
+            &super::create_config_with_lifetime(external_sender, lifetime_seconds)?,
+        )
+    }
+
+    fn create_with<P: OpenMlsProvider>(
+        provider: &P,
+        signer: &DeviceSigner<'_>,
+        credential: CredentialWithKey,
+        expected: &ExpectedGroup<'_>,
+        key_packages: &[ClaimedKeyPackage],
+        roster: &impl Roster,
+        config: &openmls::prelude::MlsGroupCreateConfig,
+    ) -> Result<(Self, Commit), MlsError> {
         let own = verify_leaf(
             &credential.credential,
             credential.signature_key.as_slice(),
@@ -299,11 +345,10 @@ impl Group {
         members.extend(check_key_packages(key_packages, roster, &[own])?);
         expected.check_members(&members)?;
 
-        let config = create_config(external_sender)?;
         let inner = MlsGroup::new_with_group_id(
             provider,
             signer,
-            &config,
+            config,
             expected.identity.to_group_id(),
             credential,
         )

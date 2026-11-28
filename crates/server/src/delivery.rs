@@ -110,6 +110,15 @@ impl Refused {
         )
     }
 
+    /// The first commit of a group generation another device created first,
+    /// or recreated: one recreation is accepted, the first (section 17).
+    fn already_created() -> Self {
+        Self::new(
+            proto::ErrorCode::StaleEpoch,
+            "another device created this group first: process its Welcome, or join it",
+        )
+    }
+
     fn invalid_commit() -> Self {
         Self::new(
             proto::ErrorCode::InvalidCommit,
@@ -174,7 +183,7 @@ fn commit_refused(error: MlsError, current_epoch: u64) -> Refused {
 fn state_refused(error: StateError) -> Refused {
     match error {
         // Another device created the group, or committed, first.
-        StateError::GenerationExists => Refused::stale(),
+        StateError::GenerationExists => Refused::already_created(),
         StateError::Mls(error) => commit_refused(error, 0),
         StateError::Database(error) => error.into(),
         StateError::NoConversation => Refused::not_a_member(),
@@ -389,8 +398,12 @@ pub(crate) async fn group_of(
 /// 17), read under its lock.
 #[derive(Debug, Clone, Copy)]
 struct Recreation {
-    /// A restore requires it: nothing else is accepted until then.
+    /// A restore, or a group without a member that can commit, requires it:
+    /// nothing else is accepted until then.
     required: bool,
+    /// Required because no member can commit (the next generation), not by
+    /// a restore (the restore's generation).
+    dead: bool,
     /// How long until a user may ask for one again (at most once an hour),
     /// if they may not yet.
     wait_ms: Option<u32>,
@@ -405,8 +418,8 @@ async fn instance_generation(conn: &mut PgConnection) -> Result<u64> {
 }
 
 async fn recreation(conn: &mut PgConnection, conversation: Uuid) -> Result<Recreation> {
-    let (required, wait_ms): (bool, Option<i64>) = sqlx::query_as(
-        "SELECT needs_recreation, \
+    let (required, dead, wait_ms): (bool, bool, Option<i64>) = sqlx::query_as(
+        "SELECT needs_recreation, group_dead, \
                 CASE WHEN recreated_at > now() - interval '1 hour' \
                      THEN ceil(extract(epoch FROM recreated_at + interval '1 hour' - now()) \
                                * 1000)::bigint END \
@@ -417,6 +430,7 @@ async fn recreation(conn: &mut PgConnection, conversation: Uuid) -> Result<Recre
     .await?;
     Ok(Recreation {
         required,
+        dead,
         wait_ms: wait_ms.map(|ms| u32::try_from(ms.max(1)).unwrap_or(u32::MAX)),
     })
 }
@@ -439,7 +453,9 @@ async fn clear_old_group(conn: &mut PgConnection, conversation: Uuid) -> Result<
             .await?;
     }
     sqlx::query(
-        "UPDATE conversations SET needs_recreation = false, recreated_at = now() WHERE id = $1",
+        "UPDATE conversations SET needs_recreation = false, group_dead = false, \
+                                  recreated_at = now() \
+         WHERE id = $1",
     )
     .bind(conversation)
     .execute(conn)
@@ -621,6 +637,27 @@ async fn sync_leaves(
     Ok(())
 }
 
+/// How long a leaf still as its KeyPackage made it may live, at most: the
+/// packages' lifetime (90 days) and the longest retention. Only a group's
+/// creator chooses its own leaf's lifetime unchecked (OpenMLS bounds a
+/// KeyPackage's, not a creator's leaf): a longer one is refused as an
+/// invalid commit, never kept, nor given to the database out of its range.
+const MAX_LEAF_LIFETIME_SECONDS: u64 = 120 * 24 * 3600;
+
+/// Refuses a tree whose leaves from KeyPackages (`expiring`, each with the
+/// end of its lifetime in seconds) live longer than
+/// [`MAX_LEAF_LIFETIME_SECONDS`] from now.
+fn check_leaf_ends(expiring: &[(u32, u64)]) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let limit = now.saturating_add(MAX_LEAF_LIFETIME_SECONDS);
+    if expiring.iter().any(|(_, end)| *end > limit) {
+        return Err(Refused::invalid_commit());
+    }
+    Ok(())
+}
+
 /// Checks that `welcome` is for exactly the KeyPackages `added` (their
 /// references), the ones a member's commit adds; no Welcome when it adds
 /// none.
@@ -769,8 +806,9 @@ pub async fn submit_commit(
             // The one generation it may take: after a restore, the first of
             // the new instance generation, which no group of the conversation
             // had before (`tavern_protocol::group_generation`); at a user's
-            // request (section 11), the next one; a new group, 0.
-            let allowed = if recreation.required {
+            // request (section 11), or when no member can commit (section 3),
+            // the next one; a new group, 0.
+            let allowed = if recreation.required && !recreation.dead {
                 group_generation::after_restore(instance_generation(&mut tx).await?)
             } else {
                 current.map_or(Some(0), |(generation, _)| {
@@ -806,6 +844,13 @@ pub async fn submit_commit(
         }
         (Some(header), Some((generation, _))) if header.group.generation < generation => {
             return Err(Refused::recreation_required());
+        }
+        // The first commit of the generation the group has: another device
+        // created or recreated it first, and only the first is accepted.
+        (Some(CommitHeader { group, epoch: 0 }), Some((generation, _)))
+            if request.epoch == 0 && group.generation == generation && !recreation.required =>
+        {
+            return Err(Refused::already_created());
         }
         _ if recreation.required => return Err(Refused::recreation_required()),
         _ => None,
@@ -850,6 +895,7 @@ pub async fn submit_commit(
                 .map_err(|error| commit_refused(error, 0))?;
                 let leaves = public.leaves();
                 let expiring = public.key_package_leaves();
+                check_leaf_ends(&expiring)?;
                 let added = public
                     .leaf_keys()
                     .into_iter()
@@ -934,6 +980,7 @@ pub async fn submit_commit(
                     )
                     .map_err(|error| commit_refused(error, epoch))?;
                 let leaves = (loaded.state.leaves(), loaded.state.key_package_leaves());
+                check_leaf_ends(&leaves.1)?;
                 let still_pending = loaded
                     .state
                     .pending_removals()
@@ -1339,6 +1386,32 @@ type GroupInfoRow = (Uuid, Uuid, bool, Option<i64>, Option<Vec<u8>>);
 /// in a read-only DM, where an external commit is refused anyway, the tree
 /// it holds would tell the other user of every change of devices. The
 /// blocked user is answered what an unfriended one is.
+/// `ReportUnjoinable`: a device of a participant cannot join the group (a
+/// leaf outlived its KeyPackage). The server asks for the removals due in
+/// the conversation and checks whether any member can still commit
+/// ([`crate::removals::check`]); nothing of the report is taken on trust.
+pub async fn report_unjoinable(
+    state: &AppState,
+    session: &Session,
+    request: proto::ReportUnjoinable,
+) -> Result<()> {
+    let conversation = conversation_id(&request.conversation_id)?;
+    let participant: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM dm_conversations \
+                        WHERE conversation_id = $1 AND $2 IN (user_low, user_high))",
+    )
+    .bind(conversation)
+    .bind(session.user_id)
+    .fetch_one(&state.db)
+    .await?;
+    if !participant {
+        return Err(Refused::not_a_member());
+    }
+    crate::removals::check(state, conversation)
+        .await
+        .map_err(state_refused)
+}
+
 pub async fn fetch_group_info(
     state: &AppState,
     session: &Session,

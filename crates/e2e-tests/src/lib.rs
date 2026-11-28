@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tavern_client_core::local::ProfileLock;
 use tavern_client_core::{GatewayEvent, InstanceClient, InstanceUrl, MemoryStore};
 use tavern_server::secrets::InstanceSecrets;
 use tavern_server::{AppState, Settings, app, db, routes};
@@ -62,6 +63,9 @@ pub fn database_url() -> String {
 /// A password that meets the strength requirement.
 pub const PASSWORD: &str = "tournesol-vexant-42-brume";
 
+/// A computer's local data directory and a profile.
+type ProfileKey = (PathBuf, Option<String>);
+
 /// A running server.
 pub struct Server {
     /// Where it listens.
@@ -71,6 +75,9 @@ pub struct Server {
     /// The local data directories of the simulated computers, deleted with
     /// the server.
     data: tempfile::TempDir,
+    /// The hold of each profile of each computer: one per window of the
+    /// application, shared here by the clients of one computer and profile.
+    locks: std::sync::Mutex<HashMap<ProfileKey, Arc<ProfileLock>>>,
 }
 
 impl Server {
@@ -110,7 +117,12 @@ impl Server {
             .unwrap();
         });
         let data = tempfile::tempdir().expect("a temporary directory");
-        Self { addr, state, data }
+        Self {
+            addr,
+            state,
+            data,
+            locks: std::sync::Mutex::default(),
+        }
     }
 
     /// A client on a computer that has never been used: empty secret store.
@@ -130,7 +142,15 @@ impl Server {
     /// with the same local data directory.
     pub fn computer(&self, store: &Arc<MemoryStore>, profile: Option<&str>) -> InstanceClient {
         let url = InstanceUrl::parse(&format!("http://{}", self.addr)).unwrap();
-        InstanceClient::new(url, store.clone(), &self.local_data(store), profile).unwrap()
+        let local_data = self.local_data(store);
+        let lock = Arc::clone(
+            self.locks
+                .lock()
+                .unwrap()
+                .entry((local_data.clone(), profile.map(str::to_owned)))
+                .or_insert_with(|| Arc::new(ProfileLock::acquire(&local_data, profile).unwrap())),
+        );
+        InstanceClient::new(url, store.clone(), lock).unwrap()
     }
 
     /// The local data directory of the computer whose secret store is `store`.

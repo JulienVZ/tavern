@@ -331,8 +331,9 @@ async fn a_weak_password_is_refused_before_anything_is_sent() {
     let computer = InstanceClient::new(
         nowhere,
         std::sync::Arc::new(MemoryStore::default()),
-        data.path(),
-        None,
+        std::sync::Arc::new(
+            tavern_client_core::local::ProfileLock::acquire(data.path(), None).unwrap(),
+        ),
     )
     .unwrap();
 

@@ -127,6 +127,8 @@ pub enum LocalStoreError {
 #[derive(Debug)]
 pub struct ProfileLock {
     _file: std::fs::File,
+    local_data: PathBuf,
+    profile: Option<String>,
 }
 
 impl ProfileLock {
@@ -150,11 +152,35 @@ impl ProfileLock {
             .write(true)
             .open(directory.join(format!("{name}.lock")))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self {
+                _file: file,
+                local_data: local_data.to_owned(),
+                profile: profile.map(str::to_owned),
+            }),
             Err(std::fs::TryLockError::WouldBlock) => Err(LocalStoreError::ProfileInUse),
             Err(std::fs::TryLockError::Error(error)) => Err(LocalStoreError::Io(error)),
         }
     }
+
+    /// The application's local data directory this lock holds a profile of.
+    pub fn local_data(&self) -> &Path {
+        &self.local_data
+    }
+
+    /// The profile held (`None`: the default one).
+    pub fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+}
+
+/// A profile lock for the tests of this crate, held for the whole run.
+#[cfg(test)]
+pub(crate) fn test_lock() -> &'static ProfileLock {
+    static LOCK: std::sync::OnceLock<ProfileLock> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| {
+        let directory = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        ProfileLock::acquire(directory.path(), Some("tests")).unwrap()
+    })
 }
 
 /// Keeps the SQLite error code and drops the rest: some rusqlite errors carry
@@ -218,12 +244,17 @@ impl LocalStore {
     /// Never opens anything in clear: a plain SQLite file, a file encrypted
     /// with another key and a damaged file all give
     /// [`LocalStoreError::Unreadable`]. Blocking; see [`open_in`].
+    ///
+    /// `profile`: this window's hold of the profile, which a store is never
+    /// opened without (one window per profile, [`ProfileLock`]).
     pub fn open(
         path: &Path,
         key: &Secret<32>,
         binding: Binding,
         now_ms: u64,
+        profile: &ProfileLock,
     ) -> Result<Self, LocalStoreError> {
+        let _held = profile;
         let mut connection = connect(path, key)?;
         migrations::bring_up_to_date(&mut connection, binding, now_ms)?;
         let info = read_info(&connection)?;
@@ -616,6 +647,7 @@ impl AccountDirectory {
         fresh: bool,
         existed: bool,
         now_ms: u64,
+        profile: &ProfileLock,
     ) -> Result<Opened, LocalStoreError> {
         if fresh {
             self.remove()?;
@@ -623,13 +655,13 @@ impl AccountDirectory {
         create_private_dir(&self.0)?;
         let database = self.database();
         if !database.exists() {
-            let store = LocalStore::open(&database, key, binding, now_ms)?;
+            let store = LocalStore::open(&database, key, binding, now_ms, profile)?;
             return Ok(Opened {
                 store,
                 reset: existed && !fresh,
             });
         }
-        match LocalStore::open(&database, key, binding, now_ms) {
+        match LocalStore::open(&database, key, binding, now_ms, profile) {
             Ok(store) => Ok(Opened {
                 store,
                 reset: false,
@@ -637,7 +669,7 @@ impl AccountDirectory {
             Err(LocalStoreError::Unreadable | LocalStoreError::OtherDevice) => {
                 tracing::warn!("the local store could not be opened; starting an empty one");
                 self.set_aside()?;
-                let store = LocalStore::open(&database, key, binding, now_ms)?;
+                let store = LocalStore::open(&database, key, binding, now_ms, profile)?;
                 Ok(Opened { store, reset: true })
             }
             Err(error) => Err(error),

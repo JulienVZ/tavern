@@ -32,7 +32,17 @@ fn not_friends() -> ApiError {
 
 /// A DM, its group if any, whether its users are friends, and whether the
 /// requesting device is in its group.
-type Row = (Uuid, i64, Uuid, Uuid, Option<i64>, Option<i64>, bool, bool);
+type Row = (
+    Uuid,
+    i64,
+    Uuid,
+    Uuid,
+    Option<i64>,
+    Option<i64>,
+    bool,
+    bool,
+    bool,
+);
 
 /// The DMs of the session's user, or the one with id `only`, oldest first.
 async fn dms<'c>(
@@ -49,7 +59,7 @@ async fn dms<'c>(
                         WHERE m.conversation_id = c.id AND m.device_id = $3 \
                           AND m.left_seq IS NULL AND ",
         crate::delivery::not_cut_off!("m"),
-        ") \
+        "), c.needs_recreation \
          FROM dm_conversations d \
          JOIN conversations c ON c.id = d.conversation_id \
          LEFT JOIN mls_groups g ON g.conversation_id = c.id \
@@ -63,7 +73,9 @@ async fn dms<'c>(
     .await?)
 }
 
-fn view((id, last_seq, low, high, generation, epoch, friends, joined): Row) -> Conversation {
+fn view(
+    (id, last_seq, low, high, generation, epoch, friends, joined, needs_recreation): Row,
+) -> Conversation {
     Conversation {
         conversation_id: id,
         kind: ConversationKind::Dm,
@@ -73,6 +85,7 @@ fn view((id, last_seq, low, high, generation, epoch, friends, joined): Row) -> C
         last_seq: u64::try_from(last_seq).unwrap_or_default(),
         read_only: !friends,
         joined,
+        needs_recreation,
     }
 }
 

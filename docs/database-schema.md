@@ -231,9 +231,11 @@ CREATE TABLE conversations (
     last_seq      bigint NOT NULL DEFAULT 0,                 -- META  last assigned sequence number
     created_by    uuid REFERENCES users(id) ON DELETE SET NULL, -- META
     created_at    timestamptz NOT NULL DEFAULT now(),        -- META
-    needs_recreation boolean NOT NULL DEFAULT false,         -- META  set by a restore: only the recreation of its group is accepted (migration 0014)
+    needs_recreation boolean NOT NULL DEFAULT false,         -- META  set by a restore, or with `group_dead`: only the recreation of its group is accepted (migration 0014)
     recreated_at  timestamptz,                               -- META  last recreation of its group: a user may ask for one at most once an hour
-    CHECK (last_seq >= 0)
+    group_dead    boolean NOT NULL DEFAULT false,            -- META  no member of its group can commit: recreated at the next generation (migration 0017)
+    CHECK (last_seq >= 0),
+    CHECK (NOT group_dead OR needs_recreation)
 );
 
 CREATE TABLE dm_conversations (

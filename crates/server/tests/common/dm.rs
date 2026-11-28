@@ -196,6 +196,8 @@ pub struct Member {
     /// commit (`JoinConversation`), in the order it did; kept aside by
     /// [`Member::event`].
     pub told_to_join: Vec<Uuid>,
+    /// The conversations whose group it was told to recreate.
+    pub told_to_recreate: Vec<Uuid>,
 }
 
 impl Member {
@@ -217,6 +219,7 @@ impl Member {
             group: None,
             acked_welcomes: HashSet::new(),
             told_to_join: Vec::new(),
+            told_to_recreate: Vec::new(),
         }
     }
 
@@ -264,6 +267,9 @@ impl Member {
                 ServerPayload::JoinConversation(join) => self
                     .told_to_join
                     .push(Uuid::from_slice(&join.conversation_id).unwrap()),
+                ServerPayload::RecreateConversation(recreate) => self
+                    .told_to_recreate
+                    .push(Uuid::from_slice(&recreate.conversation_id).unwrap()),
                 event if self.seen(&event) => {}
                 event => return event,
             }
@@ -281,6 +287,11 @@ impl Member {
             if let ServerPayload::JoinConversation(join) = &event {
                 self.told_to_join
                     .push(Uuid::from_slice(&join.conversation_id).unwrap());
+                continue;
+            }
+            if let ServerPayload::RecreateConversation(recreate) = &event {
+                self.told_to_recreate
+                    .push(Uuid::from_slice(&recreate.conversation_id).unwrap());
                 continue;
             }
             assert!(
@@ -306,6 +317,28 @@ impl Member {
             &dm.external_sender,
             claimed,
             &dm.keys,
+        )
+        .unwrap();
+        self.group = Some(group);
+        commit
+    }
+
+    /// [`Member::create`], this device's leaf valid `seconds` from now.
+    pub fn create_with_leaf_lifetime(
+        &mut self,
+        dm: &Dm,
+        claimed: &[ClaimedKeyPackage],
+        seconds: u64,
+    ) -> Commit {
+        let (group, commit) = Group::create_with_leaf_lifetime(
+            &self.device.provider,
+            &DeviceSigner::new(&self.device.key),
+            for_device(&self.device.certificate, &self.device.key.public()),
+            &dm.expected(),
+            &dm.external_sender,
+            claimed,
+            &dm.keys,
+            seconds,
         )
         .unwrap();
         self.group = Some(group);
@@ -822,4 +855,21 @@ pub async fn group_of_two(app: &TestApp) -> (Account, Member, Account, Member, D
     alice1.merge();
     bob1.join(&dm).await;
     (alice, alice1, bob, bob1, dm)
+}
+
+/// Makes the leaf of `device` in `conversation` due for the server's
+/// removal without changing its activity: its end, within the 7 days the
+/// server removes a leaf never updated before (ADR 0019, section 3). The
+/// server reads the reason of a removal again under the conversation's
+/// lock, and removes no leaf that is not due.
+pub async fn make_due(app: &TestApp, conversation: Uuid, device: Uuid) {
+    sqlx::query(
+        "UPDATE conversation_devices SET leaf_expires_at = now() + interval '1 day' \
+         WHERE conversation_id = $1 AND device_id = $2 AND left_seq IS NULL",
+    )
+    .bind(conversation)
+    .bind(device)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
 }

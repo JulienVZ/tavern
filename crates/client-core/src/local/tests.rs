@@ -98,7 +98,14 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[tokio::test]
 async fn the_cipher_parameters_are_frozen() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+    let store = LocalStore::open(
+        &store_path(&dir),
+        &key(1),
+        binding(),
+        NOW_MS,
+        super::test_lock(),
+    )
+    .unwrap();
 
     assert!(pragma(&store, "cipher_version").await.starts_with("4."));
     assert_eq!(pragma(&store, "cipher_page_size").await, "4096");
@@ -120,7 +127,14 @@ async fn the_cipher_parameters_are_frozen() {
 #[tokio::test]
 async fn the_crypto_comes_from_the_expected_library() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+    let store = LocalStore::open(
+        &store_path(&dir),
+        &key(1),
+        binding(),
+        NOW_MS,
+        super::test_lock(),
+    )
+    .unwrap();
     let provider = pragma(&store, "cipher_provider").await;
     let version = pragma(&store, "cipher_provider_version").await;
 
@@ -138,7 +152,7 @@ async fn the_crypto_comes_from_the_expected_library() {
 async fn a_store_reopens_with_its_key_and_refuses_any_other() {
     let dir = tempfile::tempdir().unwrap();
     let path = store_path(&dir);
-    let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+    let store = LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()).unwrap();
     exec(
         &store,
         "CREATE TABLE probe (body TEXT); INSERT INTO probe VALUES ('kept');",
@@ -149,7 +163,8 @@ async fn a_store_reopens_with_its_key_and_refuses_any_other() {
     assert!(!store.is_open());
     assert!(matches!(store.info().await, Err(LocalStoreError::Closed)));
 
-    let again = LocalStore::open(&path, &key(1), binding(), NOW_MS + 1).unwrap();
+    let again =
+        LocalStore::open(&path, &key(1), binding(), NOW_MS + 1, super::test_lock()).unwrap();
     assert_eq!(again.info().await.unwrap(), created);
     let body = again
         .run(|connection| {
@@ -164,12 +179,12 @@ async fn a_store_reopens_with_its_key_and_refuses_any_other() {
 
     for wrong in [key(2), key(0)] {
         assert!(matches!(
-            LocalStore::open(&path, &wrong, binding(), NOW_MS),
+            LocalStore::open(&path, &wrong, binding(), NOW_MS, super::test_lock()),
             Err(LocalStoreError::Unreadable)
         ));
     }
     // The refusals changed nothing: the right key still opens it.
-    LocalStore::open(&path, &key(1), binding(), NOW_MS)
+    LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock())
         .unwrap()
         .close();
 }
@@ -188,7 +203,7 @@ fn a_plain_or_foreign_file_is_never_opened() {
     assert!(before.starts_with(b"SQLite format 3\0"));
 
     assert!(matches!(
-        LocalStore::open(&path, &key(1), binding(), NOW_MS),
+        LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()),
         Err(LocalStoreError::Unreadable)
     ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -196,7 +211,7 @@ fn a_plain_or_foreign_file_is_never_opened() {
     let garbage = dir.path().join("garbage.db");
     std::fs::write(&garbage, [0x5a_u8; 8192]).unwrap();
     assert!(matches!(
-        LocalStore::open(&garbage, &key(1), binding(), NOW_MS),
+        LocalStore::open(&garbage, &key(1), binding(), NOW_MS, super::test_lock()),
         Err(LocalStoreError::Unreadable)
     ));
 }
@@ -210,7 +225,14 @@ async fn nothing_is_written_in_clear() {
         b"MARKER-table-name",
     ];
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+    let store = LocalStore::open(
+        &store_path(&dir),
+        &key(1),
+        binding(),
+        NOW_MS,
+        super::test_lock(),
+    )
+    .unwrap();
     exec(
         &store,
         "CREATE TABLE MARKER_table_name (body TEXT, data BLOB);
@@ -268,7 +290,14 @@ async fn nothing_is_written_in_clear() {
 #[tokio::test]
 async fn full_text_search_ignores_accents_and_case() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+    let store = LocalStore::open(
+        &store_path(&dir),
+        &key(1),
+        binding(),
+        NOW_MS,
+        super::test_lock(),
+    )
+    .unwrap();
     exec(
         &store,
         "CREATE VIRTUAL TABLE search USING fts5(body, tokenize = 'unicode61 remove_diacritics 2');
@@ -296,7 +325,8 @@ async fn every_earlier_schema_version_is_brought_up_to_date() {
         let dir = tempfile::tempdir().unwrap();
         let path = store_path(&dir);
         // A store as an older client left it: migrations up to `from`.
-        let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+        let store =
+            LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()).unwrap();
         if from < LATEST_VERSION {
             store
                 .run(move |connection| {
@@ -308,7 +338,8 @@ async fn every_earlier_schema_version_is_brought_up_to_date() {
         }
         store.close();
 
-        let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+        let store =
+            LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()).unwrap();
         let info = store.info().await.unwrap();
         assert_eq!(info.schema_version, LATEST_VERSION, "from version {from}");
         assert_eq!(info.binding, binding());
@@ -352,7 +383,7 @@ fn rebuild_at(connection: &mut Connection, version: u32) {
 async fn a_store_from_a_newer_client_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = store_path(&dir);
-    let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+    let store = LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()).unwrap();
     store
         .run(|connection| {
             connection
@@ -364,7 +395,7 @@ async fn a_store_from_a_newer_client_is_refused() {
     store.close();
 
     assert!(matches!(
-        LocalStore::open(&path, &key(1), binding(), NOW_MS),
+        LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()),
         Err(LocalStoreError::TooNew { found, known }) if found == LATEST_VERSION + 1 && known == LATEST_VERSION
     ));
 }
@@ -373,7 +404,7 @@ async fn a_store_from_a_newer_client_is_refused() {
 fn a_store_of_another_device_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = store_path(&dir);
-    LocalStore::open(&path, &key(1), binding(), NOW_MS)
+    LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock())
         .unwrap()
         .close();
     let other = Binding {
@@ -381,7 +412,7 @@ fn a_store_of_another_device_is_refused() {
         ..binding()
     };
     assert!(matches!(
-        LocalStore::open(&path, &key(1), other, NOW_MS),
+        LocalStore::open(&path, &key(1), other, NOW_MS, super::test_lock()),
         Err(LocalStoreError::OtherDevice)
     ));
 }
@@ -410,10 +441,11 @@ async fn the_format_of_the_first_release_still_opens() {
     std::fs::copy(fixture_path(), &copy).unwrap();
 
     assert!(matches!(
-        LocalStore::open(&copy, &key(1), binding(), NOW_MS),
+        LocalStore::open(&copy, &key(1), binding(), NOW_MS, super::test_lock()),
         Err(LocalStoreError::Unreadable)
     ));
-    let store = LocalStore::open(&copy, &fixture_key(), binding(), NOW_MS).unwrap();
+    let store =
+        LocalStore::open(&copy, &fixture_key(), binding(), NOW_MS, super::test_lock()).unwrap();
     let info = store.info().await.unwrap();
     assert_eq!(info.binding, binding());
     assert_eq!(info.created_at_ms, FIXTURE_CREATED_AT_MS);
@@ -441,7 +473,14 @@ async fn write_the_fixture_of_the_first_release() {
     let path = fixture_path();
     assert!(!path.exists(), "the fixture exists and is frozen");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let store = LocalStore::open(&path, &fixture_key(), binding(), FIXTURE_CREATED_AT_MS).unwrap();
+    let store = LocalStore::open(
+        &path,
+        &fixture_key(),
+        binding(),
+        FIXTURE_CREATED_AT_MS,
+        super::test_lock(),
+    )
+    .unwrap();
     exec(
         &store,
         "CREATE TABLE fixture_probe (body TEXT);
@@ -458,14 +497,14 @@ fn a_fresh_key_replaces_whatever_was_there() {
     let root = tempfile::tempdir().unwrap();
     let directory = AccountDirectory(root.path().join("account"));
     let first = directory
-        .open(&key(1), binding(), true, false, NOW_MS)
+        .open(&key(1), binding(), true, false, NOW_MS, super::test_lock())
         .unwrap();
     assert!(!first.reset);
     first.store.close();
 
     // New device or lost key: the old file can never be read again.
     let fresh = directory
-        .open(&key(2), binding(), true, true, NOW_MS)
+        .open(&key(2), binding(), true, true, NOW_MS, super::test_lock())
         .unwrap();
     assert!(
         !fresh.reset,
@@ -481,14 +520,14 @@ fn a_store_that_vanished_is_reported() {
     let directory = AccountDirectory(root.path().join("account"));
     // Before this version of the client, signed-in accounts had no store.
     let first = directory
-        .open(&key(1), binding(), false, false, NOW_MS)
+        .open(&key(1), binding(), false, false, NOW_MS, super::test_lock())
         .unwrap();
     assert!(!first.reset);
     first.store.close();
 
     std::fs::remove_dir_all(&directory.0).unwrap();
     let again = directory
-        .open(&key(1), binding(), false, true, NOW_MS)
+        .open(&key(1), binding(), false, true, NOW_MS, super::test_lock())
         .unwrap();
     assert!(again.reset);
     again.store.close();
@@ -499,7 +538,7 @@ fn a_store_that_does_not_open_is_set_aside_and_reported() {
     let root = tempfile::tempdir().unwrap();
     let directory = AccountDirectory(root.path().join("account"));
     directory
-        .open(&key(1), binding(), false, false, NOW_MS)
+        .open(&key(1), binding(), false, false, NOW_MS, super::test_lock())
         .unwrap()
         .store
         .close();
@@ -509,7 +548,7 @@ fn a_store_that_does_not_open_is_set_aside_and_reported() {
     std::fs::write(&database, &damaged).unwrap();
 
     let opened = directory
-        .open(&key(1), binding(), false, true, NOW_MS)
+        .open(&key(1), binding(), false, true, NOW_MS, super::test_lock())
         .unwrap();
     assert!(opened.reset);
     opened.store.close();
@@ -524,7 +563,7 @@ fn other_failures_touch_nothing() {
     let root = tempfile::tempdir().unwrap();
     let directory = AccountDirectory(root.path().join("account"));
     let opened = directory
-        .open(&key(1), binding(), false, false, NOW_MS)
+        .open(&key(1), binding(), false, false, NOW_MS, super::test_lock())
         .unwrap();
     let path = opened.store.path().to_owned();
     opened.store.close();
@@ -540,7 +579,7 @@ fn other_failures_touch_nothing() {
     let before = std::fs::read(&path).unwrap();
 
     assert!(matches!(
-        directory.open(&key(1), binding(), false, true, NOW_MS),
+        directory.open(&key(1), binding(), false, true, NOW_MS, super::test_lock()),
         Err(LocalStoreError::TooNew { .. })
     ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -560,7 +599,14 @@ fn removing_a_directory_that_does_not_exist_is_fine() {
 #[tokio::test]
 async fn commits_are_durable() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+    let store = LocalStore::open(
+        &store_path(&dir),
+        &key(1),
+        binding(),
+        NOW_MS,
+        super::test_lock(),
+    )
+    .unwrap();
     // 2 is FULL.
     assert_eq!(pragma(&store, "synchronous").await, "2");
     assert_eq!(pragma(&store, "journal_mode").await, "wal");
@@ -579,7 +625,14 @@ async fn commits_are_durable() {
 async fn measure_durable_commits() {
     for setting in ["NORMAL", "FULL", "FULL_FULLFSYNC"] {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::open(&store_path(&dir), &key(1), binding(), NOW_MS).unwrap();
+        let store = LocalStore::open(
+            &store_path(&dir),
+            &key(1),
+            binding(),
+            NOW_MS,
+            super::test_lock(),
+        )
+        .unwrap();
         let elapsed = store
             .run(move |connection| {
                 let (synchronous, fullfsync) = match setting {
@@ -626,7 +679,8 @@ async fn an_upgraded_store_runs_mls_operations() {
     for from in 1..LATEST_VERSION {
         let dir = tempfile::tempdir().unwrap();
         let path = store_path(&dir);
-        let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+        let store =
+            LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()).unwrap();
         store
             .run(move |connection| {
                 rebuild_at(connection, from);
@@ -635,7 +689,8 @@ async fn an_upgraded_store_runs_mls_operations() {
             .await
             .unwrap();
         store.close();
-        let store = LocalStore::open(&path, &key(1), binding(), NOW_MS).unwrap();
+        let store =
+            LocalStore::open(&path, &key(1), binding(), NOW_MS, super::test_lock()).unwrap();
 
         let device_key = DeviceKey::generate();
         let certificate = AccountRootSecret::generate()

@@ -856,6 +856,12 @@ dto! {
         /// enrolled after it was created, one back after an inactivity): it
         /// joins by external commit, in a DM that is not read-only.
         pub joined: bool,
+        /// Whether its group must be recreated before anything else: after
+        /// a restored backup, or when no member of the group can commit any
+        /// more (ADR 0019, sections 3, 15 and 17). `false` from an older
+        /// instance, which does not say.
+        #[serde(default)]
+        pub needs_recreation: bool,
     }
 }
 

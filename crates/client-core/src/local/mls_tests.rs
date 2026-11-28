@@ -99,6 +99,7 @@ impl Device {
                 &Secret::from_slice(&[7; 32]).unwrap(),
                 binding,
                 NOW_MS,
+                super::test_lock(),
             )
         } else {
             LocalStore::open_unencrypted(&path, binding, NOW_MS)
@@ -176,6 +177,7 @@ impl Device {
                 device_id: self.device_id,
             },
             NOW_MS,
+            super::test_lock(),
         )
         .unwrap();
     }
@@ -764,6 +766,7 @@ async fn the_mls_state_of_the_first_release_still_reads() {
             device_id: Uuid::from_u128(0x0000_0000_0000_7000_8000_0000_0000_0d01),
         },
         NOW_MS,
+        super::test_lock(),
     )
     .unwrap();
     let text = store
@@ -806,6 +809,7 @@ async fn write_the_mls_state_of_the_first_release() {
             device_id: bob1.device_id,
         },
         NOW_MS,
+        super::test_lock(),
     )
     .unwrap();
     let bob1 = Device {

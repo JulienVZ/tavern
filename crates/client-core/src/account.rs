@@ -10,7 +10,6 @@
 //! One computer keeps one device per account (ADR 0017): signing out keeps
 //! the device, so signing in again finds it and its local store.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,7 +44,7 @@ use crate::error::ClientError;
 use crate::gateway::Gateway;
 use crate::instance::InstanceUrl;
 use crate::key_packages;
-use crate::local::{AccountDirectory, Binding, LocalStore};
+use crate::local::{AccountDirectory, Binding, LocalStore, ProfileLock};
 use crate::password;
 use crate::store::{KnownAccounts, Records, SecretStore, StoredDevice};
 
@@ -83,8 +82,9 @@ fn now_ms() -> u64 {
 pub struct InstanceClient {
     api: Api,
     records: Records,
-    /// Where the local stores of this computer live.
-    local_root: Arc<PathBuf>,
+    /// This window's hold of its profile: where the local stores of this
+    /// computer live, and which profile; no store opens without it.
+    profile: Arc<ProfileLock>,
 }
 
 impl std::fmt::Debug for InstanceClient {
@@ -184,34 +184,27 @@ impl PendingTotp {
 }
 
 impl InstanceClient {
-    /// Prepares to talk to an instance. `local_root` is the directory of this
-    /// computer's local stores (the application's local data directory).
-    /// `profile` separates several accounts on one computer; pass `None`
-    /// normally.
+    /// Prepares to talk to an instance, in the profile this window holds
+    /// (its local data directory, and the profile, which separates several
+    /// accounts on one computer: `None` normally).
     pub fn new(
         instance: InstanceUrl,
         store: Arc<dyn SecretStore>,
-        local_root: &Path,
-        profile: Option<&str>,
+        profile: Arc<ProfileLock>,
     ) -> Result<Self, ClientError> {
-        let records = Records::new(store, instance.as_str(), profile);
+        let records = Records::new(store, instance.as_str(), profile.profile());
         Ok(Self {
             api: Api::new(instance)?,
             records,
-            local_root: Arc::new(local_root.to_owned()),
+            profile,
         })
     }
 
     /// The directory of an account's local store on this computer.
     fn account_directory(&self, user_id: Uuid) -> AccountDirectory {
-        AccountDirectory(
-            self.local_root
-                .join("accounts")
-                .join(local_store::directory_name(
-                    self.records.scope(),
-                    user_id.as_bytes(),
-                )),
-        )
+        AccountDirectory(self.profile.local_data().join("accounts").join(
+            local_store::directory_name(self.records.scope(), user_id.as_bytes()),
+        ))
     }
 
     /// Opens the local store of a signed-in account (see
@@ -230,8 +223,10 @@ impl InstanceClient {
             device_id: device.device_id,
         };
         let existed = device.local_store_created;
+        let profile = Arc::clone(&self.profile);
         let opened =
-            blocking(move || directory.open(&key, binding, fresh, existed, now_ms())).await??;
+            blocking(move || directory.open(&key, binding, fresh, existed, now_ms(), &profile))
+                .await??;
         if !existed {
             let mut device = device.clone();
             device.local_store_created = true;
@@ -840,6 +835,22 @@ impl Client {
         result
     }
 
+    /// The local part of the upkeep only: forgets the KeyPackages that are
+    /// due, and erases the journal, without the instance. Runs as soon as
+    /// the client starts, connected or not.
+    async fn forget_due_key_packages(&self) {
+        let _one_at_a_time = self.key_packages.lock().await;
+        match key_packages::forget_due(&self.local, now_ms()).await {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(error) = self.local.erase_journal().await {
+                    tracing::warn!(%error, "cannot erase the journal of the local store");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "cannot forget the KeyPackages due"),
+        }
+    }
+
     async fn keep_key_packages_up(&self, replace_last_resort: bool) -> Result<(), ClientError> {
         let refused_at = key_packages::refused_at(&self.local).await?;
         match key_packages::clock_gate(refused_at, self.clock_skew_ms(), now_ms()) {
@@ -1168,15 +1179,26 @@ impl Client {
         )?;
         let (events, received) = tokio::sync::mpsc::channel(64);
         let client = self.duplicate();
-        // Every hour whatever the connection, and while the gateway lives:
-        // what is due locally never waits for a connection.
-        let hourly = key_packages::spawn_every(key_packages::UPKEEP_INTERVAL, {
-            let (client, events) = (client.duplicate(), events.clone());
-            move || {
+        // What is due locally at once, connected or not; the whole upkeep
+        // every hour whatever the connection, the first an hour from now
+        // (the connection runs one as it comes up), while the gateway lives.
+        let hourly = key_packages::spawn_upkeep(
+            key_packages::UPKEEP_INTERVAL,
+            {
+                let client = client.duplicate();
+                move || {
+                    let client = client.duplicate();
+                    async move { client.forget_due_key_packages().await }
+                }
+            },
+            {
                 let (client, events) = (client.duplicate(), events.clone());
-                async move { client.upkeep(&events).await }
-            }
-        });
+                move || {
+                    let (client, events) = (client.duplicate(), events.clone());
+                    async move { client.upkeep(&events).await }
+                }
+            },
+        );
         tokio::spawn(async move {
             while let Some(event) = raw.recv().await {
                 if let GatewayEvent::Connected { server_time_ms, .. } = &event {

@@ -11,7 +11,6 @@
 
 mod error;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -50,14 +49,12 @@ struct Session {
 
 struct Shell {
     store: Arc<dyn SecretStore>,
-    /// The application's local data directory: the accounts' local stores.
-    local_data: PathBuf,
-    /// Separates several accounts on one computer (`TAVERN_PROFILE`), for
-    /// development: two clients can then run side by side.
-    profile: Option<String>,
-    /// This window's hold of the profile, for as long as it runs; `Err`
+    /// This window's hold of the profile, for as long as it runs: the
+    /// application's local data directory (the accounts' local stores) and
+    /// the profile, which separates several accounts on one computer
+    /// (`TAVERN_PROFILE`, for development: two clients side by side). `Err`
     /// when another window has it, and every account operation is refused.
-    profile_lock: std::result::Result<ProfileLock, LocalStoreError>,
+    profile_lock: std::result::Result<Arc<ProfileLock>, LocalStoreError>,
     session: Mutex<Session>,
 }
 
@@ -243,6 +240,7 @@ impl GatewayView {
             | GatewayEvent::UserDevicesChanged { .. }
             | GatewayEvent::ConversationCreated { .. }
             | GatewayEvent::JoinConversation { .. }
+            | GatewayEvent::RecreateConversation { .. }
             | GatewayEvent::Sequenced(_)
             | GatewayEvent::Welcome(_)
             | GatewayEvent::KeyPackagesLow { .. }
@@ -323,13 +321,16 @@ async fn probe_instance(
     url: String,
 ) -> Result<InstanceProbe> {
     // One window per profile: the first command of every start.
-    if let Err(error) = &shell.profile_lock {
-        return Err(ClientError::LocalStore(match error {
-            LocalStoreError::ProfileInUse => LocalStoreError::ProfileInUse,
-            _ => LocalStoreError::Database("the profile cannot be locked".to_owned()),
-        })
-        .into());
-    }
+    let profile_lock = match &shell.profile_lock {
+        Ok(lock) => Arc::clone(lock),
+        Err(error) => {
+            return Err(ClientError::LocalStore(match error {
+                LocalStoreError::ProfileInUse => LocalStoreError::ProfileInUse,
+                _ => LocalStoreError::Database("the profile cannot be locked".to_owned()),
+            })
+            .into());
+        }
+    };
     let instance_url = InstanceUrl::parse(&url)?;
     let health = fetch_health(&instance_url).await?;
     let version = fetch_version(&instance_url).await?;
@@ -339,12 +340,7 @@ async fn probe_instance(
         // Nothing would work reliably: refuse now, with a clear reason.
         Compatibility::ServerNewer => return Err(ClientError::ClientTooOld.into()),
     };
-    let instance = InstanceClient::new(
-        instance_url,
-        shell.store.clone(),
-        &shell.local_data,
-        shell.profile.as_deref(),
-    )?;
+    let instance = InstanceClient::new(instance_url, shell.store.clone(), profile_lock)?;
 
     let mut session = shell.session.lock().await;
     *session = Session::default();
@@ -711,12 +707,10 @@ pub fn run() -> std::result::Result<(), tauri::Error> {
             // Local, not roaming, on Windows: the store is useless on any other
             // computer, its key being this device's.
             let local_data = app.path().app_local_data_dir()?;
-            let profile_lock = ProfileLock::acquire(&local_data, profile.as_deref());
+            let profile_lock = ProfileLock::acquire(&local_data, profile.as_deref()).map(Arc::new);
             app.manage(Shell {
                 store: Arc::new(KeychainStore::new(&identifier)),
-                local_data,
                 profile_lock,
-                profile,
                 session: Mutex::new(Session::default()),
             });
             Ok(())

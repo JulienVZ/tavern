@@ -122,15 +122,23 @@ pub(crate) fn clock_gate(refused_at: Option<u64>, skew_ms: Option<i64>, now_ms: 
 /// How often the KeyPackages are kept up, whatever the connection.
 pub const UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Runs `run` every `every`, the first time `every` from now, until
-/// aborted: the upkeep's clock, independent of the connection (the
-/// connection runs it besides, as it comes up).
-pub(crate) fn spawn_every<F, Fut>(every: std::time::Duration, run: F) -> tokio::task::JoinHandle<()>
+/// The upkeep's clock, independent of the connection, until aborted: runs
+/// `local` (what is due without the instance) at once, then `run` (the
+/// whole upkeep) every `every`, the first time `every` from now (the
+/// connection runs one besides, as it comes up).
+pub(crate) fn spawn_upkeep<L, LF, R, RF>(
+    every: std::time::Duration,
+    local: L,
+    run: R,
+) -> tokio::task::JoinHandle<()>
 where
-    F: Fn() -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
+    L: FnOnce() -> LF + Send + 'static,
+    LF: Future<Output = ()> + Send + 'static,
+    R: Fn() -> RF + Send + 'static,
+    RF: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
+        local().await;
         let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -592,6 +600,7 @@ mod tests {
                     device_id: device,
                 },
                 NOW_MS,
+                crate::local::test_lock(),
             )
             .unwrap();
             Self {
@@ -614,6 +623,7 @@ mod tests {
                 &Secret::from_slice(&[3; 32]).unwrap(),
                 self.binding,
                 NOW_MS,
+                crate::local::test_lock(),
             )
             .unwrap();
         }
@@ -877,27 +887,38 @@ mod tests {
     async fn the_upkeep_runs_every_hour_on_its_own() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
-        let runs = Arc::new(AtomicU32::new(0));
-        let handle = spawn_every(UPKEEP_INTERVAL, {
-            let runs = Arc::clone(&runs);
-            move || {
-                let runs = Arc::clone(&runs);
-                async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
+        let (local, runs) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let handle = spawn_upkeep(
+            UPKEEP_INTERVAL,
+            {
+                let local = Arc::clone(&local);
+                move || async move {
+                    local.fetch_add(1, Ordering::SeqCst);
                 }
-            }
-        });
+            },
+            {
+                let runs = Arc::clone(&runs);
+                move || {
+                    let runs = Arc::clone(&runs);
+                    async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            },
+        );
         tokio::task::yield_now().await;
+        assert_eq!(local.load(Ordering::SeqCst), 1, "what is local, at once");
         assert_eq!(
             runs.load(Ordering::SeqCst),
             0,
-            "the connection runs it at once"
+            "the connection runs the rest at once"
         );
         for _ in 0..24 {
             tokio::time::advance(UPKEEP_INTERVAL).await;
             tokio::task::yield_now().await;
         }
         assert_eq!(runs.load(Ordering::SeqCst), 24, "every hour, for a day");
+        assert_eq!(local.load(Ordering::SeqCst), 1);
         handle.abort();
     }
 

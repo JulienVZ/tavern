@@ -58,8 +58,8 @@ pub fn build<P: OpenMlsProvider>(
 
 /// A one-time KeyPackage valid `seconds` from now, in real time: to test
 /// what OpenMLS does once a lifetime is over.
-#[cfg(test)]
-pub(crate) fn build_with_lifetime<P: OpenMlsProvider>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_with_lifetime<P: OpenMlsProvider>(
     provider: &P,
     signer: &DeviceSigner<'_>,
     credential: CredentialWithKey,

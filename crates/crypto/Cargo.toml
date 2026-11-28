@@ -10,6 +10,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Builders for tests of lifetimes (a group whose creator's leaf, or a
+# KeyPackage, lives a chosen time), for the server's tests. Never enabled
+# outside tests.
+test-support = []
+
 [dependencies]
 tavern-protocol.workspace = true
 tavern-argon2-memory.workspace = true

@@ -357,6 +357,7 @@ async fn messages_sent_at_once_take_consecutive_numbers() {
 /// (`removals`): its proposal is stored with the group's state, and
 /// appended to the sequence.
 async fn server_removes(app: &TestApp, dm: &Dm, device: VerifiedLeaf) {
+    make_due(app, dm.conversation, Uuid::from_bytes(device.device_id)).await;
     let issued = removals::remove_from(
         &app.state,
         dm.conversation,

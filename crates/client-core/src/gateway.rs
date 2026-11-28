@@ -243,6 +243,13 @@ pub enum GatewayEvent {
         /// The conversation.
         conversation_id: Uuid,
     },
+    /// No member of a conversation's group can commit any more: an active
+    /// device of a participant recreates it, at the next generation (ADR
+    /// 0019, sections 3 and 17; task 10c).
+    RecreateConversation {
+        /// The conversation.
+        conversation_id: Uuid,
+    },
     /// A friend enrolled (`added`) or revoked a device.
     UserDevicesChanged {
         /// The friend.
@@ -505,6 +512,23 @@ impl Gateway {
     ) -> Result<proto::GroupInfo, RequestError> {
         match self.request(ClientPayload::FetchGroupInfo(request)).await? {
             ServerPayload::GroupInfo(info) => Ok(info),
+            _ => Err(RequestError::Unexpected),
+        }
+    }
+
+    /// `ReportUnjoinable`: this device cannot join the conversation's group
+    /// (a Welcome or an external commit refused as `MlsError::Expired`).
+    /// Sent once per refusal, never in a loop; the instance checks the
+    /// group, and asks for its recreation if no member can commit.
+    pub async fn report_unjoinable(&self, conversation_id: Uuid) -> Result<(), RequestError> {
+        let request = proto::ReportUnjoinable {
+            conversation_id: conversation_id.as_bytes().to_vec(),
+        };
+        match self
+            .request(ClientPayload::ReportUnjoinable(request))
+            .await?
+        {
+            ServerPayload::Ack(_) => Ok(()),
             _ => Err(RequestError::Unexpected),
         }
     }
@@ -854,6 +878,11 @@ async fn connection(
                     }
                     Some(ServerPayload::JoinConversation(join)) => uuid(&join.conversation_id)
                         .map(|conversation_id| GatewayEvent::JoinConversation { conversation_id }),
+                    Some(ServerPayload::RecreateConversation(recreate)) => {
+                        uuid(&recreate.conversation_id).map(|conversation_id| {
+                            GatewayEvent::RecreateConversation { conversation_id }
+                        })
+                    }
                     Some(ServerPayload::UserDevicesChanged(change)) => uuid(&change.user_id)
                         .zip(uuid(&change.device_id))
                         .map(|(user_id, device_id)| GatewayEvent::UserDevicesChanged {

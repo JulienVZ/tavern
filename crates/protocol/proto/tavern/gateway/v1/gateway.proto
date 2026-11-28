@@ -30,6 +30,7 @@ message ClientFrame {
     AckMessages ack_messages = 23;
     AckWelcome ack_welcome = 24;
     FetchGroupInfo fetch_group_info = 25;
+    ReportUnjoinable report_unjoinable = 26;  // Since minor 8.
   }
 }
 
@@ -65,6 +66,7 @@ message ServerFrame {
     KeyPackagesLow key_packages_low = 48;  // Since minor 2.
     UserDevicesChanged user_devices_changed = 49;  // Since minor 3.
     JoinConversation join_conversation = 50;  // Since minor 6.
+    RecreateConversation recreate_conversation = 51;  // Since minor 8.
   }
 }
 
@@ -168,6 +170,18 @@ message ConversationCreated {
 // merges, to such devices if they are connected, in a DM open to writing
 // only; the others read `joined` in GET /v1/conversations. Since minor 6.
 message JoinConversation {
+  bytes conversation_id = 1;
+}
+
+// A conversation's group has no member left that can commit: every leaf is
+// being removed by the server (away, revoked, or a leaf never updated near
+// the end of its lifetime). It must be recreated (ADR 0019, sections 3 and
+// 17): any active device of a participant builds the first commit of the
+// next generation; the first one wins, the others are told STALE_EPOCH.
+// Until then the old group takes nothing: GROUP_RECREATION_REQUIRED. Sent
+// to the connected devices of both participants; the others read
+// `needs_recreation` in GET /v1/conversations. Since minor 8.
+message RecreateConversation {
   bytes conversation_id = 1;
 }
 
@@ -385,6 +399,14 @@ message AckWelcome { bytes welcome_id = 1; }
 // The latest GroupInfo of a conversation's group, to join it by external
 // commit.
 message FetchGroupInfo { bytes conversation_id = 1; }
+
+// This device cannot join a conversation's group: a Welcome or an external
+// commit refused because a leaf outlived its KeyPackage (ADR 0019, section
+// 3). The server trusts nothing of it: it asks for the removals due in that
+// conversation, and checks whether any member can still commit; if none
+// can, the group must be recreated (RecreateConversation). Answered with
+// Ack. Sent once per refusal, never in a loop. Since minor 8.
+message ReportUnjoinable { bytes conversation_id = 1; }
 
 message GroupInfo {
   uint64 epoch = 1;

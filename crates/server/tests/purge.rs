@@ -150,6 +150,7 @@ async fn the_purge_deletes_what_is_no_longer_needed_and_keeps_the_rest() {
 
     // A device that left: its row stays until it acknowledged the sequence
     // up to its departure.
+    make_due(&app, dm.conversation, bob1.device.device_id).await;
     assert!(
         removals::remove_from(&app.state, dm.conversation, bob1.device.device_id)
             .await
@@ -194,6 +195,7 @@ async fn revoked(app: &TestApp, device: &Device) {
 /// The server's removal of `member`'s device from `dm`, committed by
 /// `committer`: the number of the commit, the device's departure.
 async fn removed(app: &TestApp, dm: &Dm, committer: &mut Member, member: &Member) -> u64 {
+    make_due(app, dm.conversation, member.device.device_id).await;
     assert!(
         removals::remove_from(&app.state, dm.conversation, member.device.device_id)
             .await
@@ -294,6 +296,7 @@ async fn what_follows_a_device_s_proposal_does_not_wait_for_it() {
     commit_ack(&alice2.join_externally(&dm).await);
     alice2.merge();
     for device in [&bob1.device, &alice2.device] {
+        make_due(&app, dm.conversation, device.device_id).await;
         assert!(
             removals::remove_from(&app.state, dm.conversation, device.device_id)
                 .await

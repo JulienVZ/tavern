@@ -47,8 +47,10 @@ pub const GATEWAY_MAJOR_VERSION: u32 = 1;
 ///   `JoinConversation` to the devices left out of a group (M2, ADR 0019);
 /// - 7: a restored backup: `Ready.instance_generation`, the notice
 ///   `INSTANCE_RESTORED` with the date of the backup, the recreation of a
-///   group and `GROUP_RECREATION_REQUIRED` (M2, ADR 0019).
-pub const GATEWAY_MINOR_VERSION: u32 = 7;
+///   group and `GROUP_RECREATION_REQUIRED` (M2, ADR 0019);
+/// - 8: a group without a member that can commit: `RecreateConversation`,
+///   `ReportUnjoinable` (M2, ADR 0019).
+pub const GATEWAY_MINOR_VERSION: u32 = 8;
 
 /// Largest number of notices one `AckSecurityNotices` frame may name.
 pub const MAX_SECURITY_NOTICE_ACKS: usize = 64;

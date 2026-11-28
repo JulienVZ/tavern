@@ -449,12 +449,14 @@ pub async fn handle(db: &PgPool, marker: Option<Marker>) -> Result<Start, sqlx::
     // The sequence numbers given after the backup are lost with it: each
     // conversation's numbering goes on above any of them, so that a device
     // never takes a new message for one it read before the restore.
-    let conversations =
-        sqlx::query("UPDATE conversations SET needs_recreation = true, last_seq = last_seq + $1")
-            .bind(SEQUENCE_JUMP)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+    let conversations = sqlx::query(
+        "UPDATE conversations SET needs_recreation = true, group_dead = false, \
+                                      last_seq = last_seq + $1",
+    )
+    .bind(SEQUENCE_JUMP)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     // Last: the generation counts as handled once all of it is done.
     sqlx::query("UPDATE instance_state SET handled_generation = generation")
         .execute(&mut *tx)

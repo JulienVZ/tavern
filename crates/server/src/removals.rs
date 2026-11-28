@@ -19,6 +19,12 @@
 //! removed, it rejoins by external commit if it is active
 //! (`JoinConversation`), as any device left out (ADR 0019, section 3).
 //!
+//! A group whose leaves are all being removed has no member left that can
+//! commit those removals (nor anything else): the server declares it dead
+//! (`conversations.group_dead`) and asks its participants to recreate it
+//! ([`declare_dead`]): checked with each removal, at each sweep, and when a
+//! device reports it cannot join ([`check`], `ReportUnjoinable`).
+//!
 //! A revocation and the disabling of an account ask for their removals
 //! right after their own transaction, which cannot fail because of them;
 //! the hourly [`sweep`] asks for any that is missing (an inactive device, or
@@ -30,6 +36,7 @@
 /// lifetime is over, OpenMLS refuses to join the group.
 pub const LEAF_EXPIRY_MARGIN_DAYS: i32 = 7;
 
+use sqlx::PgConnection;
 use tavern_crypto::mls::group_id::GroupIdentity;
 use tavern_crypto::mls::{ServerSigner, VerifiedLeaf};
 use uuid::Uuid;
@@ -83,17 +90,60 @@ pub async fn remove_user_devices(state: &AppState, user: Uuid) -> Result<usize, 
 /// asked to remove yet. Returns the number of proposals issued. A failure
 /// in one conversation is logged and does not stop the others.
 pub async fn sweep(state: &AppState) -> Result<usize, StateError> {
+    let issued = remove_due(state, None).await?;
+    // Groups whose leaves were all being removed before this check existed,
+    // or whose check failed: declared now.
+    let stuck: Vec<Uuid> = sqlx::query_scalar(concat!(
+        "SELECT c.id FROM conversations c \
+         WHERE NOT c.needs_recreation \
+           AND EXISTS (SELECT 1 FROM mls_groups g WHERE g.conversation_id = c.id) \
+           AND NOT EXISTS (SELECT 1 FROM conversation_devices m \
+                           WHERE m.conversation_id = c.id AND m.left_seq IS NULL AND ",
+        delivery::not_cut_off!("m"),
+        ") ORDER BY c.id"
+    ))
+    .fetch_all(&state.db)
+    .await?;
+    for conversation in stuck {
+        if let Err(error) = declare_if_dead(state, conversation).await {
+            tracing::error!(%error, %conversation, "cannot check a group for members");
+        }
+    }
+    Ok(issued)
+}
+
+/// Whether the leaf of a device in a conversation, row `c` of
+/// `conversation_devices` joined with its device `d` and user `u`, is due
+/// for removal: its device no longer active (window bound as `$w`), or the
+/// leaf never updated and ending within [`LEAF_EXPIRY_MARGIN_DAYS`] (bound
+/// as `$m`). A string literal, for `concat!`.
+macro_rules! due {
+    ($w:literal, $m:literal) => {
+        concat!(
+            "(NOT (",
+            activity::active_device!($w),
+            ") OR c.leaf_expires_at <= now() + make_interval(days => ",
+            $m,
+            "))"
+        )
+    };
+}
+
+/// Asks for the removals due in every conversation, or in `only`. A failure
+/// in one conversation is logged and does not stop the others.
+async fn remove_due(state: &AppState, only: Option<Uuid>) -> Result<usize, StateError> {
     let leaves: Vec<(Uuid, Uuid)> = sqlx::query_as(concat!(
         "SELECT c.conversation_id, c.device_id FROM conversation_devices c \
          JOIN devices d ON d.id = c.device_id JOIN users u ON u.id = d.user_id \
-         WHERE c.left_seq IS NULL AND (NOT (",
-        activity::active_device!("$1"),
-        ") OR c.leaf_expires_at <= now() + make_interval(days => $2)) AND ",
+         WHERE c.left_seq IS NULL AND ($3::uuid IS NULL OR c.conversation_id = $3) AND ",
+        due!("$1", "$2"),
+        " AND ",
         delivery::not_cut_off!("c"),
         " ORDER BY c.conversation_id, c.device_id"
     ))
     .bind(activity::window(state.settings.device_inactive_days))
     .bind(LEAF_EXPIRY_MARGIN_DAYS)
+    .bind(only)
     .fetch_all(&state.db)
     .await?;
     let mut issued = 0;
@@ -107,6 +157,87 @@ pub async fn sweep(state: &AppState) -> Result<usize, StateError> {
         }
     }
     Ok(issued)
+}
+
+/// A device reports it cannot join `conversation`'s group (a leaf outlived
+/// its KeyPackage): the removals due there are asked for now, then whether
+/// any member can still commit is checked. Nothing of the report is taken
+/// on trust; it only makes the server look at once instead of at its next
+/// sweep.
+pub async fn check(state: &AppState, conversation: Uuid) -> Result<(), StateError> {
+    remove_due(state, Some(conversation)).await?;
+    declare_if_dead(state, conversation).await?;
+    Ok(())
+}
+
+/// Declares `conversation`'s group dead, under the conversation's lock, if
+/// none of its leaves can commit, and tells its participants. Returns
+/// whether it was declared now.
+async fn declare_if_dead(state: &AppState, conversation: Uuid) -> Result<bool, StateError> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation)
+        .execute(&mut *tx)
+        .await?;
+    let told = declare_dead(&mut tx, conversation, state.settings.device_inactive_days).await?;
+    tx.commit().await?;
+    notify_dead(state, conversation, told.as_deref().unwrap_or_default());
+    Ok(told.is_some())
+}
+
+/// In the caller's transaction, under the conversation's lock: if the group
+/// has leaves, none of which can commit (each being removed by the server),
+/// marks it dead: only its recreation, at the next generation, is accepted
+/// from now on (`needs_recreation`, `group_dead`; ADR 0019, sections 3 and
+/// 17). Returns the active devices of its participants, to tell after the
+/// commit; `None` if it was not declared now.
+pub(crate) async fn declare_dead(
+    conn: &mut PgConnection,
+    conversation: Uuid,
+    inactive_days: u32,
+) -> Result<Option<Vec<Uuid>>, StateError> {
+    let declared: Option<Uuid> = sqlx::query_scalar(concat!(
+        "UPDATE conversations c SET needs_recreation = true, group_dead = true \
+         WHERE c.id = $1 AND NOT c.needs_recreation \
+           AND EXISTS (SELECT 1 FROM conversation_devices m \
+                       WHERE m.conversation_id = c.id AND m.left_seq IS NULL) \
+           AND NOT EXISTS (SELECT 1 FROM conversation_devices m \
+                           WHERE m.conversation_id = c.id AND m.left_seq IS NULL AND ",
+        delivery::not_cut_off!("m"),
+        ") RETURNING c.id"
+    ))
+    .bind(conversation)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if declared.is_none() {
+        return Ok(None);
+    }
+    tracing::warn!(%conversation, "a group has no member that can commit: to recreate");
+    Ok(Some(
+        sqlx::query_scalar(concat!(
+            "SELECT d.id FROM devices d JOIN users u ON u.id = d.user_id \
+         JOIN dm_conversations m ON d.user_id IN (m.user_low, m.user_high) \
+         WHERE m.conversation_id = $1 AND ",
+            activity::active_device!("$2"),
+            " ORDER BY d.id"
+        ))
+        .bind(conversation)
+        .bind(activity::window(inactive_days))
+        .fetch_all(conn)
+        .await?,
+    ))
+}
+
+/// Tells the devices [`declare_dead`] returned to recreate the group.
+fn notify_dead(state: &AppState, conversation: Uuid, devices: &[Uuid]) {
+    for device in devices {
+        state.gateway.notify_device(
+            *device,
+            Event::RecreateConversation {
+                conversation_id: conversation,
+            },
+        );
+    }
 }
 
 /// Asks for the removal of `device` from `conversation`'s group, in one
@@ -132,13 +263,20 @@ pub async fn remove_from(
     if locked.is_none_or(|needs_recreation| needs_recreation) {
         return Ok(false);
     }
+    // Due still, read under the lock: a leaf updated, or a device back,
+    // since it was picked keeps its place.
     let leaf: Option<Uuid> = sqlx::query_scalar(concat!(
-        "SELECT v.user_id FROM conversation_devices c JOIN devices v ON v.id = c.device_id \
+        "SELECT d.user_id FROM conversation_devices c \
+         JOIN devices d ON d.id = c.device_id JOIN users u ON u.id = d.user_id \
          WHERE c.conversation_id = $1 AND c.device_id = $2 AND c.left_seq IS NULL AND ",
+        due!("$3", "$4"),
+        " AND ",
         delivery::not_cut_off!("c")
     ))
     .bind(conversation)
     .bind(device)
+    .bind(activity::window(state.settings.device_inactive_days))
+    .bind(LEAF_EXPIRY_MARGIN_DAYS)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(user) = leaf else {
@@ -180,7 +318,9 @@ pub async fn remove_from(
         .bind(leaf_index)
         .execute(&mut *tx)
         .await?;
+        let dead = declare_dead(&mut tx, conversation, state.settings.device_inactive_days).await?;
         tx.commit().await?;
+        notify_dead(state, conversation, dead.as_deref().unwrap_or_default());
         return Ok(true);
     };
     mls::save(&mut tx, loaded).await?;
@@ -205,6 +345,7 @@ pub async fn remove_from(
     .execute(&mut *tx)
     .await?;
     let recipients = delivery::members(&mut tx, conversation).await?;
+    let dead = declare_dead(&mut tx, conversation, state.settings.device_inactive_days).await?;
     tx.commit().await?;
 
     tracing::info!(%conversation, "removal of a device asked for");
@@ -216,5 +357,6 @@ pub async fn remove_from(
             .gateway
             .notify_device(recipient, Event::Sequenced(message.clone()));
     }
+    notify_dead(state, conversation, dead.as_deref().unwrap_or_default());
     Ok(true)
 }
