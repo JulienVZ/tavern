@@ -113,6 +113,10 @@ pub enum LocalStoreError {
     /// The files of the store could not be created, moved or removed.
     #[error("the files of the local store cannot be accessed: {0}")]
     Io(#[from] std::io::Error),
+    /// The store is not in the profile this window holds: another profile's,
+    /// or outside its data directory.
+    #[error("the local store is not in the profile this window holds")]
+    WrongProfile,
     /// Another window of this application has this profile open: one
     /// window per profile ([`ProfileLock`]).
     #[error("this profile is already open in another window of Tavern")]
@@ -177,9 +181,14 @@ impl ProfileLock {
 #[cfg(test)]
 pub(crate) fn test_lock() -> &'static ProfileLock {
     static LOCK: std::sync::OnceLock<ProfileLock> = std::sync::OnceLock::new();
+    // The system's temporary directory, which holds every temporary
+    // directory of the tests, under a profile of this process alone.
     LOCK.get_or_init(|| {
-        let directory = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        ProfileLock::acquire(directory.path(), Some("tests")).unwrap()
+        ProfileLock::acquire(
+            &std::env::temp_dir(),
+            Some(&format!("tavern-client-core-tests-{}", std::process::id())),
+        )
+        .unwrap()
     })
 }
 
@@ -254,7 +263,10 @@ impl LocalStore {
         now_ms: u64,
         profile: &ProfileLock,
     ) -> Result<Self, LocalStoreError> {
-        let _held = profile;
+        // The lock covers this store: it lies in the lock's data directory.
+        if !path.starts_with(profile.local_data()) {
+            return Err(LocalStoreError::WrongProfile);
+        }
         let mut connection = connect(path, key)?;
         migrations::bring_up_to_date(&mut connection, binding, now_ms)?;
         let info = read_info(&connection)?;
@@ -621,7 +633,11 @@ pub(crate) struct Opened {
 
 /// Where the store of an account lives, and what to do with what is there.
 #[derive(Debug, Clone)]
-pub(crate) struct AccountDirectory(pub(crate) PathBuf);
+pub(crate) struct AccountDirectory(
+    pub(crate) PathBuf,
+    /// The profile it belongs to (`None`: the default one).
+    pub(crate) Option<String>,
+);
 
 impl AccountDirectory {
     fn database(&self) -> PathBuf {
@@ -649,6 +665,9 @@ impl AccountDirectory {
         now_ms: u64,
         profile: &ProfileLock,
     ) -> Result<Opened, LocalStoreError> {
+        if self.1.as_deref() != profile.profile() {
+            return Err(LocalStoreError::WrongProfile);
+        }
         if fresh {
             self.remove()?;
         }

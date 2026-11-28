@@ -614,6 +614,17 @@ async fn sync_leaves(
     .bind(seq)
     .execute(&mut *conn)
     .await?;
+    Ok(write_leaf_ends(conn, conversation, expiring).await?)
+}
+
+/// Writes the end of each current leaf of `conversation` still as its
+/// KeyPackage made it (`expiring`, from the group's public state), and none
+/// for the others: what [`crate::removals::sweep`] reads.
+pub(crate) async fn write_leaf_ends(
+    conn: &mut PgConnection,
+    conversation: Uuid,
+    expiring: &[(u32, u64)],
+) -> std::result::Result<(), sqlx::Error> {
     let (expiring_leaves, ends): (Vec<i32>, Vec<i64>) = expiring
         .iter()
         .map(|(leaf, end)| {
@@ -625,7 +636,8 @@ async fn sync_leaves(
         .unzip();
     sqlx::query(
         "UPDATE conversation_devices c SET leaf_expires_at = ( \
-             SELECT to_timestamp(t.ends) FROM unnest($2::integer[], $3::bigint[]) AS t(leaf, ends) \
+             SELECT to_timestamp(LEAST(t.ends, 253402300799)) \
+             FROM unnest($2::integer[], $3::bigint[]) AS t(leaf, ends) \
              WHERE t.leaf = c.leaf_index) \
          WHERE c.conversation_id = $1 AND c.left_seq IS NULL",
     )
@@ -1386,10 +1398,14 @@ type GroupInfoRow = (Uuid, Uuid, bool, Option<i64>, Option<Vec<u8>>);
 /// in a read-only DM, where an external commit is refused anyway, the tree
 /// it holds would tell the other user of every change of devices. The
 /// blocked user is answered what an unfriended one is.
-/// `ReportUnjoinable`: a device of a participant cannot join the group (a
-/// leaf outlived its KeyPackage). The server asks for the removals due in
-/// the conversation and checks whether any member can still commit
-/// ([`crate::removals::check`]); nothing of the report is taken on trust.
+/// `ReportUnjoinable`: a device of a participant has no usable state for
+/// the group, and cannot join it (a leaf outlived its KeyPackage, or its
+/// resync failed). If it is a leaf of the group, the server asks to remove
+/// that leaf, its own and no other; then it asks for the removals due in
+/// the conversation, and checks whether any member can still commit
+/// ([`crate::removals::check`]). Nothing else of the report is taken on
+/// trust. One accepted per device and conversation in any hour: others are
+/// refused (`RATE_LIMITED`), with no effect.
 pub async fn report_unjoinable(
     state: &AppState,
     session: &Session,
@@ -1407,7 +1423,20 @@ pub async fn report_unjoinable(
     if !participant {
         return Err(Refused::not_a_member());
     }
-    crate::removals::check(state, conversation)
+    if let Err(wait) = state
+        .rate_limits
+        .unjoinable_reports
+        .admit(session.device_id, conversation)
+    {
+        return Err(Refused {
+            retry_after_ms: u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1),
+            ..Refused::new(
+                proto::ErrorCode::RateLimited,
+                "a device reports a conversation it cannot join at most once an hour",
+            )
+        });
+    }
+    crate::removals::check_reported(state, conversation, session.device_id)
         .await
         .map_err(state_refused)
 }

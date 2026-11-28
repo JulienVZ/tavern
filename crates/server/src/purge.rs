@@ -124,9 +124,20 @@ pub async fn run_once(state: &AppState) {
 
 /// Runs [`run_once`] now, then every [`INTERVAL`], until the runtime stops.
 pub fn spawn(state: AppState) -> JoinHandle<()> {
+    // The first pass first writes the ends of the leaves of groups older than
+    // migration 0016, before its sweep reads them.
+    let filled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_every(INTERVAL, move || {
-        let state = state.clone();
-        async move { run_once(&state).await }
+        let (state, filled) = (state.clone(), std::sync::Arc::clone(&filled));
+        async move {
+            if !filled.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                match removals::fill_leaf_ends(&state, None).await {
+                    Ok(groups) => tracing::info!(groups, "ends of the groups' leaves written"),
+                    Err(error) => tracing::error!(%error, "cannot write the ends of leaves"),
+                }
+            }
+            run_once(&state).await;
+        }
     })
 }
 

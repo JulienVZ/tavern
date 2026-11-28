@@ -202,9 +202,16 @@ impl InstanceClient {
 
     /// The directory of an account's local store on this computer.
     fn account_directory(&self, user_id: Uuid) -> AccountDirectory {
-        AccountDirectory(self.profile.local_data().join("accounts").join(
-            local_store::directory_name(self.records.scope(), user_id.as_bytes()),
-        ))
+        AccountDirectory(
+            self.profile
+                .local_data()
+                .join("accounts")
+                .join(local_store::directory_name(
+                    self.records.scope(),
+                    user_id.as_bytes(),
+                )),
+            self.profile.profile().map(str::to_owned),
+        )
     }
 
     /// Opens the local store of a signed-in account (see

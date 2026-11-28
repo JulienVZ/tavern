@@ -400,12 +400,15 @@ message AckWelcome { bytes welcome_id = 1; }
 // commit.
 message FetchGroupInfo { bytes conversation_id = 1; }
 
-// This device cannot join a conversation's group: a Welcome or an external
-// commit refused because a leaf outlived its KeyPackage (ADR 0019, section
-// 3). The server trusts nothing of it: it asks for the removals due in that
-// conversation, and checks whether any member can still commit; if none
-// can, the group must be recreated (RecreateConversation). Answered with
-// Ack. Sent once per refusal, never in a loop. Since minor 8.
+// This device has no usable state for a conversation's group, and cannot
+// join it: a Welcome or an external commit refused (a leaf outlived its
+// KeyPackage, or its resync failed), its store reset (ADR 0019, section 3).
+// If it is a leaf of the group, the server asks to remove that leaf, its
+// own and never another; then it asks for the removals due there, and
+// checks whether any member can still commit; if none can, the group must
+// be recreated (RecreateConversation). Answered with Ack; one accepted per
+// device and conversation in any hour, the others RATE_LIMITED with no
+// effect. Sent once, after a failed resync, never in a loop. Since minor 8.
 message ReportUnjoinable { bytes conversation_id = 1; }
 
 message GroupInfo {

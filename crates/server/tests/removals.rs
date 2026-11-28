@@ -975,6 +975,13 @@ async fn a_leaf_never_updated_is_removed_seven_days_before_its_end() {
     assert_eq!(removals::sweep(&app.state).await.unwrap(), 0);
 }
 
+/// A device's report that it cannot join `conversation`'s group.
+fn report(conversation: Uuid) -> ClientPayload {
+    ClientPayload::ReportUnjoinable(proto::ReportUnjoinable {
+        conversation_id: conversation.as_bytes().to_vec(),
+    })
+}
+
 /// Whether `dm`'s conversation must be recreated, and because no member can
 /// commit.
 async fn dead(app: &TestApp, dm: &Dm) -> (bool, bool) {
@@ -1092,19 +1099,24 @@ async fn a_group_without_a_member_that_can_commit_is_recreated_once() {
 #[ignore = "needs PostgreSQL, see the module documentation"]
 async fn a_report_that_a_group_cannot_be_joined_checks_it_at_once() {
     let app = TestApp::spawn_unlimited().await;
-    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
-    let report = |conversation: Uuid| {
-        ClientPayload::ReportUnjoinable(proto::ReportUnjoinable {
-            conversation_id: conversation.as_bytes().to_vec(),
-        })
-    };
+    let (_, mut alice1, bob, mut bob1, dm) = group_of_two(&app).await;
+    // Bob's second device, not in the group: its report removes nobody.
+    let mut bob2 = Member::connect(&app, app.enrol(&bob).await).await;
 
     // A live group: nothing.
     assert!(matches!(
-        bob1.request(report(dm.conversation)).await,
+        bob2.request(report(dm.conversation)).await,
         ServerPayload::Ack(_)
     ));
     assert!(pending_removals(&app, dm.conversation).await.is_empty());
+    // Once an hour per device and conversation: the next one is refused,
+    // and does nothing.
+    let answer = bob2.request(report(dm.conversation)).await;
+    assert_eq!(code(&answer), proto::ErrorCode::RateLimited);
+    let ServerPayload::Error(error) = answer else {
+        unreachable!()
+    };
+    assert!(error.retry_after_ms > 3_000_000, "{}", error.retry_after_ms);
     // Someone else's conversation.
     let (_, carol1) = app.account_with_device("rm", false).await;
     let mut carol1 = Member::connect(&app, carol1).await;
@@ -1118,7 +1130,12 @@ async fn a_report_that_a_group_cannot_be_joined_checks_it_at_once() {
     away(&app, &alice1.device).await;
     leaf_ends_in(&app, &dm, &bob1.device, -1).await;
     assert!(matches!(
-        bob1.request(report(dm.conversation)).await,
+        carol1.request(report(dm.conversation)).await,
+        ServerPayload::Error(_)
+    ));
+    let mut bob3 = Member::connect(&app, app.enrol(&bob).await).await;
+    assert!(matches!(
+        bob3.request(report(dm.conversation)).await,
         ServerPayload::Ack(_)
     ));
     assert_eq!(pending_removals(&app, dm.conversation).await.len(), 2);
@@ -1132,7 +1149,7 @@ async fn a_report_that_a_group_cannot_be_joined_checks_it_at_once() {
     let mut told = Vec::new();
     while let Some(event) = bob1.events.pop_front() {
         match event {
-            ServerPayload::ProposalEvent(_) => {}
+            ServerPayload::ProposalEvent(_) | ServerPayload::DeviceListChanged(_) => {}
             ServerPayload::RecreateConversation(recreate) => {
                 told.push(Uuid::from_slice(&recreate.conversation_id).unwrap());
             }
@@ -1206,4 +1223,184 @@ async fn a_leaf_living_too_long_is_an_invalid_commit() {
     let commit = a1.create_with_leaf_lifetime(&dm, &claimed, 100 * DAY);
     let id = a1.submit(&dm, 0, commit, false).await;
     commit_ack(&a1.answer(id).await);
+}
+
+/// The review of e96c16f, the reviewer's case: Bob's only device never
+/// processed its Welcome, its leaf near its end, its removal pending; Alice's
+/// only device is active but has no state for the group (its store reset).
+/// Its report removes its own leaf: no member is left that can commit, the
+/// group is declared dead, both active devices are told, and the
+/// recreation is accepted once.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_leaf_without_state_reports_itself_and_a_dead_group_is_recreated_once() {
+    let app = TestApp::spawn_unlimited().await;
+    let (alice, a1) = app.account_with_device("rm", false).await;
+    let bob = app.register("rm", false).await;
+    let dm = dm_between(&app, (&alice, &a1), &bob).await;
+    let b1 = app.enrol(&bob).await;
+    upload(&app, &b1, 3).await;
+    let claimed = claim(&app, &a1, &bob, &dm.keys).await;
+    let mut a1 = Member::connect(&app, a1).await;
+    let mut b1 = Member::connect(&app, b1).await;
+    let commit = a1.create(&dm, &claimed);
+    let id = a1.submit(&dm, 0, commit, false).await;
+    commit_ack(&a1.answer(id).await);
+    a1.merge();
+    assert!(matches!(b1.event().await, ServerPayload::WelcomeEvent(_)));
+    leaf_ends_in(&app, &dm, &b1.device, 6).await;
+    removals::sweep(&app.state).await.unwrap();
+    assert_eq!(
+        dead(&app, &dm).await,
+        (false, false),
+        "Alice's device's leaf"
+    );
+
+    // Alice's device lost its state: it reports, and its own leaf goes.
+    a1.drop_group();
+    assert!(matches!(a1.event().await, ServerPayload::ProposalEvent(_)));
+    assert!(matches!(
+        a1.request(report(dm.conversation)).await,
+        ServerPayload::Ack(_)
+    ));
+    let pending: Vec<Uuid> = pending_removals(&app, dm.conversation)
+        .await
+        .into_iter()
+        .map(|(device, _)| device)
+        .collect();
+    assert_eq!(pending, [b1.device.device_id, a1.device.device_id]);
+    assert_eq!(dead(&app, &dm).await, (true, true));
+    for member in [&mut a1, &mut b1] {
+        let _ = member
+            .request(ClientPayload::Heartbeat(proto::Heartbeat {}))
+            .await;
+        let told: Vec<Uuid> = std::mem::take(&mut member.events)
+            .into_iter()
+            .filter_map(|event| match event {
+                ServerPayload::RecreateConversation(recreate) => {
+                    Some(Uuid::from_slice(&recreate.conversation_id).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [dm.conversation]);
+    }
+
+    // Recreated once, by Alice's device; Bob's, second, is refused.
+    let next = at_generation(&dm, 1);
+    upload(&app, &b1.device, 3).await;
+    let from_bob = claim(&app, &a1.device, &bob, &next.keys).await;
+    let recreation = a1.create(&next, &from_bob);
+    let id = a1.submit(&next, 0, recreation, false).await;
+    commit_ack(&a1.answer(id).await);
+    a1.merge();
+    upload(&app, &a1.device, 3).await;
+    let from_alice = claim(&app, &b1.device, &alice, &next.keys).await;
+    let second = b1.create(&next, &from_alice);
+    let id = b1.submit(&next, 0, second, false).await;
+    assert_eq!(code(&b1.answer(id).await), proto::ErrorCode::StaleEpoch);
+    assert_eq!(dead(&app, &dm).await, (false, false));
+}
+
+/// The review of e96c16f: with another member that can commit, a device
+/// without state that reports only removes its own leaf; the member
+/// commits that removal, and the device, active, is told to join again (by
+/// external commit). A report never removes another device.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn a_report_removes_its_own_leaf_and_never_another() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    // Bob's device lost its state for the group, and reports.
+    bob1.drop_group();
+    assert!(matches!(
+        bob1.request(report(dm.conversation)).await,
+        ServerPayload::Ack(_)
+    ));
+    assert_eq!(
+        pending_removals(&app, dm.conversation).await,
+        [(bob1.device.device_id, 2)],
+        "its own leaf only"
+    );
+    assert_eq!(dead(&app, &dm).await, (false, false));
+    let proposal = removal_event(&mut alice1).await;
+    assert!(matches!(
+        alice1.process(&dm, &proposal.mls_message),
+        Incoming::Proposal
+    ));
+    let commit = alice1.commit_pending(&dm);
+    let id = alice1.submit(&dm, 1, commit, false).await;
+    commit_ack(&alice1.answer(id).await);
+    alice1.merge();
+    assert!(pending_removals(&app, dm.conversation).await.is_empty());
+    let _ = bob1
+        .request(ClientPayload::Heartbeat(proto::Heartbeat {}))
+        .await;
+    let told: Vec<Uuid> = std::mem::take(&mut bob1.events)
+        .into_iter()
+        .filter_map(|event| match event {
+            ServerPayload::JoinConversation(join) => {
+                Some(Uuid::from_slice(&join.conversation_id).unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told, [dm.conversation]);
+    assert!(!listed(&app, &bob1.device, &dm).await.joined);
+    // Alice's device, still a member, was never removed by Bob's report.
+    assert!(listed(&app, &alice1.device, &dm).await.joined);
+}
+
+/// The review of e96c16f, minor 2: the groups of an instance that ran before
+/// migration 0016 had no end written for their leaves. The start-up pass
+/// writes them from the stored public state (the creator's and the
+/// joiner's, 90 days), none for a leaf updated since, and writing again
+/// changes nothing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL, see the module documentation"]
+async fn the_ends_of_older_groups_leaves_are_written_at_start() {
+    let app = TestApp::spawn_unlimited().await;
+    let (_, mut alice1, _, mut bob1, dm) = group_of_two(&app).await;
+    let update = alice1.self_update(&dm);
+    let id = alice1.submit(&dm, 1, update, false).await;
+    commit_ack(&alice1.answer(id).await);
+    alice1.merge();
+    let written = leaf_ends(&app, &dm).await;
+    // As before migration 0016.
+    sqlx::query(
+        "UPDATE conversation_devices SET leaf_expires_at = NULL WHERE conversation_id = $1",
+    )
+    .bind(dm.conversation)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        removals::fill_leaf_ends(&app.state, Some(dm.conversation))
+            .await
+            .unwrap(),
+        1
+    );
+    let filled = leaf_ends(&app, &dm).await;
+    let end_of = |ends: &[(Uuid, Option<f64>)], device: &Device| {
+        ends.iter()
+            .find(|(id, _)| *id == device.device_id)
+            .unwrap()
+            .1
+    };
+    assert_eq!(end_of(&filled, &alice1.device), None, "updated since");
+    let bob_end = end_of(&filled, &bob1.device).expect("its KeyPackage's");
+    assert!((89.9..=90.1).contains(&bob_end), "{bob_end}");
+    assert!((bob_end - end_of(&written, &bob1.device).unwrap()).abs() < 0.01);
+    removals::fill_leaf_ends(&app.state, Some(dm.conversation))
+        .await
+        .unwrap();
+    assert_eq!(
+        end_of(&leaf_ends(&app, &dm).await, &bob1.device).map(|end| (end * 100.0).round()),
+        Some((bob_end * 100.0).round()),
+        "the same again"
+    );
+    let ServerPayload::CommitEvent(_) = bob1.event().await else {
+        panic!("expected Alice's update");
+    };
+    bob1.nothing_waiting().await;
 }

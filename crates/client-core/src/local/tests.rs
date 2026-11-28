@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use super::migrations::{LATEST_VERSION, MIGRATIONS, upgrade};
 use super::{
-    AccountDirectory, Binding, DATABASE_FILE, LocalStore, LocalStoreError, UNREADABLE_FILE,
+    AccountDirectory, Binding, DATABASE_FILE, LocalStore, LocalStoreError, ProfileLock,
+    UNREADABLE_FILE,
 };
 
 const NOW_MS: u64 = 1_794_000_000_000;
@@ -495,7 +496,7 @@ async fn write_the_fixture_of_the_first_release() {
 #[test]
 fn a_fresh_key_replaces_whatever_was_there() {
     let root = tempfile::tempdir().unwrap();
-    let directory = AccountDirectory(root.path().join("account"));
+    let directory = directory_in(&root, "account");
     let first = directory
         .open(&key(1), binding(), true, false, NOW_MS, super::test_lock())
         .unwrap();
@@ -517,7 +518,7 @@ fn a_fresh_key_replaces_whatever_was_there() {
 #[test]
 fn a_store_that_vanished_is_reported() {
     let root = tempfile::tempdir().unwrap();
-    let directory = AccountDirectory(root.path().join("account"));
+    let directory = directory_in(&root, "account");
     // Before this version of the client, signed-in accounts had no store.
     let first = directory
         .open(&key(1), binding(), false, false, NOW_MS, super::test_lock())
@@ -536,7 +537,7 @@ fn a_store_that_vanished_is_reported() {
 #[test]
 fn a_store_that_does_not_open_is_set_aside_and_reported() {
     let root = tempfile::tempdir().unwrap();
-    let directory = AccountDirectory(root.path().join("account"));
+    let directory = directory_in(&root, "account");
     directory
         .open(&key(1), binding(), false, false, NOW_MS, super::test_lock())
         .unwrap()
@@ -561,7 +562,7 @@ fn a_store_that_does_not_open_is_set_aside_and_reported() {
 #[test]
 fn other_failures_touch_nothing() {
     let root = tempfile::tempdir().unwrap();
-    let directory = AccountDirectory(root.path().join("account"));
+    let directory = directory_in(&root, "account");
     let opened = directory
         .open(&key(1), binding(), false, false, NOW_MS, super::test_lock())
         .unwrap();
@@ -589,9 +590,7 @@ fn other_failures_touch_nothing() {
 #[test]
 fn removing_a_directory_that_does_not_exist_is_fine() {
     let root = tempfile::tempdir().unwrap();
-    AccountDirectory(root.path().join("never"))
-        .remove()
-        .unwrap();
+    directory_in(&root, "never").remove().unwrap();
 }
 
 /// Every commit is durable before it returns (review of task 10a, point 5):
@@ -795,7 +794,6 @@ async fn an_incomplete_checkpoint_is_reported_and_completed_later() {
 /// released; another profile is independent.
 #[test]
 fn a_profile_is_held_by_one_window_at_a_time() {
-    use super::ProfileLock;
     let dir = tempfile::tempdir().unwrap();
     let first = ProfileLock::acquire(dir.path(), Some("bob")).unwrap();
     assert!(matches!(
@@ -811,4 +809,47 @@ fn a_profile_is_held_by_one_window_at_a_time() {
     drop(first);
     let again = ProfileLock::acquire(dir.path(), Some("bob")).unwrap();
     drop((again, other, default));
+}
+
+/// An account's directory under `root`, in the tests' profile.
+fn directory_in(root: &tempfile::TempDir, name: &str) -> AccountDirectory {
+    AccountDirectory(
+        root.path().join(name),
+        super::test_lock().profile().map(str::to_owned),
+    )
+}
+
+/// The review of e96c16f, minor 3: a store opens only with the lock of its
+/// profile: one outside the lock's data directory, or an account directory
+/// of another profile, is refused.
+#[test]
+fn a_store_opens_only_in_the_profile_held() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ProfileLock::acquire(&root.path().join("data"), Some("alice")).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        LocalStore::open(&store_path(&elsewhere), &key(1), binding(), NOW_MS, &lock),
+        Err(LocalStoreError::WrongProfile)
+    ));
+    let inside = root.path().join("data").join("accounts").join("one");
+    std::fs::create_dir_all(&inside).unwrap();
+    LocalStore::open(
+        &inside.join(DATABASE_FILE),
+        &key(1),
+        binding(),
+        NOW_MS,
+        &lock,
+    )
+    .unwrap()
+    .close();
+    let other_profile = AccountDirectory(inside.clone(), Some("bob".to_owned()));
+    assert!(matches!(
+        other_profile.open(&key(1), binding(), false, true, NOW_MS, &lock),
+        Err(LocalStoreError::WrongProfile)
+    ));
+    let same = AccountDirectory(inside, Some("alice".to_owned()));
+    same.open(&key(1), binding(), false, true, NOW_MS, &lock)
+        .unwrap()
+        .store
+        .close();
 }

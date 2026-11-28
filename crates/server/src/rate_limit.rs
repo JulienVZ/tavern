@@ -51,6 +51,9 @@ pub struct RateLimits {
     pub friend_requests: HourlyLimit,
     /// Gateway requests and `Hello`s, per device.
     pub gateway: GatewayLimits,
+    /// `ReportUnjoinable`, accepted once an hour per device and
+    /// conversation (ADR 0019, section 3).
+    pub unjoinable_reports: ReportLimit,
 }
 
 impl std::fmt::Debug for RateLimits {
@@ -90,6 +93,7 @@ impl RateLimits {
             claims: ClaimLimiter::new(claims),
             friend_requests: HourlyLimit::new(friend_requests_per_hour),
             gateway: GatewayLimits::new(),
+            unjoinable_reports: ReportLimit(Recent::new()),
         }
     }
 
@@ -323,6 +327,21 @@ impl HourlyLimit {
         self.recent
             .admit(&user, now, |events| room(events, now, HOUR, limit))
             .map_err(refused_for)
+    }
+}
+
+/// At most one accepted report per device and conversation in any hour,
+/// counted exactly, in memory (from zero when the server restarts).
+pub struct ReportLimit(Recent<(Uuid, Uuid)>);
+
+impl ReportLimit {
+    /// Admits one report of `device` about `conversation`, or says how long
+    /// until the next may be.
+    pub fn admit(&self, device: Uuid, conversation: Uuid) -> Result<(), Duration> {
+        let now = Instant::now();
+        self.0.admit(&(device, conversation), now, |events| {
+            room(events, now, HOUR, 1)
+        })
     }
 }
 

@@ -170,6 +170,21 @@ pub async fn check(state: &AppState, conversation: Uuid) -> Result<(), StateErro
     Ok(())
 }
 
+/// [`check`], on the report of `reporter`, which has no usable state for
+/// the group (its Welcome never processed, its store reset, its resync
+/// failed): its own leaf, if it has one, is removed first, by the path of
+/// every removal. Never another device's: those are removed only when due.
+/// It rejoins by external commit, or with the recreation of the group if no
+/// member is left that can commit.
+pub async fn check_reported(
+    state: &AppState,
+    conversation: Uuid,
+    reporter: Uuid,
+) -> Result<(), StateError> {
+    remove_leaf(state, conversation, reporter, Reason::Reported).await?;
+    check(state, conversation).await
+}
+
 /// Declares `conversation`'s group dead, under the conversation's lock, if
 /// none of its leaves can commit, and tells its participants. Returns
 /// whether it was declared now.
@@ -250,6 +265,25 @@ pub async fn remove_from(
     conversation: Uuid,
     device: Uuid,
 ) -> Result<bool, StateError> {
+    remove_leaf(state, conversation, device, Reason::Due).await
+}
+
+/// Why a leaf is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reason {
+    /// Its device is no longer active, or the leaf nears its end: read again
+    /// under the lock.
+    Due,
+    /// Its own device reports it has no usable state for the group.
+    Reported,
+}
+
+async fn remove_leaf(
+    state: &AppState,
+    conversation: Uuid,
+    device: Uuid,
+    reason: Reason,
+) -> Result<bool, StateError> {
     let mut tx = state.db.begin().await?;
     // The same lock as every request that adds to the sequence, taken
     // first, as they do.
@@ -268,15 +302,17 @@ pub async fn remove_from(
     let leaf: Option<Uuid> = sqlx::query_scalar(concat!(
         "SELECT d.user_id FROM conversation_devices c \
          JOIN devices d ON d.id = c.device_id JOIN users u ON u.id = d.user_id \
-         WHERE c.conversation_id = $1 AND c.device_id = $2 AND c.left_seq IS NULL AND ",
+         WHERE c.conversation_id = $1 AND c.device_id = $2 AND c.left_seq IS NULL \
+           AND ($5 OR ",
         due!("$3", "$4"),
-        " AND ",
+        ") AND ",
         delivery::not_cut_off!("c")
     ))
     .bind(conversation)
     .bind(device)
     .bind(activity::window(state.settings.device_inactive_days))
     .bind(LEAF_EXPIRY_MARGIN_DAYS)
+    .bind(reason == Reason::Reported)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(user) = leaf else {
@@ -359,4 +395,56 @@ pub async fn remove_from(
     }
     notify_dead(state, conversation, dead.as_deref().unwrap_or_default());
     Ok(true)
+}
+
+/// Writes, from each group's stored public state, the end of each leaf still
+/// as its KeyPackage made it: for the groups of an instance that ran before
+/// migration 0016, whose leaves had none written yet, and harmless for the
+/// others (it writes what their last commit wrote). Run once at start-up,
+/// before the first sweep, on every group (`only`: one conversation's).
+/// Returns the number of groups read; a failure in one is logged and does
+/// not stop the others.
+pub async fn fill_leaf_ends(state: &AppState, only: Option<Uuid>) -> Result<usize, StateError> {
+    let groups: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT g.conversation_id, g.generation FROM mls_groups g \
+         JOIN conversations c ON c.id = g.conversation_id \
+         WHERE NOT c.needs_recreation AND ($1::uuid IS NULL OR c.id = $1) \
+         ORDER BY g.conversation_id",
+    )
+    .bind(only)
+    .fetch_all(&state.db)
+    .await?;
+    let mut read = 0;
+    for (conversation, generation) in groups {
+        match fill_group(state, conversation, generation).await {
+            Ok(()) => read += 1,
+            Err(error) => {
+                tracing::error!(%error, %conversation, "cannot write the ends of a group's leaves");
+            }
+        }
+    }
+    Ok(read)
+}
+
+async fn fill_group(
+    state: &AppState,
+    conversation: Uuid,
+    generation: i64,
+) -> Result<(), StateError> {
+    let mut tx = state.db.begin().await?;
+    // The lock of every request that changes the group, taken first.
+    sqlx::query("SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation)
+        .execute(&mut *tx)
+        .await?;
+    let identity = GroupIdentity {
+        conversation_id: *conversation.as_bytes(),
+        generation: u32::try_from(generation).map_err(|_| StateError::Inconsistent)?,
+    };
+    if let Some(loaded) = mls::load(&mut tx, identity).await? {
+        delivery::write_leaf_ends(&mut tx, conversation, &loaded.state.key_package_leaves())
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
